@@ -1,7 +1,7 @@
 ---
 name: ask
 description: Ask Google's Antigravity CLI (agy staffer, fast Gemini) a cheap one-shot question - the fast zero-tool mode and the post-install smoke test. Use when the user says /agy:ask, "ask agy", "quick second opinion from agy", or right after installing to verify the plugin works.
-argument-hint: '[--continue] [--model <id>|--effort low|medium|high] [--timeout <dur>] "question"'
+argument-hint: '[--continue] [--worker <id>] [--model <id>|--effort low|medium|high] [--timeout <dur>] "question"'
 allowed-tools: Bash(node:*)
 ---
 
@@ -25,6 +25,8 @@ Pass the user's question verbatim via `--prompt`; use `--prompt-file <path>` or 
 > Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../jobs/references/troubleshooting.md`.
 
 ## Flags (all optional)
+
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
 
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the question, from exactly one of these three sources. Use file/stdin for a long question.
 - `--continue` — reuse the last ask conversation; `--conversation <id>` targets a specific one.

@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Get a second-opinion review from Google's Antigravity CLI (agy staffer, fast Gemini) - of code (a diff, PR, working tree) or of a decision, plan, or design. Use when the user says /agy:reviewer, "have agy review this", "second opinion on my diff/PR/plan", or after finishing work and wanting an independent verifier that does not share the host model's blind spots.
-argument-hint: '[--restricted|--unrestricted] [--json] [--model <id>|--effort low|medium|high] [--prompt-file <path>|--stdin] "what to review"'
+argument-hint: '[--worker <id>] [--restricted|--unrestricted] [--json] [--model <id>|--effort low|medium|high] [--prompt-file <path>|--stdin] "what to review"'
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Bash(gh:*)
 ---
 
@@ -36,6 +36,8 @@ review is prompt-based: the user's request plus the flavor's framing is the task
 The command returns a job id. Read `../jobs/SKILL.md` for result collection and recovery: dispatch, wait for the final result, then validate as needed. Do not proactively observe progress, read logs or inspect intermediate artifacts while running. Observe only when the user explicitly asks for progress; diagnose a failure or a result requiring intervention under the jobs protocol.
 
 ## Flags (all optional)
+
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
 
 - `--json` — schema-enforced JSON findings (verdict/summary/findings/could_not_verify) instead of markdown. Code-review flavor only, and only when the user asks for machine-readable output.
 - `--restricted` / `--unrestricted` — permission profile. review defaults to unrestricted, so it works out of the box and can run tests or reproduce a bug when the request asks for it. `--restricted` is the opt-in hardening path: agy may then only use allowlisted tools, so it needs the setup flow's evidence-gathering allowlist to be useful — and some native agy tools ignore allow-rules headless, so restricted runs can still come back empty.

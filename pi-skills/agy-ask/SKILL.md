@@ -26,6 +26,8 @@ Pass the user's question verbatim via `--prompt`; use `--prompt-file <path>` or 
 
 ## Flags (all optional)
 
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
+
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the question, from exactly one of these three sources. Use file/stdin for a long question.
 - `--continue` — reuse the last ask conversation; `--conversation <id>` targets a specific one.
 - `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-low`.

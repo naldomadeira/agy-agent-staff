@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Delegate a deep research or survey task to Google's Antigravity CLI (agy staffer, fast Gemini). Use when the user says /agy:researcher, "ask agy to research", "have the agy staffer survey X", or wants a second, independent deep-dive on a topic or codebase without spending the host model's quota.
-argument-hint: '[--continue] [--model <id>|--effort low|medium|high] [--restricted|--unrestricted] [--prompt-file <path>|--stdin] "what to research"'
+argument-hint: '[--continue] [--worker <id>] [--model <id>|--effort low|medium|high] [--restricted|--unrestricted] [--prompt-file <path>|--stdin] "what to research"'
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), Bash(gh:*)
 ---
 
@@ -27,6 +27,8 @@ Pass the user's research topic verbatim via `--prompt`; use `--prompt-file <path
 The command returns a job id. Read `../jobs/SKILL.md` for result collection and recovery: dispatch, wait for the final result, then validate as needed. Do not proactively observe progress, read logs or inspect intermediate artifacts while running. Observe only when the user explicitly asks for progress; diagnose a failure or a result requiring intervention under the jobs protocol.
 
 ## Flags (all optional)
+
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
 
 - `--continue` — reuse the last research conversation (quota-friendly, served largely from cache); `--conversation <id>` targets a specific one.
 - `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-high`.

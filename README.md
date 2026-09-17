@@ -116,6 +116,10 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 
 ## Core design
 
+### Optional worker pool
+
+Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `$agy:pool workers` (or `/agy:pool workers`) to inspect workers and `--worker <id>` to select one. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, executables `agy`, `agy2`, `agy3` on `PATH`, then optional `.agy-staff/config.json`. Shell aliases and functions are not visible to Node; use executable wrappers or explicit paths. Jobs retain worker affinity across `continue` and `restart`. Parallel work is for independent tasks; writes require separate worktrees or explicit authorization.
+
 `lead` adds task orchestration guidance for your current agent. Within lead, orient enough to frame the assignment, delegate substantive work to `staffer` by default, wait for the result, then assess it and integrate or follow up. Specialists provide dedicated guidance when useful, while `ask` is reserved for testing. The host owns cross-task decisions, acceptance, integration, and delivery, using the existing jobs workflow. Invoke `/agy:lead` in Claude Code, `$agy:lead` in Codex, or `/skill:agy-lead` in Pi.
 
 `ask` answers in the same call. The other personas return a job id and a collection command, such as `wait <id> --timeout 10m`. Your agent waits using the host's available capabilities, with one independent background wait per job where supported.

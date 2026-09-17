@@ -7,6 +7,8 @@ description: Manage agy staffer background jobs - collect results, check status,
 
 # agy jobs
 
+Jobs may record a selected pool worker (`id`, executable, and detected version). `continue` and `restart` preserve that affinity; legacy jobs without worker metadata use `AGY_BIN || agy`. Use the pool skill's `workers` command to inspect availability and active load.
+
 Manage background staffer/research/review/implement jobs. State is per repository in `.agy-staff/`. Only ask runs synchronously.
 
 This file lives at `<plugin-root>/pi-skills/agy-jobs/SKILL.md`:

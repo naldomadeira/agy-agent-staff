@@ -95,6 +95,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
+import { discoverWorkers, selectWorker } from './worker-pool.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TEMPLATES_DIR = path.join(path.dirname(SELF), '..', 'templates');
@@ -103,9 +104,9 @@ const AGY_BIN = process.env.AGY_BIN || 'agy';
 /** How to launch agy. AGY_BIN normally names an executable; when it names a
  *  Node script (the test fake), run it through the current Node binary so the
  *  launch does not depend on shebang support (Windows has none: EFTYPE). */
-function agyCommand(args) {
-  if (/\.(mjs|cjs|js)$/i.test(AGY_BIN)) return { cmd: process.execPath, args: [AGY_BIN, ...args] };
-  return { cmd: AGY_BIN, args };
+function agyCommand(args, bin = AGY_BIN) {
+  if (/\.(mjs|cjs|js)$/i.test(bin)) return { cmd: process.execPath, args: [bin, ...args] };
+  return { cmd: bin, args };
 }
 const AGY_SETTINGS = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json');
 
@@ -395,10 +396,10 @@ function rememberConversation(resolved, id, jobId) {
   updateState((state) => {
     state.conversations ||= {};
     state.conversations[resolved.mode] = id;
-    state.last = { mode: resolved.mode, id, model: resolved.model, profile: resolved.profile };
+    state.last = { mode: resolved.mode, id, model: resolved.model, profile: resolved.profile, worker: resolved.worker || null };
     state.conversation_configs ||= {};
     state.conversation_configs[id] = { mode: resolved.mode, model: resolved.model,
-      profile: resolved.profile, cwd: process.cwd() };
+      profile: resolved.profile, cwd: process.cwd(), worker: resolved.worker || null };
     const job = state.jobs?.find((j) => j.id === jobId);
     if (job) job.conversation_id = id;
   });
@@ -414,7 +415,7 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker']);
 const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
@@ -723,7 +724,7 @@ function runAgy(invoke) {
   const args = agyArgs(invoke, 'json');
 
   const budget = (durationToMs(timeout) ?? 600_000) + 60_000; // grace over agy's own timeout
-  const agy = agyCommand(args);
+  const agy = agyCommand(args, invoke.worker?.bin || AGY_BIN);
   const r = spawnSync(agy.cmd, agy.args, {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -733,7 +734,7 @@ function runAgy(invoke) {
   if (r.error && r.error.code === 'ETIMEDOUT') {
     die(`agy timed out: no result within ${timeout} plus 60s grace. Retry with a larger --timeout, or narrow the task.`);
   }
-  if (r.error) die(`failed to launch agy (${AGY_BIN}): ${r.error.message}`);
+  if (r.error) die(`failed to launch agy (${invoke.worker?.bin || AGY_BIN}): ${r.error.message}`);
   if (r.signal) {
     die(`agy was killed by signal ${r.signal} before returning a result (companion budget: ${timeout} + 60s grace).`);
   }
@@ -960,7 +961,30 @@ function resolveRun(mode, opts, priorJob = null) {
     if (!opts.restricted && !opts.unrestricted && prior.profile) { profile = prior.profile; profileSource = 'inherited'; }
   }
   if (profileSource === 'project') process.stderr.write(`agy-staff: profile=${profile} set by project policy (${configPath()})\n`);
-  return { mode, model, profile, profileSource, background, timeout, conversation, parentJobId: prior?.id || null, originalCwd: prior?.cwd || null };
+  return { mode, model, profile, profileSource, background, timeout, conversation, parentJobId: prior?.id || null, originalCwd: prior?.cwd || null,
+    worker: prior?.worker || null };
+}
+
+/** Resolve optional pool affinity. Without --worker this is deliberately a
+ * no-op for new runs, preserving the historical AGY_BIN || agy path. */
+async function resolveWorker(opts, prior = null) {
+  const requested = opts.worker;
+  const affinity = prior?.worker || null;
+  if (affinity && requested && requested !== 'auto' && requested !== affinity.id && requested !== affinity.bin) {
+    die(`worker affinity conflict: this conversation is pinned to ${affinity.id || affinity.bin}; refusing migration to ${requested}`);
+  }
+  if (!requested && !affinity) return null;
+  // Historical/default jobs retain the legacy executable without probing or
+  // entering the pool. This is an affinity marker, not an auto-pool request.
+  if (!requested && affinity?.id === 'default') return affinity;
+  const workers = await discoverWorkers({ config: configPath() });
+  const activeJobs = (loadState().jobs || []).filter((job) => liveJobStatus(job) === 'running');
+  const worker = selectWorker({ workers, activeJobs, requestedWorkerId: requested && requested !== 'auto' ? requested : undefined, affinity });
+  if (!worker) {
+    if (affinity) die(`worker ${affinity.id || affinity.bin} for this job is unavailable; refusing automatic migration`);
+    die(requested && requested !== 'auto' ? `worker "${requested}" is unavailable or at capacity` : 'no available AGY worker found');
+  }
+  return { id: worker.id, bin: worker.bin, version: worker.version ?? null, capacity: worker.capacity };
 }
 
 /** Task text comes from exactly one source: --prompt, --prompt-file, or
@@ -1128,6 +1152,7 @@ async function executeRun(resolved, prompt, opts, execution = null) {
     model: resolved.model,
     timeout: resolved.timeout,
     conversation: resolved.conversation,
+    worker: resolved.worker || null,
     unrestricted: resolved.profile === 'unrestricted',
     jsonSchema: opts.json && resolved.mode === 'review' ? REVIEW_JSON_SCHEMA : null,
   };
@@ -1175,9 +1200,14 @@ async function executeRun(resolved, prompt, opts, execution = null) {
   return guard ? response + '\n' + guard : response;
 }
 
-function cmdRun(mode, opts) {
+async function cmdRun(mode, opts) {
   const task = taskText(opts); // Resolve prompt-file/stdin in the caller's cwd.
   const resolved = resolveRun(mode, opts);
+  // A direct mode continuation (`research --continue`) reaches this path too.
+  // Feed its resolved conversation affinity back into the selector; otherwise
+  // it would silently fall back to AGY_BIN instead of its original worker.
+  resolved.worker = await resolveWorker(opts, resolved.worker ? { worker: resolved.worker } : null)
+    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
   enterOriginalWorkspace(resolved.originalCwd);
   if (resolved.parentJobId) {
     const prior = findJob(resolved.parentJobId);
@@ -1211,6 +1241,7 @@ async function dispatch(resolved, prompt, opts) {
     id: jobId, mode, pid: null, status: 'running', cwd: process.cwd(),
     model: resolved.model, profile: resolved.profile, profileSource: resolved.profileSource,
     timeout: resolved.timeout, conversation_id: resolved.conversation || null,
+    worker: resolved.worker || null,
     parent_job_id: opts.parentJobId || resolved.parentJobId || null,
     started_at: new Date().toISOString(), log_file: logFile, result_file: resultFile,
     spec_file: specFile,
@@ -1278,9 +1309,14 @@ async function workerMain(jobId) {
     cancelTimer = setInterval(checkCancellation, 100);
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
+    if (spec.resolved.worker && spec.opts.worker) {
+      const available = await discoverWorkers({ config: configPath() });
+      const current = available.find((w) => w.id === spec.resolved.worker.id && w.bin === spec.resolved.worker.bin);
+      if (!current?.available) throw new Error(`worker ${spec.resolved.worker.id} (${spec.resolved.worker.bin}) became unavailable after job creation; no automatic migration was attempted`);
+    }
     const opts = { ...spec.opts, jobId };
     const output = await executeRun(spec.resolved, spec.prompt, opts, (invoke) => {
-      const agy = agyCommand(agyArgs(invoke, 'stream-json'));
+      const agy = agyCommand(agyArgs(invoke, 'stream-json'), invoke.worker?.bin || AGY_BIN);
       return runStreaming({ binary: agy.cmd, args: agy.args, job,
         budget: durationToMs(spec.resolved.timeout) - (Date.now() - started), signal: controller.signal,
         update: (fields) => updateJob(jobId, fields),
@@ -1383,6 +1419,18 @@ function cmdStatus(opts) {
   if (jobs.slice(-20).some((j) => j.status === 'crashed' && !fs.existsSync(j.result_file))) {
     process.stdout.write(`\n${CRASH_SANDBOX_HINT}\n`);
   }
+}
+
+async function cmdWorkers() {
+  const workers = await discoverWorkers({ config: configPath() });
+  const jobs = loadState().jobs || [];
+  const active = jobs.filter((j) => liveJobStatus(j) === 'running');
+  process.stdout.write('id | executable | status | version | capacity | active jobs\n');
+  for (const worker of workers) {
+    const count = active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
+    process.stdout.write(`${worker.id} | ${worker.bin} | ${worker.available ? 'available' : 'unavailable'} | ${worker.version || '-'} | ${worker.capacity} | ${count}\n`);
+  }
+  if (!workers.length) process.stdout.write('(no workers discovered)\n');
 }
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1649,7 +1697,7 @@ function enterOriginalWorkspace(cwd) {
   repoRootCache.set(process.cwd(), git.code === 0 && git.out ? git.out : target);
 }
 
-function cmdContinue(opts) {
+async function cmdContinue(opts) {
   const state = loadState();
   const targetId = opts.conversation || state.last?.id;
   const prior = opts.job ? findJob(opts.job) : [...(state.jobs || [])].reverse().find((j) => j.conversation_id === targetId)
@@ -1665,6 +1713,8 @@ function cmdContinue(opts) {
   if (!task) die('continue needs follow-up text');
   enterOriginalWorkspace(prior?.cwd);
   const resolved = resolveRun(mode, { ...opts, conversation }, prior);
+  resolved.worker = await resolveWorker(opts, prior)
+    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
   const workspace = mode === 'implement' ? dirtyWorkspacePrompt() : '';
   const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}`;
   let json = opts.json;
@@ -1672,7 +1722,7 @@ function cmdContinue(opts) {
   return dispatch(resolved, prompt, { ...opts, json, parentJobId: prior?.id, promptSource: { kind: 'followup', task } });
 }
 
-function cmdRestart(opts) {
+async function cmdRestart(opts) {
   if (!opts._[0]) die('restart needs a job id');
   const job = findJob(opts._[0]);
   if (liveJobStatus(job) === 'running') die('job is still running; cancel it before restarting');
@@ -1680,6 +1730,8 @@ function cmdRestart(opts) {
   const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
   enterOriginalWorkspace(spec.cwd);
   const resolved = { ...spec.resolved, conversation: null, timeout: DEFAULTS.timeout[job.mode] };
+  resolved.worker = await resolveWorker(opts, job)
+    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;
   }
@@ -1866,9 +1918,9 @@ function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd) {
     die(
-      'usage: agy-companion.mjs <staffer|research|review|implement|ask|continue|restart|observe|status|wait|result|cancel|setup> [flags]\n' +
-        'flags: --restricted|--unrestricted --model <id> --effort <l|m|h> --timeout <dur> ' +
-        '--prompt <text> --prompt-file <path> --stdin --conversation <id> --continue --json (review) ' +
+      'usage: agy-companion.mjs <staffer|research|review|implement|ask|continue|restart|observe|status|wait|result|cancel|workers|setup> [flags]\n' +
+      'flags: --restricted|--unrestricted --model <id> --effort <l|m|h> --timeout <dur> ' +
+        '--prompt <text> --prompt-file <path> --stdin --conversation <id> --continue --worker <id|auto> --json (review) ' +
         '--apply --restrict <modes|none> (setup)\n' +
         'task text for staffer/research/review/implement/ask/continue comes from exactly one of ' +
         '--prompt <text>, --prompt-file <path>, or --stdin.\n' +
@@ -1897,6 +1949,8 @@ function main() {
       return cmdCancel(opts);
     case 'setup':
       return cmdSetup(opts);
+    case 'workers':
+      return cmdWorkers();
     case '_worker':
       return workerMain(rest[0]);
     default:
