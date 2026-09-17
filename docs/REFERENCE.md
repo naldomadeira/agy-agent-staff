@@ -4,6 +4,10 @@ Back to the [README](../README.md). See the [Chinese reference](REFERENCE.zh-CN.
 
 ## Modes and defaults
 
+## Optional worker pool
+
+The normal path remains a single worker resolved as `AGY_BIN || agy`. The opt-in `pool` skill exposes `workers` for inspection and `--worker <id>` for explicit selection; existing skills remain unchanged otherwise. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, `agy`/`agy2`/`agy3` on `PATH`, then optional `.agy-staff/config.json`. Node cannot discover shell aliases or functions; use executable wrappers or explicit paths. Jobs record worker id, executable, and version when available; `continue` and `restart` preserve affinity, while legacy jobs use `AGY_BIN || agy`. The default capacity is one active job per worker. Independent tasks may run in parallel; dependent tasks stay sequential, and parallel writes require separate worktrees or explicit authorization. `workers` reports id, executable, availability, version, and active-job count.
+
 | Persona (skill) | Companion mode | What it is | Default model | Profile | Execution |
 |---|---|---|---|---|---|
 | `ask` | `ask` | Cheap zero-tool one-shot Q&A (~3s); doubles as the post-install smoke test | `gemini-3.8-flash-low` | restricted (prompt-only) | synchronous — the answer comes back in the same call |

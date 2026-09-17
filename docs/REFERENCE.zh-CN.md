@@ -4,6 +4,10 @@
 
 ## 模式与默认值
 
+## 可选 worker 池
+
+默认仍使用单个 worker：`AGY_BIN || agy`。可选的 `pool` 技能提供 `workers` 检查命令和 `--worker <id>` 显式选择；没有请求 pool 时，现有技能行为不变。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，以及可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行包装器或显式路径。任务记录 worker ID、可执行文件和可用时的版本；`continue` 和 `restart` 保持亲和性，旧任务使用 `AGY_BIN || agy`。每个 worker 默认一个活动任务。独立任务可并行，依赖任务保持顺序；并行写入需要不同 worktree 或明确授权。`workers` 显示 ID、可执行文件、可用性、版本和活动任务数。
+
 插件提供五种角色（persona），每种角色对应一个技能。你选择角色并描述任务，主 agent 就会按照技能中的说明调用 companion CLI。companion 是插件自带的 Node.js 程序，负责启动 agy、保存任务状态和收取结果。
 
 | 角色技能 | companion 命令 | 用途 | 默认模型 | 执行方式 |

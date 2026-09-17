@@ -37,6 +37,8 @@ The command returns a job id. Read `../agy-jobs/SKILL.md` for result collection 
 
 ## Flags (all optional)
 
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
+
 - `--json` — schema-enforced JSON findings (verdict/summary/findings/could_not_verify) instead of markdown. Code-review flavor only, and only when the user asks for machine-readable output.
 - `--restricted` / `--unrestricted` — permission profile. review defaults to unrestricted, so it works out of the box and can run tests or reproduce a bug when the request asks for it. `--restricted` is the opt-in hardening path: agy may then only use allowlisted tools, so it needs the setup flow's evidence-gathering allowlist to be useful — and some native agy tools ignore allow-rules headless, so restricted runs can still come back empty.
 - `--model <id>` / `--effort low|medium|high` (default `gemini-3.8-flash-medium`), `--continue` (or `--conversation <id>`), `--timeout <dur>` (default 60m, maximum 120m hard execution limit).

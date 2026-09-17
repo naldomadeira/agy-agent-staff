@@ -1,7 +1,7 @@
 ---
 name: lead
 description: Orchestrate an ongoing task with AGY while the current agent owns key decisions, review, and delivery. Use when the user invokes /agy:lead or asks you to coordinate a task using AGY.
-argument-hint: '[task]'
+argument-hint: '[--worker <id>] [task]'
 ---
 
 # agy lead
@@ -9,6 +9,8 @@ argument-hint: '[task]'
 Task orchestration with AGY. You are the lead in the current harness. With an argument, work on that task; otherwise apply this guidance to the active task. Extend it across the session only when the user asks.
 
 ## Working with AGY
+
+The pool is optional. For independent assignments, recommend or delegate through `pool`; keep process management in the companion. A `--worker <id>` selection is explicit and must not change the default `AGY_BIN || agy` behavior.
 
 1. **Frame the assignment.** Orient just enough to state the outcome and completion criteria. Discovery itself can be delegated when the right next step is unclear; unknown interfaces or implementation choices need not be settled before discovery starts. Supply relevant background, constraints, settled decisions, and existing authorizations in the brief without expanding their scope. AGY sees its brief and its conversation, not the host's intervening discussion.
 2. **Default to delegating substantive work.** Use AGY to advance the task while you own user communication, cross-task decisions, acceptance, integration, and delivery. Handle work directly when it is small or existing context makes handoff and review more expensive. Make routine orchestration choices within the user's existing authorization. Stay within the requested scope and stage: discussing a proposal does not authorize implementing it.

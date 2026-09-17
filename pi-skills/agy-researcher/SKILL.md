@@ -28,6 +28,8 @@ The command returns a job id. Read `../agy-jobs/SKILL.md` for result collection 
 
 ## Flags (all optional)
 
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
+
 - `--continue` — reuse the last research conversation (quota-friendly, served largely from cache); `--conversation <id>` targets a specific one.
 - `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-high`.
 - `--restricted` / `--unrestricted` — permission profile. research defaults to unrestricted, so it works out of the box with no setup. `--restricted` is the opt-in hardening path: agy runs without `--dangerously-skip-permissions` and may only use allowlisted tools, so it needs the setup flow's evidence-gathering allowlist to be useful — and some native agy tools ignore allow-rules headless, so restricted runs can still come back empty.

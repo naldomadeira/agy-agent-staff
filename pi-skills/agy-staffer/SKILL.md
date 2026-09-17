@@ -32,6 +32,8 @@ The command returns a job id. Read `../agy-jobs/SKILL.md` for result collection 
 
 ## Flags (all optional)
 
+- `--worker <id>` — optional pool worker; omitted keeps the legacy worker.
+
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the task, from exactly one of these three sources. Use file/stdin for long prompts instead of shell quoting.
 - `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-medium`.
 - `--restricted` / `--unrestricted` — permission profile; staffer defaults to unrestricted like the other tool-using personas, `--restricted` is the opt-in hardening path.
