@@ -45,21 +45,21 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash
 Step 2 — install the plugin into your harness:
 
 ```bash
-claude plugin marketplace add keli-wen/agy-staff
-claude plugin install agy@agy-staff
+claude plugin marketplace add naldomadeira/agy-agent-staff
+claude plugin install agy@agy
 ```
 
 ```bash
-codex plugin marketplace add https://github.com/keli-wen/agy-staff
-codex plugin add agy@agy-staff
+codex plugin marketplace add https://github.com/naldomadeira/agy-agent-staff
+codex plugin add agy@agy
 ```
 
 <details>
 <summary>Using Pi?</summary>
 
-Install: `pi install git:github.com/keli-wen/agy-staff`.
+Install: `pi install git:github.com/naldomadeira/agy-agent-staff`.
 Skills are prefixed as `/skill:agy-<persona>` (e.g. `/skill:agy-ask reply with OK`), with `/skill:agy-jobs` for job management.
-Update with `pi update --extension git:github.com/keli-wen/agy-staff`, then run `/reload`.
+Update with `pi update --extension git:github.com/naldomadeira/agy-agent-staff`, then run `/reload`.
 
 </details>
 
@@ -84,11 +84,11 @@ Respond in the user's language.
 Claude Code and Codex install a *copy*, so a new version only reaches you when you pull it in yourself:
 
 ```bash
-claude plugin marketplace update agy-staff && claude plugin update agy@agy-staff
+claude plugin marketplace update agy-agent-staff && claude plugin update agy@agy
 ```
 
 ```bash
-codex plugin marketplace upgrade && codex plugin add agy@agy-staff  # then restart Codex
+codex plugin marketplace upgrade && codex plugin add agy@agy  # then restart Codex
 ```
 
 Claude Code and Codex cache per version directory, so an upgrade lands only if the plugin version changed; restart the harness afterwards. If a fix does not show up, see [upgrading](docs/REFERENCE.md#upgrading) — it has the force-refresh command.
