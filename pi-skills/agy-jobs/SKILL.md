@@ -7,7 +7,7 @@ description: Manage agy staffer background jobs - collect results, check status,
 
 # agy jobs
 
-Jobs may record a selected pool worker (`id`, executable, and detected version). `continue` and `restart` preserve that affinity; legacy jobs without worker metadata use `AGY_BIN || agy`. Use the pool skill's `workers` command to inspect availability and active load.
+Jobs may record a selected pool worker (`id`, executable, and detected version). Every background dispatch now prints `AGY worker: …`; `status`, `observe`, and the delivered result preserve that context so Codex, Claude Code, and other hosts can show which external worker is operating. `continue` and `restart` preserve affinity; legacy jobs without worker metadata use `AGY_BIN || agy`. Use the pool skill's `workers` command to inspect availability and active load.
 
 Manage background staffer/research/review/implement jobs. State is per repository in `.agy-staff/`. Only ask runs synchronously.
 
@@ -50,7 +50,7 @@ Follow through to a result unless the user asked only to launch. If the host can
 | Command | Purpose |
 | --- | --- |
 | `observe [id]` | On an explicit user progress request, or for diagnosis after failure/required intervention: bounded JSON with progress or terminal metadata and recovery pointers. Never returns report text. |
-| `status [id]` | List jobs or show one job's state and log tail. |
+| `status [id]` | List jobs with worker identity, or show one job's state and log tail. |
 | `result [id]` | Reprint stored output; default to the latest finished job. |
 | `cancel <id>` | Stop that job's execution. Interrupting wait does not cancel it. |
 | `continue --job <id> --prompt "..."` | Resume the job's conversation with its original mode/model/profile; create a linked new job. |

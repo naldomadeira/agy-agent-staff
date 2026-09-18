@@ -32,7 +32,7 @@ describe('companion worker pool integration', () => {
   test('auto dispatches across two workers and persists the selected worker', async () => {
     const sb = sandbox('auto-two');
     const bins = workersFor(sb, 2);
-    const env = { AGY_POOL_BINS: bins.join(',') };
+    const env = { AGY_POOL_BINS: bins.join(','), FAKE_AGY_SLEEP_MS: '2000' };
     const first = run(sb, ['research', '--worker', 'auto', '--prompt', 'first'], env);
     const second = run(sb, ['research', '--worker', 'auto', '--prompt', 'second'], env);
     assert.equal(first.code, 0, first.stderr);
@@ -43,6 +43,8 @@ describe('companion worker pool integration', () => {
     assert.equal(records.length, 2);
     assert.ok(records.every((job) => job.worker?.id));
     assert.notEqual(records[0].worker.bin, records[1].worker.bin, 'auto should avoid a saturated worker');
+    assert.match(first.stdout, new RegExp(`AGY worker: ${records[0].worker.id} \\(`));
+    assert.match(second.stdout, new RegExp(`AGY worker: ${records[1].worker.id} \\(`));
     assert.equal(await waitForJob(sb, firstId), 'done');
     assert.equal(await waitForJob(sb, secondId), 'done');
     assert.equal(agyCalls(sb).length, 2);
@@ -51,7 +53,7 @@ describe('companion worker pool integration', () => {
   test('auto supports three workers', async () => {
     const sb = sandbox('auto-three');
     const bins = workersFor(sb, 3);
-    const env = { AGY_POOL_BINS: bins.join(',') };
+    const env = { AGY_POOL_BINS: bins.join(','), FAKE_AGY_SLEEP_MS: '2000' };
     const started = [1, 2, 3].map((n) => run(sb, ['research', '--worker', 'auto', '--prompt', `task ${n}`], env));
     assert.ok(started.every((result) => result.code === 0));
     const ids = started.map((result) => jobIdOf(result.stdout));
