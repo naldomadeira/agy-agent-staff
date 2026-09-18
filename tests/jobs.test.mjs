@@ -23,6 +23,7 @@ describe('background job lifecycle', () => {
     const started = run(sb, ['research', '--prompt', 'a topic']);
     assert.equal(started.code, 0, started.stderr);
     const id = jobIdOf(started.stdout);
+    assert.match(started.stdout, /AGY worker: default \(/);
 
     const terminal = await waitForJob(sb, id);
     assert.equal(terminal, 'done', `job ended as ${terminal}`);
@@ -35,8 +36,8 @@ describe('background job lifecycle', () => {
 
     const list = run(sb, ['status']);
     assert.equal(list.code, 0, list.stderr);
-    assert.match(list.stdout, /id \| mode \| status \| started \| finished/);
-    assert.match(list.stdout, new RegExp(`${id} \\| research \\| done \\|`));
+    assert.match(list.stdout, /id \| mode \| worker \| status \| started \| finished/);
+    assert.match(list.stdout, new RegExp(`${id} \\| research \\| default \\([^|]+\\) \\| done \\|`));
 
     const res = run(sb, ['result', id]);
     assert.equal(res.code, 0, res.stderr);

@@ -1282,6 +1282,7 @@ async function dispatch(resolved, prompt, opts) {
   process.stdout.write(
     `Started background ${mode} job.\n` +
       `job id: ${jobId} (pid ${child.pid})\n` +
+      `AGY worker: ${workerLabel(resolved.worker)}\n` +
       `model: ${resolved.model}  profile: ${resolved.profile}  timeout: ${resolved.timeout}\n` +
       `result file (written when the job finishes): ${resultFile}\n` +
       `Collect: run \`wait ${jobId} --timeout 10m\` as a background command ` +
@@ -1379,6 +1380,16 @@ function liveJobStatus(job) {
   return !job.spec_file && fs.existsSync(job.result_file) ? 'done' : 'crashed';
 }
 
+/** Compact, host-neutral worker label for dispatches, job lists, and reports.
+ * This is deliberately ordinary stdout metadata: Codex and Claude both show
+ * companion output, while neither can register an external process as a
+ * native host subagent. */
+function workerLabel(worker) {
+  if (!worker) return 'legacy (AGY_BIN || agy)';
+  const version = worker.version ? `; ${worker.version}` : '';
+  return `${worker.id || 'unnamed'} (${worker.bin || 'AGY_BIN || agy'}${version})`;
+}
+
 // Machine-readable job exit codes shared by `status <id>` and `wait`.
 // 1 stays the generic companion error, so callers can loop on "code 2"
 // without parsing any output.
@@ -1411,9 +1422,9 @@ function cmdStatus(opts) {
     process.stdout.write('No agy-staff jobs recorded in this repository.\n');
     return;
   }
-  process.stdout.write('id | mode | status | started | finished\n');
+  process.stdout.write('id | mode | worker | status | started | finished\n');
   for (const j of jobs.slice(-20)) {
-    process.stdout.write(`${j.id} | ${j.mode} | ${j.status} | ${j.started_at} | ${j.finished_at || '-'}\n`);
+    process.stdout.write(`${j.id} | ${j.mode} | ${workerLabel(j.worker)} | ${j.status} | ${j.started_at} | ${j.finished_at || '-'}\n`);
   }
   process.stdout.write('\nDetails: `status <id>`   Output: `result <id>`\n');
   if (jobs.slice(-20).some((j) => j.status === 'crashed' && !fs.existsSync(j.result_file))) {
@@ -1479,7 +1490,7 @@ function findJob(id) {
 function readObservation(job) {
   let snapshot = { recent_activities: [], latest_text: null, last_event_at: null, warnings: ['No activity record is available for this job.'] };
   try { snapshot = JSON.parse(fs.readFileSync(job.progress_file, 'utf8')); } catch {}
-  return boundSnapshot({ ...snapshot, job_id: job.id, mode: job.mode, status: liveJobStatus(job),
+  return boundSnapshot({ ...snapshot, job_id: job.id, mode: job.mode, status: liveJobStatus(job), worker: job.worker || null,
     started_at: job.started_at, observed_at: new Date().toISOString(),
     elapsed_seconds: Math.max(0, Math.round((Date.now() - Date.parse(job.started_at)) / 1000)),
     details: { raw_output: job.events_file || null, diagnostics: job.log_file, result: job.result_file },
@@ -1526,6 +1537,7 @@ function diagnosticPacket(job) {
   let logBytes = null;
   try { logBytes = fs.statSync(job.log_file).size; } catch {}
   return { job_id: job.id, mode: job.mode, cwd: job.cwd || process.cwd(), status: liveJobStatus(job),
+    worker: job.worker || null,
     started_at: job.started_at, worker_started_at: job.worker_started_at || null, finished_at: job.finished_at || null,
     pid: job.pid, agy_pid: job.agy_pid || null, log_bytes: logBytes,
     log_state: logBytes === null ? 'missing' : logBytes === 0 ? 'empty' : 'present',
@@ -1546,6 +1558,7 @@ function readTerminalObservation(job, status) {
   const finishedAt = job.finished_at || final.finished_at || null;
   const snapshot = {
     job_id: job.id, mode: job.mode, status,
+    worker: job.worker || null,
     started_at: job.started_at, finished_at: finishedAt, observed_at: new Date().toISOString(),
     elapsed_seconds: Math.max(0, Math.round(((Date.parse(finishedAt) || Date.now()) - Date.parse(job.started_at)) / 1000)),
     result_file: job.result_file, result_available: fs.existsSync(job.result_file),
