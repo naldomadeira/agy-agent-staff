@@ -33,23 +33,23 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash
 接着，在你使用的 agent 环境中安装插件。如果使用 Claude Code，运行：
 
 ```bash
-claude plugin marketplace add keli-wen/agy-staff
+claude plugin marketplace add naldomadeira/agy-agent-staff
 claude plugin install agy@agy-staff
 ```
 
 如果使用 Codex，运行：
 
 ```bash
-codex plugin marketplace add https://github.com/keli-wen/agy-staff
+codex plugin marketplace add https://github.com/naldomadeira/agy-agent-staff
 codex plugin add agy@agy-staff
 ```
 
 <details>
 <summary>在 Pi 中安装</summary>
 
-运行 `pi install git:github.com/keli-wen/agy-staff` 安装插件。Pi 中的技能使用 `agy-` 前缀，例如 `/skill:agy-ask reply with OK`；任务管理技能是 `/skill:agy-jobs`。
+运行 `pi install git:github.com/naldomadeira/agy-agent-staff` 安装插件。Pi 中的技能使用 `agy-` 前缀，例如 `/skill:agy-ask reply with OK`；任务管理技能是 `/skill:agy-jobs`。
 
-更新时运行 `pi update --extension git:github.com/keli-wen/agy-staff`，然后在 Pi 中执行 `/reload`。
+更新时运行 `pi update --extension git:github.com/naldomadeira/agy-agent-staff`，然后在 Pi 中执行 `/reload`。
 
 </details>
 
@@ -65,7 +65,7 @@ codex plugin add agy@agy-staff
 也可以把下面这段话交给你的 coding agent，让它按照仓库里的说明完成安装和验证：
 
 ```
-Read the raw text of https://raw.githubusercontent.com/keli-wen/agy-staff/master/docs/INSTALL_FOR_AGENTS.md
+Read the raw text of https://raw.githubusercontent.com/naldomadeira/agy-agent-staff/master/docs/INSTALL_FOR_AGENTS.md
 (curl it — do not work from a summary), or the same file in your local checkout of agy-staff, and follow it to
 install and verify the agy-staff plugin for the harness you are running in. Respond in the user's language.
 ```
