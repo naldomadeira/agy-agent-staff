@@ -214,7 +214,11 @@ describe('permission profile wiring reaches the agy argv', () => {
 describe('tiered git guards: implement', () => {
   test('implement defaults to high effort Flash', async () => {
     const sb = sandbox('impl-default-model');
-    const started = run(sb, ['implement', '--prompt', 'a task']);
+    // A real edit keeps this run's outcome 'done'; this test's own concern is
+    // model selection, not the zero-delta postcondition covered below.
+    const started = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
     assert.equal(started.code, 0, started.stderr);
     assert.match(started.stdout, /model: gemini-3\.8-flash-high/);
 
@@ -228,7 +232,12 @@ describe('tiered git guards: implement', () => {
     const sb = sandbox('dirty');
     fs.writeFileSync(path.join(sb.repo, 'dirty.txt'), 'uncommitted\n');
 
-    const r = run(sb, ['implement', '--prompt', 'a task']);
+    // dirty.txt is pre-existing user context, not agy's doing; agy-edit.txt is
+    // agy's own edit, so this run has a real delta and stays 'done' — the
+    // no-op path is covered separately below.
+    const r = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-edit.txt'),
+    });
     assert.equal(r.code, 0, r.stderr);
     assert.doesNotMatch(r.stderr, /unrestricted profile refused/);
     assert.match(r.stdout, /Started background implement job\./);
@@ -248,7 +257,9 @@ describe('tiered git guards: implement', () => {
       fs.writeFileSync(path.join(sb.repo, `dirty-${String(i).padStart(3, '0')}.txt`), 'x\n');
     }
 
-    const r = run(sb, ['implement', '--prompt', 'a task']);
+    const r = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-edit.txt'),
+    });
     assert.equal(r.code, 0, r.stderr);
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id), 'done');
@@ -288,26 +299,7 @@ describe('tiered git guards: implement', () => {
     assert.doesNotMatch(res.stdout, /\[unrestricted\] agy modified the working tree/);
   });
 
-  test('implement reports the tree with the [unrestricted] prefix', async () => {
-    const sb = sandbox('guard-report');
-    const started = run(sb, ['implement', '--prompt', 'a task']);
-    assert.equal(started.code, 0, started.stderr);
-    const id = jobIdOf(started.stdout);
-    assert.equal(await waitForJob(sb, id), 'done');
-
-    const res = run(sb, ['result', id]);
-    assert.equal(res.code, 0, res.stderr);
-    // the guard warning stays in the body …
-    assert.match(res.stdout, /\[unrestricted\] Working tree clean after implement/);
-    assert.doesNotMatch(res.stdout, /\[loose\]/);
-    // … the telemetry does not, it is in the worker log instead
-    assert.doesNotMatch(res.stdout, /\[agy-staff\]/);
-    assert.doesNotMatch(jobResultFile(sb, id), /\[agy-staff\]/);
-    assert.match(jobLog(sb, id), /\[agy-staff\] mode=implement profile=unrestricted/);
-    assert.match(jobLog(sb, id), /^conversation: conv-1 \(follow up with --continue\)$/m);
-  });
-
-  test('implement reports edits agy made on the clean tree', async () => {
+  test('implement reports edits agy made on the clean tree, telemetry stays off the result body', async () => {
     const sb = sandbox('impl-touched');
     const started = run(sb, ['implement', '--prompt', 'a task'], {
       FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
@@ -317,9 +309,17 @@ describe('tiered git guards: implement', () => {
     assert.equal(await waitForJob(sb, id), 'done');
 
     const res = run(sb, ['result', id]);
+    // files actually changed → still 'done', exit 0 — the fix must not
+    // regress the common case while catching the zero-delta one below.
+    assert.equal(res.code, 0, res.stderr);
     assert.match(res.stdout, /\[unrestricted\] agy modified the working tree\./);
     assert.match(res.stdout, /New untracked files: agy-wrote\.txt/);
     assert.match(res.stdout, /ACTION FOR THE CALLING AGENT/);
+    // … the telemetry does not appear in the body, it is in the worker log instead
+    assert.doesNotMatch(res.stdout, /\[agy-staff\]/);
+    assert.doesNotMatch(jobResultFile(sb, id), /\[agy-staff\]/);
+    assert.match(jobLog(sb, id), /\[agy-staff\] mode=implement profile=unrestricted/);
+    assert.match(jobLog(sb, id), /^conversation: conv-1 \(follow up with --continue\)$/m);
   });
 
   test('implement continuation can build on its own dirty result', async () => {
@@ -330,7 +330,13 @@ describe('tiered git guards: implement', () => {
     assert.equal(first.code, 0, first.stderr);
     assert.equal(await waitForJob(sb, jobIdOf(first.stdout)), 'done');
 
-    const cont = run(sb, ['continue', '--prompt', 'refine the same change']);
+    // A second real edit, distinct from the first run's file: the prompt
+    // assertions below only care about what the *first* run left dirty, so
+    // this does not disturb them, and it keeps the continuation itself out
+    // of the zero-delta path (covered on its own below).
+    const cont = run(sb, ['continue', '--prompt', 'refine the same change'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote-2.txt'),
+    });
     assert.equal(cont.code, 0, cont.stderr);
     assert.match(cont.stdout, /Started background implement job\./);
     assert.equal(await waitForJob(sb, jobIdOf(cont.stdout)), 'done');
@@ -340,6 +346,77 @@ describe('tiered git guards: implement', () => {
     assert.match(promptOf(calls[1]), /refine the same change/);
     assert.match(promptOf(calls[1]), /## Existing workspace changes/);
     assert.match(promptOf(calls[1]), /agy-wrote\.txt/);
+  });
+});
+
+describe('tiered git guards: implement zero-delta postcondition', () => {
+  test('implement with empty delta and unmoved HEAD is flagged for attention, not silently done', async () => {
+    const sb = sandbox('impl-noop');
+    const started = run(sb, ['implement', '--prompt', 'a task']);
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+
+    // agy reported success, touched nothing, and committed nothing: this is
+    // exactly the bug from production — a job that ran, said done, and left
+    // no trace on disk — so the fix must not report it as 'done'.
+    assert.equal(await waitForJob(sb, id), 'attention');
+    assert.equal(run(sb, ['status', id]).code, 5);
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 5, res.stderr);
+    assert.match(res.stdout, /Job needs attention: agy reported success but the repository is unchanged/);
+    assert.match(res.stdout, /re-dispatch the job/);
+    // the existing tree report is untouched, word for word
+    assert.match(res.stdout, /\[unrestricted\] Working tree clean after implement\./);
+  });
+
+  test('implement on a dirty tree that agy leaves untouched is also flagged for attention', async () => {
+    // The exact production shape: a pre-existing dirty file, and a run that
+    // changes nothing relative to it — porcelain status prints the same
+    // lines before and after, which the old code reported as 'done'.
+    const sb = sandbox('impl-noop-dirty');
+    fs.writeFileSync(path.join(sb.repo, 'dirty.txt'), 'uncommitted\n');
+
+    const started = run(sb, ['implement', '--prompt', 'a task']);
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'attention');
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 5, res.stderr);
+    assert.match(res.stdout, /Job needs attention: agy reported success but the repository is unchanged/);
+    // the existing dirty-tree report line is untouched, word for word
+    assert.match(res.stdout, /Status entries that appeared or changed during the run:\n {2}\(none detected by porcelain status\)/);
+  });
+
+  test('implement with edited files is still done, exit 0 — the fix must not regress the common case', async () => {
+    const sb = sandbox('impl-real-edit');
+    const started = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    assert.equal(run(sb, ['result', id]).code, 0);
+    assert.doesNotMatch(run(sb, ['result', id]).stdout, /Job needs attention/);
+  });
+
+  test('implement that delivers by git commit is done, exit 0, even with a clean tree', async () => {
+    // PATTERNS.md rule 4: implement may commit/push/PR when the task asks for
+    // it. That legitimately leaves porcelain status exactly as it found it —
+    // clean in, clean out — so only HEAD movement tells this apart from a
+    // true no-op.
+    const sb = sandbox('impl-commit-delivery');
+    const started = run(sb, ['implement', '--prompt', 'commit the fix'], {
+      FAKE_AGY_GIT_COMMIT: 'agy: deliver the fix',
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.doesNotMatch(res.stdout, /Job needs attention/);
+    assert.match(res.stdout, /\[unrestricted\] Working tree clean after implement\./);
   });
 });
 
@@ -413,14 +490,19 @@ describe('working-tree delta report (review / research)', () => {
     const r = run(sb, ['review', '--prompt', 'Review PR #730']);
     assert.equal(r.code, 0, r.stderr);
     const id = jobIdOf(r.stdout);
+    // review has no implement-style postcondition: an empty delta is its
+    // normal, expected result, not something the fix should flag — this run
+    // must stay 'done', exit 0, unlike the implement zero-delta case above.
     assert.equal(await waitForJob(sb, id), 'done');
 
     const res = run(sb, ['result', id]);
+    assert.equal(res.code, 0, res.stderr);
     assert.match(res.stdout, /fake answer/);
     assert.doesNotMatch(res.stdout, /\[agy-staff\]/);
     assert.match(jobLog(sb, id), /\[agy-staff\] mode=review profile=unrestricted/);
     assert.doesNotMatch(res.stdout, /agy modified the working tree/);
     assert.doesNotMatch(res.stdout, /Working tree unchanged/);
+    assert.doesNotMatch(res.stdout, /Job needs attention/);
   });
 
   test('the delta is only what appeared during the run, not pre-existing dirt', async () => {

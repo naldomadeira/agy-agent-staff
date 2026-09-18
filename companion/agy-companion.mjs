@@ -1095,6 +1095,38 @@ function porcelainDelta(before, after) {
   return after.filter((line) => seen.get(line.slice(3)) !== line);
 }
 
+// A brand-new repo has a work tree and a porcelain status but no commit yet
+// — `git rev-parse HEAD` fails on that "unborn branch" the same way it fails
+// outside a repo entirely. Those are not the same "we don't know": the first
+// is a real, comparable state (no commits before, no commits after — nothing
+// moved); only the second must stay outside the noop check. This sentinel
+// keeps them distinguishable through the before/after comparison.
+const UNBORN_HEAD = '(unborn)';
+
+/** HEAD sha, UNBORN_HEAD for a repo with no commits yet, or null when git
+ *  can't tell us at all (no repo). Paired with porcelainSnapshot() so
+ *  implement's postcondition can tell "agy edited nothing" apart from "agy
+ *  committed": a commit can leave the working tree exactly as clean (or
+ *  exactly as dirty) as it found it, so the porcelain snapshot alone cannot
+ *  see it move. */
+function headSnapshot() {
+  const r = sh('git', ['rev-parse', 'HEAD']);
+  if (r.code === 0 && r.out) return r.out;
+  return inGitRepo() ? UNBORN_HEAD : null;
+}
+
+/** True only when two porcelain snapshots are the same lines in the same
+ *  order. Unlike porcelainDelta (which is one-directional, built for
+ *  reporting what *appeared*), this also catches entries that *disappeared*
+ *  — e.g. a pre-existing dirty file agy silently discarded without
+ *  committing — so it is the right check for "nothing happened", not for
+ *  what to print. */
+function snapshotsEqual(a, b) {
+  const x = a || [];
+  const y = b || [];
+  return x.length === y.length && x.every((line, i) => line === y[i]);
+}
+
 function implementGuardApplies(resolved) {
   return resolved.profile === 'unrestricted' && resolved.mode === 'implement';
 }
@@ -1112,10 +1144,23 @@ function implementDispatchWarning() {
   }
 }
 
-function implementPostcondition(before) {
-  if (!inGitRepo()) return '';
+/**
+ * Text is unchanged from before this run's `noop` field was added — every
+ * branch below prints exactly what it printed previously. `noop` is new: it
+ * tells the caller (executeRun / workerMain) whether this implement run
+ * edited nothing at all, so job status and exit code can reflect that. A run
+ * only counts as a noop when the working tree matches how it started *and*
+ * HEAD did not move — delivery by commit/push/PR (PATTERNS.md rule 4) can
+ * leave an identical or clean tree too, and that is real work, not a noop.
+ * A HEAD we could not read (see headSnapshot()) never counts as "unchanged":
+ * we don't invent a verdict from a missing `git rev-parse`.
+ */
+function implementPostcondition(before, headBefore) {
+  if (!inGitRepo()) return { text: '', noop: false };
   const after = porcelainSnapshot() || [];
-  if (!after.length) return '\n[unrestricted] Working tree clean after implement.';
+  const headAfter = headBefore !== null ? headSnapshot() : null;
+  const noop = snapshotsEqual(before, after) && headBefore !== null && headAfter !== null && headBefore === headAfter;
+  if (!after.length) return { text: '\n[unrestricted] Working tree clean after implement.', noop };
   const diffStat = sh('git', ['diff', '--stat']).out;
   const delta = before ? porcelainDelta(before, after) : after;
   const untracked = delta
@@ -1137,7 +1182,21 @@ function implementPostcondition(before) {
   }
   if (untracked) out += `\nNew untracked files: ${untracked}`;
   out += '\nACTION FOR THE CALLING AGENT: inspect the current workspace (`git status --short`, `git diff`) and distinguish pre-run dirty paths from this run\'s delta. Continue the same agy conversation for follow-up work. If committing or opening a PR, first verify the task explicitly authorized that delivery.';
-  return out;
+  return { text: out, noop };
+}
+
+/**
+ * Fires only when implementPostcondition() reports a true noop. Not an
+ * accusation against agy — same neutral framing as the tree-delta report
+ * above — just an unmet postcondition of `implement`, in the same direct,
+ * action-first voice as poolUnavailable() in worker-pool.mjs.
+ */
+function implementNoopMessage() {
+  return (
+    'Job needs attention: agy reported success but the repository is unchanged — no working tree delta ' +
+    'and HEAD did not move. implement runs are expected to edit the working tree; review the report below ' +
+    'against the task, then re-dispatch the job if the work still needs to happen.\n\n'
+  );
 }
 
 /** Tree-delta warning for staffer/review/research: silent unless agy dirtied
@@ -1163,6 +1222,7 @@ function treeDeltaReport(mode, before, after) {
 async function executeRun(resolved, prompt, opts, execution = null) {
   const workspaceBefore = resolved.mode === 'ask' ? null : porcelainSnapshot();
   const implementBefore = implementGuardApplies(resolved) ? workspaceBefore : null;
+  const implementHeadBefore = implementGuardApplies(resolved) ? headSnapshot() : null;
   const treeBefore = treeReportApplies(resolved) ? workspaceBefore : null;
 
   const invoke = {
@@ -1214,10 +1274,18 @@ async function executeRun(resolved, prompt, opts, execution = null) {
 
   // Guard output is part of the body: the calling agent must act on it.
   let guard = '';
-  if (implementGuardApplies(resolved)) guard += implementPostcondition(implementBefore);
+  if (implementGuardApplies(resolved)) {
+    const post = implementPostcondition(implementBefore, implementHeadBefore);
+    guard += post.text;
+    // Stashed on opts (the same side channel `warnings` already uses) so
+    // workerMain can turn a truly empty implement run into `attention`
+    // without executeRun knowing anything about job records.
+    opts.implementNoop = post.noop;
+  }
   if (treeReportApplies(resolved)) guard += treeDeltaReport(resolved.mode, treeBefore, treeAfter);
   opts.warnings ||= !!guard;
-  return guard ? response + '\n' + guard : response;
+  const body = guard ? response + '\n' + guard : response;
+  return opts.implementNoop ? implementNoopMessage() + body : body;
 }
 
 async function cmdRun(mode, opts) {
@@ -1358,12 +1426,21 @@ async function workerMain(jobId) {
     });
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     // Result and conversation metadata are durable before completion is visible.
-    job = finishJob(jobId, output + '\n', { status: 'done', warnings: opts.warnings });
+    // implement is the only mode this can fire for (opts.implementNoop is
+    // only ever set inside the implementGuardApplies branch of executeRun):
+    // agy reported success, but the repository ended the run exactly as it
+    // started, so there is nothing here for the calling agent to build on.
+    job = finishJob(jobId, output + '\n', opts.implementNoop
+      ? { status: 'attention', reason: 'implement_no_changes', warnings: opts.warnings }
+      : { status: 'done', warnings: opts.warnings });
     if (job.status === 'done' && !job.warnings) {
       for (const file of [job.events_file, job.progress_file]) {
         try { fs.unlinkSync(file); } catch (error) { process.stderr.write(`cleanup: ${error.message}\n`); }
       }
     }
+    // Mirrors the exit code the catch branch below already sets for its own
+    // terminal states — 'done' keeps the process's implicit 0.
+    process.exitCode = JOB_EXIT_CODES[job.status] ?? 1;
   } catch (error) {
     if (!job) throw error;
     job = loadState().jobs?.find((j) => j.id === jobId);
