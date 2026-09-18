@@ -4,7 +4,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { sandbox, run, agyCalls } from './helpers.mjs';
+import { sandbox, run, agyCalls, jobIdOf, waitForJob, waitForCalls, promptOf } from './helpers.mjs';
 
 describe('removed review flags (--diff-file / --pr / --target)', () => {
   for (const [flag, args] of [
@@ -116,6 +116,153 @@ describe('--worker scope', () => {
     const r = run(sb, ['research', '--worker', 'auto', '--prompt', 'a topic']);
     assert.equal(r.code, 0, r.stderr);
     assert.doesNotMatch(r.stderr, /--worker has no effect on/);
+  });
+});
+
+describe('flag scope (generalized)', () => {
+  // --worker was the first flag scoped to specific subcommands (see the
+  // "--worker scope" describe block above); the companion generalizes that
+  // into a single flag -> accepted-subcommands map (FLAG_SCOPE in
+  // companion/agy-companion.mjs) instead of one Set per flag. These pairs are
+  // a representative sample of the map, not the full flags x commands
+  // matrix: at least one rejecting command per command family (a run mode,
+  // continue, restart, a status-family command, setup) for every flag, plus
+  // the specific latent no-ops the map fixes:
+  //   - --model/--effort/--restricted/--unrestricted/--conversation/--job/
+  //     --json on `restart`: cmdRestart never reads the live invocation's
+  //     opts for these — it forwards the stored job spec — so passing them
+  //     used to look like an override that silently did nothing. (Exception:
+  //     --prompt/--prompt-file/--stdin on `restart` stay accepted-and-ignored
+  //     — see the FLAG_SCOPE comment in the companion for why, and the
+  //     "restart accepts and ignores --prompt" test below for the
+  //     already-documented invocation this preserves.)
+  //   - --continue (the boolean) on the `continue` subcommand itself: a
+  //     no-op today because cmdContinue always resolves a conversation id
+  //     before resolveRun() ever consults opts.continue.
+  //   - --json anywhere but review/continue: read unconditionally by
+  //     executeRun() but only ever changes behavior when the resolved mode
+  //     is review, so it silently did nothing for staffer/research/
+  //     implement/ask.
+  //   - --dry-run anywhere but setup: never read by any command at all.
+  const NEEDS_VALUE = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file']);
+  const rejectedPairs = [
+    ['model', 'status', []],
+    ['model', 'restart', ['fake-job']],
+    ['effort', 'cancel', []],
+    ['effort', 'restart', ['fake-job']],
+    ['restricted', 'wait', []],
+    ['restricted', 'restart', ['fake-job']],
+    ['unrestricted', 'observe', []],
+    ['unrestricted', 'restart', ['fake-job']],
+    ['conversation', 'workers', []],
+    ['conversation', 'restart', ['fake-job']],
+    ['job', 'staffer', []],
+    ['job', 'restart', ['fake-job']],
+    ['prompt', 'status', []],
+    ['prompt-file', 'wait', []],
+    ['stdin', 'result', []],
+    ['continue', 'continue', []],
+    ['continue', 'setup', []],
+    ['json', 'staffer', []],
+    ['json', 'ask', []],
+    ['json', 'restart', ['fake-job']],
+    ['restrict', 'status', []],
+    ['restrict', 'wait', []],
+    ['timeout', 'status', []],
+    ['timeout', 'cancel', []],
+    ['apply', 'staffer', []],
+    ['apply', 'wait', []],
+    ['dry-run', 'staffer', []],
+    ['dry-run', 'review', []],
+  ];
+
+  for (const [flag, cmd, extraArgs] of rejectedPairs) {
+    test(`--${flag} on ${cmd} dies naming the flag, the subcommand, and where it is valid`, () => {
+      const sb = sandbox(`flagscope-${flag}-${cmd}`);
+      const value = NEEDS_VALUE.has(flag) ? ['x'] : [];
+      const r = run(sb, [cmd, ...extraArgs, `--${flag}`, ...value]);
+      assert.equal(r.code, 1, `${cmd} --${flag} must use the usage-error exit code (stdout: ${r.stdout} stderr: ${r.stderr})`);
+      assert.match(r.stderr, new RegExp(`--${flag} has no effect on ${cmd}:`));
+      assert.match(r.stderr, /valid on:/);
+      assert.equal(agyCalls(sb).length, 0, 'agy must not be invoked');
+    });
+  }
+
+  test('an unrecognized subcommand still gets its own error, not a flag-scope one', () => {
+    const sb = sandbox('flagscope-unknown-cmd');
+    const r = run(sb, ['frobnicate', '--model', 'x']);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /unknown subcommand: frobnicate/);
+    assert.doesNotMatch(r.stderr, /has no effect on frobnicate/);
+  });
+
+  test('staffer/research/review/implement/ask still accept model, effort and timeout', () => {
+    const sb = sandbox('flagscope-accept-run');
+    const r = run(sb, ['staffer', '--effort', 'high', '--timeout', '5m', '--prompt', 'do it']);
+    assert.equal(r.code, 0, r.stderr);
+  });
+
+  test('review still accepts --json', () => {
+    const sb = sandbox('flagscope-accept-review-json');
+    const r = run(sb, ['review', '--json', '--prompt', 'Review PR #730']);
+    assert.equal(r.code, 0, r.stderr);
+  });
+
+  test('continue still accepts --job and task-text flags (reaches cmdContinue, not rejected for scope)', () => {
+    const sb = sandbox('flagscope-accept-continue');
+    const r = run(sb, ['continue', '--job', 'missing-job', '--prompt', 'next']);
+    assert.notEqual(r.code, 0);
+    assert.doesNotMatch(r.stderr, /has no effect on continue/);
+    assert.match(r.stderr, /no job missing-job/);
+  });
+
+  test('restart still accepts --worker and --timeout (reaches cmdRestart, not rejected for scope)', () => {
+    const sb = sandbox('flagscope-accept-restart');
+    const r = run(sb, ['restart', 'missing-job', '--worker', 'auto', '--timeout', '5m']);
+    assert.notEqual(r.code, 0);
+    assert.doesNotMatch(r.stderr, /has no effect on restart/);
+    assert.match(r.stderr, /no job missing-job/);
+  });
+
+  test('restart accepts and ignores --prompt (cmdRestart rebuilds the prompt from the stored spec)', async () => {
+    const sb = sandbox('flagscope-accept-restart-prompt');
+    const first = run(sb, ['staffer', '--prompt', 'original task']);
+    assert.equal(first.code, 0, first.stderr);
+    const id = jobIdOf(first.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    const [originalArgv] = await waitForCalls(sb, 1);
+
+    const restarted = run(sb, ['restart', id, '--prompt', 'this value is ignored']);
+    assert.equal(restarted.code, 0, restarted.stderr);
+    assert.doesNotMatch(restarted.stderr, /has no effect on restart/);
+    const restartId = jobIdOf(restarted.stdout);
+    assert.equal(await waitForJob(sb, restartId), 'done');
+    const [, restartArgv] = await waitForCalls(sb, 2);
+    // The restarted run used the original stored task, not the ignored override.
+    assert.equal(promptOf(restartArgv), promptOf(originalArgv));
+    assert.doesNotMatch(promptOf(restartArgv), /this value is ignored/);
+  });
+
+  test('wait still accepts --timeout (reaches cmdWait, not rejected for scope)', () => {
+    const sb = sandbox('flagscope-accept-wait');
+    const r = run(sb, ['wait', '--timeout', '1s']);
+    assert.doesNotMatch(r.stderr, /has no effect on wait/);
+    assert.match(r.stderr, /no agy-staff jobs recorded/);
+  });
+
+  test('setup still accepts --restrict, --apply and --dry-run', () => {
+    const sb = sandbox('flagscope-accept-setup');
+    const r = run(sb, ['setup', '--restrict', 'review', '--dry-run']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /has no effect on setup/);
+  });
+
+  test('status/result/cancel/observe/workers keep accepting zero flags (baseline unaffected)', () => {
+    const sb = sandbox('flagscope-accept-bare');
+    for (const cmd of ['status', 'result', 'cancel', 'observe', 'workers']) {
+      const r = run(sb, [cmd]);
+      assert.doesNotMatch(r.stderr, new RegExp(`has no effect on ${cmd}`), `${cmd}: ${r.stderr}`);
+    }
   });
 });
 

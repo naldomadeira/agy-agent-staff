@@ -119,13 +119,17 @@ Caveat, stated plainly: **the exact project-settings file path is undocumented a
 | `--restricted` / `--unrestricted` | permission profile override (ignored by `ask`). `unrestricted` is the default for `staffer`/`research`/`review`/`implement`, so `--restricted` is the flag you actually reach for |
 | `--restrict <modes\|none>` | (setup) per-repo policy: the listed modes default to restricted in this repository; `none` clears it. See [Per-repo policy](#per-repo-policy-setup---restrict) |
 | `--worker <id>` | (opt-in worker pool) select a specific discovered worker by id for this run, or `auto` for automatic selection by load. Valid on `staffer`/`research`/`review`/`implement`/`ask`, `continue`, and `restart`; rejected with an error on `status`, `wait`, `result`, `cancel`, `observe`, `setup`, and `workers`, which never dispatch to a worker. See [Optional worker pool](#optional-worker-pool) |
-| `--json` | (review) schema-enforced JSON findings; default is free-form markdown. Meant for the code-review flavor |
-| `--timeout <dur>` | Background worker hard limit (default 60m, maximum 120m). AGY receives the selected response timeout. For synchronous ask: AGY response timeout, default 2m |
+| `--json` | (review) schema-enforced JSON findings; default is free-form markdown. Meant for the code-review flavor; valid on `review` and on `continue` (it only takes effect if the resumed conversation's mode is `review`), rejected with an error elsewhere |
+| `--timeout <dur>` | Background worker hard limit (default 60m, maximum 120m). AGY receives the selected response timeout. For synchronous ask: AGY response timeout, default 2m. Also valid on `wait` (its own soft poll timeout, default 100s) and `restart` (a fresh budget for the relaunch) |
 | `--prompt <text>` | the task text as one argument. Quote it; whatever is inside is opaque |
 | `--prompt-file <path>` | read the task text from a file — for long prompts, instead of shell quoting |
 | `--stdin` | read the task text from stdin. Exactly one task source per call: `--prompt`, `--prompt-file`, or `--stdin` |
 
 That table, together with the persona table above, is the whole public surface. There is no flag for execution style — see the modes table above.
+
+**Flag scope.** Every flag above is valid only on the subcommands that actually read it; passing it elsewhere is rejected before agy is ever invoked, with an error naming the flag, the subcommand, and where it is valid (`--worker`'s row above shows the pattern). Two scopes worth calling out because they are narrower than "every run command":
+- `restart` only reads `--worker` and `--timeout` from its own invocation — it replays the stored job's original model, profile, and task, so `--model`/`--effort`/`--restricted`/`--unrestricted`/`--conversation`/`--job` are rejected there. `--prompt`/`--prompt-file`/`--stdin` are the one exception: accepted for backward compatibility, but ignored, since `restart` always rebuilds the prompt from the stored spec.
+- `--continue` (the boolean flag) is rejected on the `continue` subcommand itself — `continue` has already resolved which conversation to resume before that flag would ever be consulted, so it only does something on a direct run command (`research --continue`).
 
 ## Task text
 
