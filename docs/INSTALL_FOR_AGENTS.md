@@ -3,7 +3,7 @@
 You are a coding agent that has been asked to install and verify the **agy-staff** plugin. Follow this file top to bottom. When you finish (or get blocked), report the outcome to the user **in the user's own language** — the language they have been using with you, not necessarily English.
 
 > [!IMPORTANT]
-> If you reached this file through a URL, read its **raw** text — `curl -fsSL https://raw.githubusercontent.com/keli-wen/agy-staff/master/docs/INSTALL_FOR_AGENTS.md` — or clone the repo. Fetching the rendered page through a web tool that summarises before handing you the content can return a paraphrase, and a paraphrased install command is a broken install command. If all you have is a summary, stop and fetch the raw file.
+> If you reached this file through a URL, read its **raw** text — `curl -fsSL https://raw.githubusercontent.com/naldomadeira/agy-agent-staff/master/docs/INSTALL_FOR_AGENTS.md` — or clone the repo. Fetching the rendered page through a web tool that summarises before handing you the content can return a paraphrase, and a paraphrased install command is a broken install command. If all you have is a summary, stop and fetch the raw file.
 
 ## 0. Prerequisites
 
@@ -28,7 +28,7 @@ Use the `claude` CLI. The `/plugin …` forms you may have seen are TUI slash co
 Install (use the local checkout path instead of the slug if the user gave you one):
 
 ```bash
-claude plugin marketplace add keli-wen/agy-staff   # human types: /plugin marketplace add keli-wen/agy-staff
+claude plugin marketplace add naldomadeira/agy-agent-staff   # human types: /plugin marketplace add naldomadeira/agy-agent-staff
 claude plugin install agy@agy-staff                # human types: /plugin install agy@agy-staff
 ```
 
@@ -51,7 +51,7 @@ Then verify what actually landed: `claude plugin list` should show `agy@agy-staf
 Install (use the local checkout path instead of the URL if the user gave you one):
 
 ```bash
-codex plugin marketplace add https://github.com/keli-wen/agy-staff
+codex plugin marketplace add https://github.com/naldomadeira/agy-agent-staff
 codex plugin add agy@agy-staff
 ```
 
@@ -65,7 +65,7 @@ Then the user must restart the app — Codex caches plugins per version. Upgrade
 Install (use the local checkout path if provided):
 
 ```bash
-pi install git:github.com/keli-wen/agy-staff
+pi install git:github.com/naldomadeira/agy-agent-staff
 ```
 
 For local development checkouts, use `pi install /absolute/path/to/checkout` (or `pi -e /absolute/path/to/checkout` for a temporary session). Run `npm run generate:pi` in the checkout if canonical skills were modified.
@@ -73,10 +73,10 @@ For local development checkouts, use `pi install /absolute/path/to/checkout` (or
 To upgrade an existing Git install:
 
 ```bash
-pi update --extension git:github.com/keli-wen/agy-staff
+pi update --extension git:github.com/naldomadeira/agy-agent-staff
 ```
 
-Restart Pi or run `/reload` afterwards. Use `pi list` to verify the package is registered, then check Pi's skill picker for `agy-lead`, `agy-ask`, `agy-staffer`, `agy-researcher`, `agy-reviewer`, `agy-implementer`, and `agy-jobs`.
+Restart Pi or run `/reload` afterwards. Use `pi list` to verify the package is registered, then check Pi's skill picker for `agy-lead`, `agy-ask`, `agy-staffer`, `agy-researcher`, `agy-reviewer`, `agy-implementer`, `agy-pool`, and `agy-jobs`.
 
 ## 3. Smoke test
 
@@ -130,6 +130,8 @@ If the user is security-sensitive and the machine-wide scope is unacceptable, te
 Exit 5 signals a timeout with a resumable conversation. Inspect the retained workspace changes and ask whether to continue with the suggested timeout or stop; recover only after explicit user confirmation. The continuation command preserves the original persona/model/profile. This also applies to synchronous `ask`; no run automatically retries or continues.
 
 Per-repo state lives in `<repo>/.agy-staff/`; the companion git-ignores it automatically on first use (via `.git/info/exclude` — the tracked `.gitignore` is never touched).
+
+The plugin also ships an opt-in worker pool: when the install exposes more than one `agy` executable, the `pool` skill (`agy-pool` on Pi) lists discovered workers, and any other mode accepts `--worker <id>` (or `auto`) for explicit selection. A normal single-worker install needs none of this — it is invisible unless requested.
 
 ## 6. Report back
 

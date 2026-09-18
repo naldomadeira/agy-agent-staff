@@ -1,17 +1,27 @@
 {
-  "name": "agy-staff",
-  "version": "0.7.5",
+  "name": "agy-agent-staff",
+  "version": "0.7.6",
   "description": "Delegate work to Google's Antigravity CLI (agy) with fast Gemini access.",
   "keywords": [
     "pi-package"
   ],
   "license": "MIT",
+  "author": {
+    "name": "Keli Wen",
+    "url": "https://github.com/keli-wen"
+  },
+  "maintainers": [
+    {
+      "name": "Naldo Madeira",
+      "url": "https://github.com/naldomadeira"
+    }
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/keli-wen/agy-staff.git"
+    "url": "git+https://github.com/naldomadeira/agy-agent-staff.git"
   },
-  "homepage": "https://github.com/keli-wen/agy-staff",
-  "bugs": "https://github.com/keli-wen/agy-staff/issues",
+  "homepage": "https://github.com/naldomadeira/agy-agent-staff",
+  "bugs": "https://github.com/naldomadeira/agy-agent-staff/issues",
   "files": [
     "skills/",
     "pi-skills/",

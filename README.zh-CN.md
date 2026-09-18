@@ -103,7 +103,7 @@ install and verify the agy-staff plugin for the harness you are running in. Resp
 
 ### 可选 worker 池
 
-正常安装只使用一个 worker：`AGY_BIN || agy`。worker 池是可选能力；使用 `$agy:pool workers`（或 `/agy:pool workers`）查看 worker，并用 `--worker <id>` 指定。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，最后是可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行文件或显式路径。任务在 `continue` 和 `restart` 时保持 worker 亲和性。并行仅用于独立任务；并行写入需要不同 worktree 或明确授权。
+正常安装只使用一个 worker：`AGY_BIN || agy`。worker 池是可选能力；使用 `$agy:pool workers`（或 `/agy:pool workers`）查看 worker，并用 `--worker <id>` 指定。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，最后是可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行文件或显式路径。任务在 `continue` 和 `restart` 时保持 worker 亲和性。每一次派发、状态记录和观察快照都会标出所使用的外部 AGY worker，让 Codex 和 Claude Code 获得一致的可见上下文，即使宿主原生的 subagent 面板无法呈现外部进程。并行仅用于独立任务；并行写入需要不同 worktree 或明确授权。
 
 `lead` 为当前主 agent 增加任务编排指导。在 lead 工作流中，主 agent 了解至足以明确任务后，默认用 `staffer` 承担实质性工作，等待结果返回后再验收、整合或追加任务；专门指导有帮助时再选择 specialist，`ask` 仅用于测试。主 agent 负责跨任务决策、验收、整合和交付，复用现有 jobs 工作流。Claude Code 使用 `/agy:lead`，Codex 使用 `$agy:lead`，Pi 使用 `/skill:agy-lead`。
 

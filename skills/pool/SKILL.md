@@ -9,6 +9,20 @@ allowed-tools: Bash(node:*)
 
 The pool is opt-in. Use `workers` to inspect available workers, or pass `--worker <id>` when dispatching another persona. Without an explicit pool request, the existing skills continue to use the legacy worker (`AGY_BIN || agy`).
 
+## Locating the companion
+
+This skill file lives at `<plugin-root>/skills/pool/SKILL.md`; resolve the companion path relative to this skill directory:
+
+```bash
+node "<skill-dir>/../../companion/agy-companion.mjs" workers
+node "<skill-dir>/../../companion/agy-companion.mjs" <staffer|research|review|implement|ask> --worker <id|auto> --prompt "task"
+```
+
+`workers` prints one row per worker: id, executable, availability, version, capacity, and active jobs. Pass an id from its first column to `--worker`; `--worker auto` picks the available worker with the lowest active-job count. A busy pinned worker is reported as busy, with its load and capacity — that is a reason to wait or cancel, never to dispatch the same job elsewhere.
+
+> [!IMPORTANT]
+> Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../jobs/references/troubleshooting.md`.
+
 ## Discovery and selection
 
 Workers are discovered by the companion in this order: `AGY_BIN`, entries in `AGY_POOL_BINS`, executable candidates `agy`, `agy2`, `agy3` on `PATH`, then optional `.agy-staff/config.json`. A config may name explicit executables:
@@ -21,7 +35,9 @@ Workers are discovered by the companion in this order: `AGY_BIN`, entries in `AG
 ]}
 ```
 
-Aliases and shell functions are invisible to Node; use real `PATH` executables or explicit paths. The default capacity is one active job per worker. Select the available worker with the lowest active-job count, unless a job or conversation already has affinity.
+Aliases and shell functions are invisible to Node; use real `PATH` executables or explicit paths. The same executable reached two ways — an absolute `AGY_BIN` and the bare name found on `PATH` — is one worker, not two; ids that would otherwise collide are suffixed (`agy2-2`) so every row stays addressable by `--worker`. Separate symlinks to one agy executable stay separate workers.
+
+The default capacity is one active job per worker. Select the available worker with the lowest active-job count, unless a job or conversation already has affinity.
 
 ## Safe parallelism
 
