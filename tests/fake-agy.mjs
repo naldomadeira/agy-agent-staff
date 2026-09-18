@@ -18,6 +18,11 @@
  *   FAKE_AGY_TOUCH_FILE      create this file mid-"run" (default: touch nothing)
  *                            — simulates agy dirtying the working tree, which
  *                            the review/research delta report must catch
+ *   FAKE_AGY_GIT_COMMIT      commit message; stage everything and commit it
+ *                            mid-"run" (default: commit nothing) — simulates
+ *                            agy delivering by git (PATTERNS.md rule 4),
+ *                            which can leave the tree exactly as clean (or
+ *                            dirty) as it found it while HEAD still moves
  *   FAKE_AGY_STDERR          text written to stderr alongside the payload
  *                            (or before dying under FAKE_AGY_NO_JSON)
  *   FAKE_AGY_ERROR           payload `error` field (default: absent)
@@ -27,7 +32,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
 if (process.env.FAKE_AGY_CWD_FILE) fs.writeFileSync(process.env.FAKE_AGY_CWD_FILE, process.cwd());
@@ -78,6 +83,18 @@ if (touch) {
   const target = path.resolve(touch);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, 'written by fake agy\n');
+}
+
+// Same window as the touch knob above: strictly between the companion's
+// before/after snapshots, so a test can simulate agy delivering by git
+// (commit/push/PR) instead of leaving the working tree dirty.
+const commitMessage = process.env.FAKE_AGY_GIT_COMMIT;
+if (commitMessage) {
+  execFileSync('git', ['add', '-A']);
+  execFileSync('git', [
+    '-c', 'user.name=fake-agy', '-c', 'user.email=fake-agy@example.com',
+    'commit', '--allow-empty', '-qm', commitMessage,
+  ]);
 }
 
 const streaming = argv[argv.indexOf('--output-format') + 1] === 'stream-json';
