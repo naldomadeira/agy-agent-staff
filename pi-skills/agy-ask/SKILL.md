@@ -30,7 +30,7 @@ Pass the user's question verbatim via `--prompt`; use `--prompt-file <path>` or 
 
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the question, from exactly one of these three sources. Use file/stdin for a long question.
 - `--continue` — reuse the last ask conversation; `--conversation <id>` targets a specific one.
-- `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-low`.
+- `--model <id>` or `--effort low|medium|high` — default model is `gemini-3.8-flash-low`. When to override: `../agy-jobs/references/model-routing.md`.
 - `--timeout <dur>` — default 2m.
 
 ask is always restricted (it is tool-free, so there is nothing to unrestrict); `--unrestricted` is ignored with a note on stderr. That is fixed for ask alone — the tool-using personas default to unrestricted, where `--restricted` is an opt-in hardening flag. Execution style is likewise fixed per mode and no flag changes it.
