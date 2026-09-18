@@ -14,7 +14,7 @@ Hire Google's Antigravity CLI (`agy`) as a staffer for **Claude Code**, **OpenAI
 
 ## What & Why
 
-agy-staff lets your senior agents delegate to `agy`, which ships fast Gemini 3.8 Flash. Five personas: staffer (general-purpose), researcher, reviewer (code **and** plans/decisions), implementer, and ask — plus a model-facing jobs skill. Claude Code uses `/agy:<persona>` and Codex uses `$agy:<persona>`.
+agy-staff lets your senior agents delegate to `agy`, which ships fast Gemini 3.8 Flash. Eight skills: staffer (general-purpose), researcher, reviewer (code **and** plans/decisions), implementer, and ask — plus lead (orchestration), pool (optional worker pool), and a model-facing jobs skill. Claude Code uses `/agy:<persona>` and Codex uses `$agy:<persona>`.
 
 If you use Codex you know the feeling: GPT-5.6-Sol is slow even with fast mode on. Claude Code is quicker but still not fast, and Fable quota is scarce enough that you want it orchestrating subagents, not grinding through every survey and review itself. An agy worker gives you a fast lane — second opinions in seconds, research and reviews at Flash speed, scoped implementation handled off to the side while you keep moving. And where speed isn't the point, a second model family looking at the same code buys coverage and robustness your main agent can't give itself.
 
@@ -24,7 +24,7 @@ If you use Codex you know the feeling: GPT-5.6-Sol is slow even with fast mode o
 
 ### Invoke a persona
 
-Type `/agy:` in Claude Code and the five personas are right there:
+Type `/agy:` in Claude Code and all eight skills are right there:
 
 ![the /agy: command menu in Claude Code](assets/claude-code-screenshot.png)
 
@@ -46,13 +46,15 @@ Step 2 — install the plugin into your harness:
 
 ```bash
 claude plugin marketplace add naldomadeira/agy-agent-staff
-claude plugin install agy@agy
+claude plugin install agy@agy-staff
 ```
 
 ```bash
 codex plugin marketplace add https://github.com/naldomadeira/agy-agent-staff
-codex plugin add agy@agy
+codex plugin add agy@agy-staff
 ```
+
+> The marketplace is named `agy-staff` while the repository is `agy-agent-staff` — the id after `@` is the marketplace name.
 
 <details>
 <summary>Using Pi?</summary>
@@ -74,7 +76,7 @@ Restart Claude Code or Codex afterwards. First run: `/agy:ask reply with OK` (Cl
 Paste this into any coding agent:
 
 ```
-Read the raw text of https://raw.githubusercontent.com/keli-wen/agy-staff/master/docs/INSTALL_FOR_AGENTS.md (curl it — do not
+Read the raw text of https://raw.githubusercontent.com/naldomadeira/agy-agent-staff/master/docs/INSTALL_FOR_AGENTS.md (curl it — do not
 work from a summary) and follow it to install and verify the agy-staff plugin for the harness you are running in.
 Respond in the user's language.
 ```
@@ -84,11 +86,11 @@ Respond in the user's language.
 Claude Code and Codex install a *copy*, so a new version only reaches you when you pull it in yourself:
 
 ```bash
-claude plugin marketplace update agy-agent-staff && claude plugin update agy@agy
+claude plugin marketplace update agy-staff && claude plugin update agy@agy-staff
 ```
 
 ```bash
-codex plugin marketplace upgrade && codex plugin add agy@agy  # then restart Codex
+codex plugin marketplace upgrade && codex plugin add agy@agy-staff  # then restart Codex
 ```
 
 Claude Code and Codex cache per version directory, so an upgrade lands only if the plugin version changed; restart the harness afterwards. If a fix does not show up, see [upgrading](docs/REFERENCE.md#upgrading) — it has the force-refresh command.
@@ -108,6 +110,7 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 | Review a plan or decision | `/agy:reviewer Challenge the migration plan in docs/plan.md` |
 | Survey a topic | `/agy:researcher how does auth work in this repo` |
 | Implement a scoped fix | `/agy:implementer fix the flaky retry test` |
+| Inspect or select an AGY worker | `/agy:pool workers` |
 | Job ops (wait/status/cancel/continue) | natural language: "is the agy job done?", "continue: also check the error path" |
 
 `reviewer` is fully prompt-based: you describe the subject and agy gathers the evidence itself (`gh pr view`, `git diff`, reading the file) — there is no flag for handing it a diff. It has two flavors, routed by subject: code review (severity-ranked findings) and general review (a multi-angle challenge of a plan, design, or decision).

@@ -4,11 +4,7 @@
 
 ## 模式与默认值
 
-## 可选 worker 池
-
-默认仍使用单个 worker：`AGY_BIN || agy`。可选的 `pool` 技能提供 `workers` 检查命令和 `--worker <id>` 显式选择；没有请求 pool 时，现有技能行为不变。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，以及可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行包装器或显式路径。任务记录 worker ID、可执行文件和可用时的版本；`continue` 和 `restart` 保持亲和性，旧任务使用 `AGY_BIN || agy`。每个 worker 默认一个活动任务。独立任务可并行，依赖任务保持顺序；并行写入需要不同 worktree 或明确授权。`workers` 显示 ID、可执行文件、可用性、版本和活动任务数。
-
-插件提供五种角色（persona），每种角色对应一个技能。你选择角色并描述任务，主 agent 就会按照技能中的说明调用 companion CLI。companion 是插件自带的 Node.js 程序，负责启动 agy、保存任务状态和收取结果。
+插件提供八种技能（其中 `jobs` 只能由模型自行调用）。你选择角色并描述任务，主 agent 就会按照技能中的说明调用 companion CLI。companion 是插件自带的 Node.js 程序，负责启动 agy、保存任务状态和收取结果。
 
 | 角色技能 | companion 命令 | 用途 | 默认模型 | 执行方式 |
 | --- | --- | --- | --- | --- |
@@ -17,6 +13,7 @@
 | `researcher` | `research` | 调研并引用来源，注明尚未验证的结论 | `gemini-3.8-flash-high` | 返回后台任务 ID |
 | `reviewer` | `review` | 审查代码、方案或决策 | `gemini-3.8-flash-medium` | 返回后台任务 ID |
 | `implementer` | `implement` | 完成范围明确的编码任务 | `gemini-3.8-flash-high` | 返回后台任务 ID |
+| `pool` | `workers` | 可选的 worker 检查：列出已发现的 AGY worker，或在调用其他角色时用 `--worker <id>` 显式选择 | — | 不调用 agy | 同步返回 worker 表 |
 
 `lead` 为当前主 agent 提供任务编排指导，复用现有 companion 模式，没有自己的运行模式；Claude Code 使用 `/agy:lead`，Codex 使用 `$agy:lead`，Pi 使用 `/skill:agy-lead`。
 
@@ -29,6 +26,10 @@ Claude Code 使用 `/agy:<persona>`，Codex 使用 `$agy:<persona>`，Pi 使用 
 Pi 加载的入口位于 `pi-skills/`，由 `npm run generate:pi` 根据 `skills/` 自动生成。生成过程会添加 `agy-` 前缀、调整技能之间的相对路径，并附上 `templates/harness-compatibility.md`。这份兼容说明要求主 agent 在工具不可用时寻找等价方法，保留原有要求；无法做到时再向用户求助。
 
 任务管理由 `jobs` 技能和 companion CLI 共同完成，在 Pi 中对应 `agy-jobs`。通常直接对主 agent 说“agy 的任务进展如何”或“继续刚才的任务”即可，不需要手动记住管理命令。
+
+## 可选 worker 池
+
+默认仍使用单个 worker：`AGY_BIN || agy`。可选的 `pool` 技能提供 `workers` 检查命令和 `--worker <id>` 显式选择；没有请求 pool 时，现有技能行为不变。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，以及可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行包装器或显式路径。任务记录 worker ID、可执行文件和可用时的版本；`continue` 和 `restart` 保持亲和性，旧任务使用 `AGY_BIN || agy`。每一次派发、状态记录和观察快照都会标出所使用的外部 AGY worker，让 Codex 和 Claude Code 获得一致的可见上下文，即使宿主原生的 subagent 面板无法呈现外部进程。每个 worker 默认一个活动任务。独立任务可并行，依赖任务保持顺序；并行写入需要不同 worktree 或明确授权。`workers` 显示 ID、可执行文件、可用性、版本和活动任务数。
 
 <a id="双权限档模型"></a>
 
@@ -122,6 +123,7 @@ agy 还有与 `--project` 体系关联的项目级权限规则，可以将权限
 | `--effort low\|medium\|high` | 指定推理强度，是 `gemini-3.8-flash-<effort>` 的简写 |
 | `--restricted` / `--unrestricted` | 覆盖本次运行的权限配置；`ask` 会忽略这两个参数 |
 | `--restrict <modes\|none>` | 用于 `setup`，设置或清除[仓库默认权限](#仓库级-policysetup---restrict) |
+| `--worker <id>` | 可选 worker 池：为本次运行显式选择某个已发现的 worker，或传入 `auto` 按负载自动选择；对不会调用 agy 的模式无效 |
 | `--json` | 用于代码审查，按指定结构返回 JSON 格式的问题列表；默认使用 Markdown |
 | `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m |
 | `--prompt <text>` | 将任务正文作为一个参数传入，通常需要用引号包住 |
@@ -367,7 +369,7 @@ Claude Code 和 Codex 按版本号缓存插件，例如 `cache/agy-staff/agy/0.4
 
 ### Pi
 
-Pi 的 Git 安装跟随所配置的分支或引用，本地路径安装则直接读取检出目录。没有固定版本的 Git 安装可以运行 `pi update --extension git:github.com/keli-wen/agy-staff`，然后在 Pi 中执行 `/reload`。
+Pi 的 Git 安装跟随所配置的分支或引用，本地路径安装则直接读取检出目录。没有固定版本的 Git 安装可以运行 `pi update --extension git:github.com/naldomadeira/agy-agent-staff`，然后在 Pi 中执行 `/reload`。
 
 本地开发时，在检出目录运行 `npm run generate:pi`，再执行 `/reload` 即可加载技能修改，无需先推送到远端。
 

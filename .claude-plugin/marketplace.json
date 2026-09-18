@@ -4,12 +4,18 @@
     "name": "Keli Wen",
     "url": "https://github.com/keli-wen"
   },
+  "maintainers": [
+    {
+      "name": "Naldo Madeira",
+      "url": "https://github.com/naldomadeira"
+    }
+  ],
   "description": "agy-staff: delegate work to Google's Antigravity CLI (agy) from Claude Code and Codex.",
   "plugins": [
     {
       "name": "agy",
       "source": "./",
-      "description": "Five personas over agy (fast Gemini) - staffer, researcher, reviewer, implementer, ask - with a two-profile permission model and background jobs.",
+      "description": "Eight skills over agy (fast Gemini) - staffer, researcher, reviewer, implementer, ask, lead, pool, and jobs - with a two-profile permission model and background job orchestration.",
       "tags": ["antigravity", "gemini", "delegation", "code-review"]
     }
   ]

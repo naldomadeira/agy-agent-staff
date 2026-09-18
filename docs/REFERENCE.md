@@ -4,10 +4,6 @@ Back to the [README](../README.md). See the [Chinese reference](REFERENCE.zh-CN.
 
 ## Modes and defaults
 
-## Optional worker pool
-
-The normal path remains a single worker resolved as `AGY_BIN || agy`. The opt-in `pool` skill exposes `workers` for inspection and `--worker <id>` for explicit selection; existing skills remain unchanged otherwise. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, `agy`/`agy2`/`agy3` on `PATH`, then optional `.agy-staff/config.json`. Node cannot discover shell aliases or functions; use executable wrappers or explicit paths. Jobs record worker id, executable, and version when available; `continue` and `restart` preserve affinity, while legacy jobs use `AGY_BIN || agy`. Dispatch output, list status, observe snapshots, and diagnostics include worker identity so every host can present the external-worker context consistently without changing delivered-result text. The default capacity is one active job per worker. Independent tasks may run in parallel; dependent tasks stay sequential, and parallel writes require separate worktrees or explicit authorization. `workers` reports id, executable, availability, version, and active-job count.
-
 | Persona (skill) | Companion mode | What it is | Default model | Profile | Execution |
 |---|---|---|---|---|---|
 | `ask` | `ask` | Cheap zero-tool one-shot Q&A (~3s); doubles as the post-install smoke test | `gemini-3.8-flash-low` | restricted (prompt-only) | synchronous — the answer comes back in the same call |
@@ -15,12 +11,17 @@ The normal path remains a single worker resolved as `AGY_BIN || agy`. The opt-in
 | `researcher` | `research` | Deep survey with cited sources and explicit unverified-claims marking | `gemini-3.8-flash-high` | unrestricted | background job — returns a job id |
 | `reviewer` | `review` | Second-opinion verifier, two flavors routed by subject: code review (severity-ranked findings with `file:line` refs) and general review (multi-angle challenge of a plan, design, or decision) | `gemini-3.8-flash-medium` | unrestricted | background job — returns a job id |
 | `implementer` | `implement` | Well-scoped coding task; agy edits the working tree and can perform explicitly requested Git delivery | `gemini-3.8-flash-high` | unrestricted | background job — returns a job id |
+| `pool` | `workers` | Opt-in worker inspection: list discovered AGY workers, or pass `--worker <id>` when dispatching another persona for explicit selection | — | n/a — no agy invocation | synchronous — prints the worker table in the same call |
 
 `lead` provides task orchestration guidance for the current agent, reusing the existing companion modes without adding a mode of its own; invoke `/agy:lead` in Claude Code, `$agy:lead` in Codex, or `/skill:agy-lead` in Pi.
 
 Execution style is fixed per mode and cannot be overridden by a flag. `continue` inherits the resolved mode's style (continuing an `ask` stays synchronous; continuing the others returns a job id).
 
 Claude Code, Codex, and Pi surface the same personas, backed by one companion script (`companion/agy-companion.mjs`, Node stdlib only) and shared prompt templates (`templates/`). Invocation tokens: `/agy:<persona>` on Claude Code, `$agy:<persona>` on Codex, and `/skill:agy-<persona>` on Pi. Pi's manifest exposes only `pi-skills/`, generated mechanically from canonical `skills/` via `npm run generate:pi`. Generated skills use `agy-` prefixes, rewrite sibling references, and append `templates/harness-compatibility.md` (directing the host to adapt missing tools to equivalent methods without dropping requirements, or ask for help). Job management (`wait`/`status`/`result`/`cancel`/`continue`/`setup`) lives in `jobs` (`agy-jobs` on Pi) plus the companion CLI — ask for it in natural language ("is the agy job done?").
+
+## Optional worker pool
+
+The normal path remains a single worker resolved as `AGY_BIN || agy`. The opt-in `pool` skill exposes `workers` for inspection and `--worker <id>` for explicit selection; existing skills remain unchanged otherwise. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, `agy`/`agy2`/`agy3` on `PATH`, then optional `.agy-staff/config.json`. Node cannot discover shell aliases or functions; use executable wrappers or explicit paths. Jobs record worker id, executable, and version when available; `continue` and `restart` preserve affinity, while legacy jobs use `AGY_BIN || agy`. Dispatch output, list status, observe snapshots, and diagnostics include worker identity so every host can present the external-worker context consistently without changing delivered-result text. The default capacity is one active job per worker. Independent tasks may run in parallel; dependent tasks stay sequential, and parallel writes require separate worktrees or explicit authorization. `workers` reports id, executable, availability, version, and active-job count.
 
 ## The two-profile permission model
 
@@ -117,13 +118,14 @@ Caveat, stated plainly: **the exact project-settings file path is undocumented a
 | `--effort low\|medium\|high` | shorthand for `gemini-3.8-flash-<effort>` |
 | `--restricted` / `--unrestricted` | permission profile override (ignored by `ask`). `unrestricted` is the default for `staffer`/`research`/`review`/`implement`, so `--restricted` is the flag you actually reach for |
 | `--restrict <modes\|none>` | (setup) per-repo policy: the listed modes default to restricted in this repository; `none` clears it. See [Per-repo policy](#per-repo-policy-setup---restrict) |
+| `--worker <id>` | (opt-in worker pool) select a specific discovered worker by id for this run, or `auto` for automatic selection by load; ignored by modes that never reach agy. See [Optional worker pool](#optional-worker-pool) |
 | `--json` | (review) schema-enforced JSON findings; default is free-form markdown. Meant for the code-review flavor |
 | `--timeout <dur>` | Background worker hard limit (default 60m, maximum 120m). AGY receives the selected response timeout. For synchronous ask: AGY response timeout, default 2m |
 | `--prompt <text>` | the task text as one argument. Quote it; whatever is inside is opaque |
 | `--prompt-file <path>` | read the task text from a file — for long prompts, instead of shell quoting |
 | `--stdin` | read the task text from stdin. Exactly one task source per call: `--prompt`, `--prompt-file`, or `--stdin` |
 
-That table is the whole public surface. There is no flag for execution style — see the modes table above.
+That table, together with the persona table above, is the whole public surface. There is no flag for execution style — see the modes table above.
 
 ## Task text
 
@@ -265,7 +267,7 @@ Claude Code and Codex cache the plugin under a per-**version** directory (e.g. `
 
 - **Claude Code** — `claude plugin marketplace update agy-staff` refreshes the marketplace clone, then `claude plugin update agy@agy-staff` re-copies it into the cache. `install` is **not** the upgrade command: on an already-installed plugin it answers "already installed" and does nothing, whatever the version. And `update` only moves if the version string changed — on an unchanged version it answers "already at the latest version" and leaves the old commit in place. Force the current commit in with `claude plugin uninstall agy@agy-staff && claude plugin install agy@agy-staff`. Restart Claude Code afterwards either way — skills are registered at session start.
 - **Codex** — bump the version, run `codex plugin marketplace upgrade` (or remove and re-add the marketplace entry), then restart the app.
-- **Pi** — for an unpinned Git install, run `pi update --extension git:github.com/keli-wen/agy-staff`, then `/reload`. For local development, regenerate Pi skills (`npm run generate:pi`) and run `/reload`; no push is needed.
+- **Pi** — for an unpinned Git install, run `pi update --extension git:github.com/naldomadeira/agy-agent-staff`, then `/reload`. For local development, regenerate Pi skills (`npm run generate:pi`) and run `/reload`; no push is needed.
 
 You can check which commit is actually installed: the `gitCommitSha` in `~/.claude/plugins/installed_plugins.json`, versus `git -C ~/.claude/plugins/marketplaces/agy-staff log -1` for what the marketplace clone has fetched.
 

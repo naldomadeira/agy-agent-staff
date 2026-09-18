@@ -33,23 +33,23 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash
 接着，在你使用的 agent 环境中安装插件。如果使用 Claude Code，运行：
 
 ```bash
-claude plugin marketplace add keli-wen/agy-staff
+claude plugin marketplace add naldomadeira/agy-agent-staff
 claude plugin install agy@agy-staff
 ```
 
 如果使用 Codex，运行：
 
 ```bash
-codex plugin marketplace add https://github.com/keli-wen/agy-staff
+codex plugin marketplace add https://github.com/naldomadeira/agy-agent-staff
 codex plugin add agy@agy-staff
 ```
 
 <details>
 <summary>在 Pi 中安装</summary>
 
-运行 `pi install git:github.com/keli-wen/agy-staff` 安装插件。Pi 中的技能使用 `agy-` 前缀，例如 `/skill:agy-ask reply with OK`；任务管理技能是 `/skill:agy-jobs`。
+运行 `pi install git:github.com/naldomadeira/agy-agent-staff` 安装插件。Pi 中的技能使用 `agy-` 前缀，例如 `/skill:agy-ask reply with OK`；任务管理技能是 `/skill:agy-jobs`。
 
-更新时运行 `pi update --extension git:github.com/keli-wen/agy-staff`，然后在 Pi 中执行 `/reload`。
+更新时运行 `pi update --extension git:github.com/naldomadeira/agy-agent-staff`，然后在 Pi 中执行 `/reload`。
 
 </details>
 
@@ -65,7 +65,7 @@ codex plugin add agy@agy-staff
 也可以把下面这段话交给你的 coding agent，让它按照仓库里的说明完成安装和验证：
 
 ```
-Read the raw text of https://raw.githubusercontent.com/keli-wen/agy-staff/master/docs/INSTALL_FOR_AGENTS.md
+Read the raw text of https://raw.githubusercontent.com/naldomadeira/agy-agent-staff/master/docs/INSTALL_FOR_AGENTS.md
 (curl it — do not work from a summary), or the same file in your local checkout of agy-staff, and follow it to
 install and verify the agy-staff plugin for the harness you are running in. Respond in the user's language.
 ```
@@ -103,7 +103,7 @@ install and verify the agy-staff plugin for the harness you are running in. Resp
 
 ### 可选 worker 池
 
-正常安装只使用一个 worker：`AGY_BIN || agy`。worker 池是可选能力；使用 `$agy:pool workers`（或 `/agy:pool workers`）查看 worker，并用 `--worker <id>` 指定。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，最后是可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行文件或显式路径。任务在 `continue` 和 `restart` 时保持 worker 亲和性。并行仅用于独立任务；并行写入需要不同 worktree 或明确授权。
+正常安装只使用一个 worker：`AGY_BIN || agy`。worker 池是可选能力；使用 `$agy:pool workers`（或 `/agy:pool workers`）查看 worker，并用 `--worker <id>` 指定。发现顺序为 `AGY_BIN`、`AGY_POOL_BINS`、`PATH` 中的 `agy`/`agy2`/`agy3`，最后是可选的 `.agy-staff/config.json`。Node 无法发现 shell 别名或函数；请使用可执行文件或显式路径。任务在 `continue` 和 `restart` 时保持 worker 亲和性。每一次派发、状态记录和观察快照都会标出所使用的外部 AGY worker，让 Codex 和 Claude Code 获得一致的可见上下文，即使宿主原生的 subagent 面板无法呈现外部进程。并行仅用于独立任务；并行写入需要不同 worktree 或明确授权。
 
 `lead` 为当前主 agent 增加任务编排指导。在 lead 工作流中，主 agent 了解至足以明确任务后，默认用 `staffer` 承担实质性工作，等待结果返回后再验收、整合或追加任务；专门指导有帮助时再选择 specialist，`ask` 仅用于测试。主 agent 负责跨任务决策、验收、整合和交付，复用现有 jobs 工作流。Claude Code 使用 `/agy:lead`，Codex 使用 `$agy:lead`，Pi 使用 `/skill:agy-lead`。
 

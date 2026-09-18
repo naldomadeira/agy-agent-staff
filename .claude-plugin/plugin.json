@@ -1,11 +1,20 @@
 {
   "name": "agy",
-  "version": "0.7.5",
-  "description": "Delegate work to Google's Antigravity CLI (agy) with fast Gemini access - five personas: staffer (general), researcher, reviewer (code and plans), implementer, ask.",
+  "version": "0.7.6",
+  "description": "Delegate work to Google's Antigravity CLI (agy) with fast Gemini access - eight skills: staffer (general), researcher, reviewer (code and plans), implementer, ask, lead (orchestration), pool (worker selection), and jobs (background job management, model-only).",
   "author": {
     "name": "Keli Wen",
     "url": "https://github.com/keli-wen"
   },
+  "maintainers": [
+    {
+      "name": "Naldo Madeira",
+      "url": "https://github.com/naldomadeira"
+    }
+  ],
+  "repository": "https://github.com/naldomadeira/agy-agent-staff",
+  "homepage": "https://github.com/naldomadeira/agy-agent-staff",
+  "bugs": "https://github.com/naldomadeira/agy-agent-staff/issues",
   "license": "MIT",
   "keywords": [
     "antigravity",

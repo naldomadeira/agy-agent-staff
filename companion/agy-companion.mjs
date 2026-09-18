@@ -95,7 +95,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
-import { discoverWorkers, selectWorker } from './worker-pool.mjs';
+import { discoverWorkers, reserveWorker } from './worker-pool.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TEMPLATES_DIR = path.join(path.dirname(SELF), '..', 'templates');
@@ -965,9 +965,20 @@ function resolveRun(mode, opts, priorJob = null) {
     worker: prior?.worker || null };
 }
 
+/** Marker id of the pre-pool executable. It is never probed and never enters
+ *  the pool: a single-profile install must behave exactly as it always did. */
+const LEGACY_WORKER_ID = 'default';
+const legacyWorker = () => ({ id: LEGACY_WORKER_ID, bin: AGY_BIN, version: null, capacity: 1 });
+
 /** Resolve optional pool affinity. Without --worker this is deliberately a
- * no-op for new runs, preserving the historical AGY_BIN || agy path. */
-async function resolveWorker(opts, prior = null) {
+ * no-op for new runs, preserving the historical AGY_BIN || agy path.
+ *
+ * Only the discovery half runs here. Probing executables is slow and async,
+ * and by the time a job is registered its result is already a snapshot of the
+ * past; the choice itself is made by takeWorker, inside the lock that writes
+ * the job record.
+ * @returns {Promise<null|{pinned:object}|{workers:Array, requested?:string, affinity:object|null}>} */
+async function planWorker(opts, prior = null) {
   const requested = opts.worker;
   const affinity = prior?.worker || null;
   if (affinity && requested && requested !== 'auto' && requested !== affinity.id && requested !== affinity.bin) {
@@ -976,15 +987,23 @@ async function resolveWorker(opts, prior = null) {
   if (!requested && !affinity) return null;
   // Historical/default jobs retain the legacy executable without probing or
   // entering the pool. This is an affinity marker, not an auto-pool request.
-  if (!requested && affinity?.id === 'default') return affinity;
-  const workers = await discoverWorkers({ config: configPath() });
-  const activeJobs = (loadState().jobs || []).filter((job) => liveJobStatus(job) === 'running');
-  const worker = selectWorker({ workers, activeJobs, requestedWorkerId: requested && requested !== 'auto' ? requested : undefined, affinity });
-  if (!worker) {
-    if (affinity) die(`worker ${affinity.id || affinity.bin} for this job is unavailable; refusing automatic migration`);
-    die(requested && requested !== 'auto' ? `worker "${requested}" is unavailable or at capacity` : 'no available AGY worker found');
-  }
-  return { id: worker.id, bin: worker.bin, version: worker.version ?? null, capacity: worker.capacity };
+  if (!requested && affinity?.id === LEGACY_WORKER_ID) return { pinned: affinity };
+  return { workers: await discoverWorkers({ config: configPath() }), requested, affinity };
+}
+
+/** Second half of planWorker: pick the worker and register `record`, both
+ *  against the state snapshot held by the caller's lock. Selecting outside
+ *  that lock let two concurrent dispatches read the same idle pool and take
+ *  the same capacity-1 worker. */
+function takeWorker(plan, state, record = null) {
+  return reserveWorker(state, {
+    pinned: plan ? plan.pinned : legacyWorker(),
+    workers: plan?.workers,
+    requestedWorkerId: plan?.requested && plan.requested !== 'auto' ? plan.requested : undefined,
+    affinity: plan?.affinity ?? null,
+    isRunning: (job) => liveJobStatus(job) === 'running',
+    job: record,
+  });
 }
 
 /** Task text comes from exactly one source: --prompt, --prompt-file, or
@@ -1187,6 +1206,7 @@ async function executeRun(resolved, prompt, opts, execution = null) {
   // it lands there as the job's provenance record.
   process.stderr.write(
     `[agy-staff] mode=${resolved.mode} profile=${resolved.profile} model=${resolved.model} ` +
+      `worker=${workerTag(resolved.worker)} ` +
       `agy_status=${payload.status || 'unknown'} agy_exit=${result.exit} ` +
       `duration=${payload.duration_seconds ?? '?'}s turns=${payload.num_turns ?? '?'} tokens(${fmtTokens(payload.usage)})\n` +
       `conversation: ${payload.conversation_id || 'unknown'} (follow up with --continue)\n`
@@ -1206,8 +1226,7 @@ async function cmdRun(mode, opts) {
   // A direct mode continuation (`research --continue`) reaches this path too.
   // Feed its resolved conversation affinity back into the selector; otherwise
   // it would silently fall back to AGY_BIN instead of its original worker.
-  resolved.worker = await resolveWorker(opts, resolved.worker ? { worker: resolved.worker } : null)
-    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
+  const workerPlan = await planWorker(opts, resolved.worker ? { worker: resolved.worker } : null);
   enterOriginalWorkspace(resolved.originalCwd);
   if (resolved.parentJobId) {
     const prior = findJob(resolved.parentJobId);
@@ -1215,12 +1234,15 @@ async function cmdRun(mode, opts) {
     if (prior.spec_file) { try { opts.json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
   }
   const prompt = buildPrompt(mode, { prompt: task });
-  return dispatch(resolved, prompt, { ...opts, promptSource: { kind: 'template', task } });
+  return dispatch(resolved, prompt, { ...opts, workerPlan, promptSource: { kind: 'template', task } });
 }
 
 async function dispatch(resolved, prompt, opts) {
   const mode = resolved.mode;
   if (!resolved.background) {
+    // Foreground runs (ask) register no job, so there is nothing for a
+    // concurrent dispatch to collide with; select against the current state.
+    resolved.worker = takeWorker(opts.workerPlan, loadState());
     process.stdout.write(await executeRun(resolved, prompt, opts) + '\n');
     return;
   }
@@ -1237,11 +1259,12 @@ async function dispatch(resolved, prompt, opts) {
 
   // Register the job BEFORE spawning: a fast worker's own state update must
   // find the record already present, or it gets lost in its read-modify-write.
+  // `worker` is filled in under the registration lock (see takeWorker).
   const record = {
     id: jobId, mode, pid: null, status: 'running', cwd: process.cwd(),
     model: resolved.model, profile: resolved.profile, profileSource: resolved.profileSource,
     timeout: resolved.timeout, conversation_id: resolved.conversation || null,
-    worker: resolved.worker || null,
+    worker: null,
     parent_job_id: opts.parentJobId || resolved.parentJobId || null,
     started_at: new Date().toISOString(), log_file: logFile, result_file: resultFile,
     spec_file: specFile,
@@ -1249,12 +1272,12 @@ async function dispatch(resolved, prompt, opts) {
     progress_file: path.join(jobsDir, `${jobId}.progress.json`),
   };
   updateState((state) => {
-    // Two callers can both resolve an idle conversation. Recheck under the
-    // registration lock before accepting either the job or its prompt file.
+    // Two callers can both resolve an idle conversation, and two can both see
+    // an idle pool. Recheck occupancy and choose the worker under the same
+    // registration lock, before accepting the job or writing its prompt file.
     refuseRunningFollowUp(state, resolved.conversation);
+    resolved.worker = takeWorker(opts.workerPlan, state, record);
     fs.writeFileSync(specFile, JSON.stringify({ resolved, prompt, prompt_source: opts.promptSource || null, opts: { json: !!opts.json }, cwd: process.cwd() }, null, 2));
-    state.jobs ||= [];
-    state.jobs.push(record);
   });
   fs.appendFileSync(logFile, `[agy-staff] dispatch registered ${jobId} at ${record.started_at}\n`);
 
@@ -1310,7 +1333,11 @@ async function workerMain(jobId) {
     cancelTimer = setInterval(checkCancellation, 100);
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
-    if (spec.resolved.worker && spec.opts.worker) {
+    // Preflight only a pool-selected worker. The legacy executable is never
+    // probed here, so a single-profile install still spawns nothing extra.
+    // (This used to read spec.opts.worker, a key the spec never carries, so
+    // the whole block was dead and the disappearance went unreported.)
+    if (spec.resolved.worker && spec.resolved.worker.id !== LEGACY_WORKER_ID) {
       const available = await discoverWorkers({ config: configPath() });
       const current = available.find((w) => w.id === spec.resolved.worker.id && w.bin === spec.resolved.worker.bin);
       if (!current?.available) throw new Error(`worker ${spec.resolved.worker.id} (${spec.resolved.worker.bin}) became unavailable after job creation; no automatic migration was attempted`);
@@ -1388,6 +1415,13 @@ function workerLabel(worker) {
   if (!worker) return 'legacy (AGY_BIN || agy)';
   const version = worker.version ? `; ${worker.version}` : '';
   return `${worker.id || 'unnamed'} (${worker.bin || 'AGY_BIN || agy'}${version})`;
+}
+
+/** Same identity as workerLabel, but space-free: the `[agy-staff]` telemetry
+ *  line is a provenance record parsed as key=value pairs. */
+function workerTag(worker) {
+  if (!worker) return LEGACY_WORKER_ID;
+  return `${worker.id || 'unnamed'}[${worker.bin || AGY_BIN}]`;
 }
 
 // Machine-readable job exit codes shared by `status <id>` and `wait`.
@@ -1610,7 +1644,10 @@ function renderJobResponse(initial, { observeOnly = false } = {}) {
     try { job = { ...job, ...JSON.parse(fs.readFileSync(job.result_file + '.status.json', 'utf8')) }; } catch {}
   }
   if (fs.existsSync(job.result_file)) {
-    process.stdout.write(`# Job ${job.id} (${job.mode}, ${status})\n\n`);
+    // wait is the mandatory collection path, so this header is where the
+    // selected worker has to survive: without it the delivered result was the
+    // one place that dropped the job's pool identity.
+    process.stdout.write(`# Job ${job.id} (${job.mode}, ${status}) — AGY worker: ${workerLabel(job.worker)}\n\n`);
     process.stdout.write(fs.readFileSync(job.result_file, 'utf8'));
   } else {
     process.stdout.write(`Job ${job.id} (${job.mode}) finished with status ${status} and no stored result. Log: ${job.log_file}\n`);
@@ -1726,13 +1763,12 @@ async function cmdContinue(opts) {
   if (!task) die('continue needs follow-up text');
   enterOriginalWorkspace(prior?.cwd);
   const resolved = resolveRun(mode, { ...opts, conversation }, prior);
-  resolved.worker = await resolveWorker(opts, prior)
-    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
+  const workerPlan = await planWorker(opts, prior);
   const workspace = mode === 'implement' ? dirtyWorkspacePrompt() : '';
   const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}`;
   let json = opts.json;
   if (prior?.spec_file) { try { json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
-  return dispatch(resolved, prompt, { ...opts, json, parentJobId: prior?.id, promptSource: { kind: 'followup', task } });
+  return dispatch(resolved, prompt, { ...opts, json, workerPlan, parentJobId: prior?.id, promptSource: { kind: 'followup', task } });
 }
 
 async function cmdRestart(opts) {
@@ -1743,8 +1779,7 @@ async function cmdRestart(opts) {
   const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
   enterOriginalWorkspace(spec.cwd);
   const resolved = { ...spec.resolved, conversation: null, timeout: DEFAULTS.timeout[job.mode] };
-  resolved.worker = await resolveWorker(opts, job)
-    || { id: 'default', bin: AGY_BIN, version: null, capacity: 1 };
+  const workerPlan = await planWorker(opts, job);
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;
   }
@@ -1758,7 +1793,7 @@ async function cmdRestart(opts) {
     const current = `${gatherContext()}\n\n${job.mode === 'implement' ? dirtyWorkspacePrompt() || 'Working tree is currently clean.' : ''}`;
     prompt = `Restart the original task below. Its embedded workspace/environment snapshots are historical. Use the current workspace section at the end for this execution; preserve existing partial work.\n\n${source.text}\n\n## Current workspace for this restart\n\n${current}`;
   }
-  return dispatch(resolved, prompt, { ...spec.opts, parentJobId: job.id, promptSource: source });
+  return dispatch(resolved, prompt, { ...spec.opts, workerPlan, parentJobId: job.id, promptSource: source });
 }
 
 // ---------------------------------------------------------------------------

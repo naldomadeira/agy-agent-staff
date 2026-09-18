@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { sandbox, run, jobIdOf, waitForCalls, COMPANION } from './helpers.mjs';
+import { sandbox, run, jobIdOf, waitForCalls, COMPANION, FAKE_AGY } from './helpers.mjs';
 const body = 'FULL_REPORT_ONLY_IN_DELIVERY\n' + '\u62a5\u544a\u5185\u5bb9😀'.repeat(4500);
 function storedJob(status, extra = {}) {
   const sb = sandbox(`terminal-${status}`);
@@ -41,7 +41,10 @@ test('observe stays bounded after legacy completion; independent reads never con
   assert.equal(fs.readFileSync(stateFile, 'utf8'), before);
   for (const command of ['wait', 'result']) {
     const r = run(sb, [command, job.id]);
-    assert.equal(r.code, 0); assert.equal(r.stdout, `# Job ${job.id} (research, done)\n\n` + body);
+    assert.equal(r.code, 0);
+    // The delivered header carries the worker identity; this job predates the
+    // pool and has no worker record, so it reports the legacy executable.
+    assert.equal(r.stdout, `# Job ${job.id} (research, done) \u2014 AGY worker: legacy (AGY_BIN || agy)\n\n` + body);
     assert.match(r.stderr, /NATIVE_DIAGNOSTIC/);
     assert.doesNotMatch(r.stderr, /OLD_DIAGNOSTIC/);
     assert.ok(Buffer.byteLength(r.stderr) < 10000);
@@ -110,5 +113,5 @@ test('observe during a pending wait never duplicates its large final report', as
   assert.equal(await done, 0); assert.equal(stderr, '');
   const terminal = observation(sb, id, 0);
   assert.ok(terminal.result_available);
-  assert.equal(stdout, `# Job ${id} (staffer, done)\n\n` + body + '\n');
+  assert.equal(stdout, `# Job ${id} (staffer, done) \u2014 AGY worker: default (${FAKE_AGY})\n\n` + body + '\n');
 });
