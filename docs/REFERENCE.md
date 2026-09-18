@@ -118,7 +118,7 @@ Caveat, stated plainly: **the exact project-settings file path is undocumented a
 | `--effort low\|medium\|high` | shorthand for `gemini-3.8-flash-<effort>` |
 | `--restricted` / `--unrestricted` | permission profile override (ignored by `ask`). `unrestricted` is the default for `staffer`/`research`/`review`/`implement`, so `--restricted` is the flag you actually reach for |
 | `--restrict <modes\|none>` | (setup) per-repo policy: the listed modes default to restricted in this repository; `none` clears it. See [Per-repo policy](#per-repo-policy-setup---restrict) |
-| `--worker <id>` | (opt-in worker pool) select a specific discovered worker by id for this run, or `auto` for automatic selection by load; ignored by modes that never reach agy. See [Optional worker pool](#optional-worker-pool) |
+| `--worker <id>` | (opt-in worker pool) select a specific discovered worker by id for this run, or `auto` for automatic selection by load. Valid on `staffer`/`research`/`review`/`implement`/`ask`, `continue`, and `restart`; rejected with an error on `status`, `wait`, `result`, `cancel`, `observe`, `setup`, and `workers`, which never dispatch to a worker. See [Optional worker pool](#optional-worker-pool) |
 | `--json` | (review) schema-enforced JSON findings; default is free-form markdown. Meant for the code-review flavor |
 | `--timeout <dur>` | Background worker hard limit (default 60m, maximum 120m). AGY receives the selected response timeout. For synchronous ask: AGY response timeout, default 2m |
 | `--prompt <text>` | the task text as one argument. Quote it; whatever is inside is opaque |

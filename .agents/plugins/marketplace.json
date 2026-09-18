@@ -1,6 +1,6 @@
 {
   "name": "agy-staff",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "description": "agy-staff: delegate work to Google's Antigravity CLI (agy) from Claude Code and Codex.",
   "owner": {
     "name": "Keli Wen",

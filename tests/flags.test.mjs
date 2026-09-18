@@ -56,6 +56,69 @@ describe('removed execution flags (--background / --wait)', () => {
   }
 });
 
+describe('--worker scope', () => {
+  // status/wait/result/cancel/observe/setup/workers never read opts.worker —
+  // --worker lives in the global VALUE_FLAGS set, so without an explicit
+  // rejection it was accepted and silently ignored there.
+  for (const cmd of ['status', 'wait', 'result', 'cancel', 'observe', 'setup', 'workers']) {
+    test(`${cmd} --worker dies naming the subcommand, not the pool`, () => {
+      const sb = sandbox(`worker-scope-${cmd}`);
+      const r = run(sb, [cmd, '--worker', 'agy2']);
+      assert.equal(r.code, 1, `${cmd} --worker must use the usage-error exit code`);
+      assert.match(
+        r.stderr,
+        new RegExp(`--worker has no effect on ${cmd}: it only selects a pool worker when starting or resuming a run`)
+      );
+      assert.match(r.stderr, /staffer, research, review, implement, ask, continue, restart/);
+      // it must not fall through to pool selection (a different error shape)
+      assert.doesNotMatch(r.stderr, /worker.*(unavailable|busy|no available AGY worker)/);
+      assert.equal(agyCalls(sb).length, 0, 'agy must not be invoked');
+    });
+  }
+
+  test('the same subcommands without --worker behave exactly as before', () => {
+    const sb = sandbox('worker-scope-baseline');
+
+    const status = run(sb, ['status']);
+    assert.equal(status.code, 0, status.stderr);
+    assert.match(status.stdout, /No agy-staff jobs recorded in this repository\./);
+
+    const wait = run(sb, ['wait']);
+    assert.equal(wait.code, 1);
+    assert.match(wait.stderr, /no agy-staff jobs recorded in this repository/);
+
+    const result = run(sb, ['result']);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /no finished jobs in this repository/);
+
+    const cancel = run(sb, ['cancel']);
+    assert.equal(cancel.code, 1);
+    assert.match(cancel.stderr, /cancel needs a job id/);
+
+    const observe = run(sb, ['observe']);
+    assert.equal(observe.code, 1);
+    assert.match(observe.stderr, /no agy-staff jobs recorded in this repository/);
+
+    const setup = run(sb, ['setup']);
+    assert.equal(setup.code, 0, setup.stderr);
+    assert.match(setup.stdout, /DRY RUN/);
+
+    const workers = run(sb, ['workers']);
+    assert.equal(workers.code, 0, workers.stderr);
+    assert.match(workers.stdout, /id \| executable \| status \| version \| capacity \| active jobs/);
+  });
+
+  test('a run command still accepts and acts on --worker', () => {
+    const sb = sandbox('worker-scope-run-accepts');
+    // AGY_BIN (the fake agy) is discoverable once the pool is probed, so
+    // --worker auto resolves instead of dying — proving the flag still does
+    // something here, unlike the rejected subcommands above.
+    const r = run(sb, ['research', '--worker', 'auto', '--prompt', 'a topic']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /--worker has no effect on/);
+  });
+});
+
 describe('deprecated aliases', () => {
   test('--strict maps to restricted and warns once on stderr', () => {
     const sb = sandbox('alias-strict');

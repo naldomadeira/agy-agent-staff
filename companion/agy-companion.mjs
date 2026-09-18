@@ -112,6 +112,14 @@ const AGY_SETTINGS = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'sett
 
 const MODES = ['staffer', 'research', 'review', 'implement', 'ask'];
 
+// --worker sits in the global VALUE_FLAGS set (parseFlags is shared across
+// every subcommand), so without this list it is silently accepted — and
+// silently ignored — by subcommands that never read opts.worker. A flag that
+// looks like it pinned a worker but did nothing is worse than an
+// unknown-flag error. Only run/resume commands (staffer/research/review/
+// implement/ask, continue, restart) act on it; everything else here dies.
+const WORKER_UNSUPPORTED_COMMANDS = new Set(['status', 'wait', 'result', 'cancel', 'observe', 'setup', 'workers']);
+
 const DEFAULTS = {
   model: {
     staffer: 'gemini-3.8-flash-medium',
@@ -2055,6 +2063,10 @@ function main() {
     );
   }
   const opts = parseFlags(rest, { taskCommand: MODES.includes(cmd) || cmd === 'continue' });
+  if (opts.worker && WORKER_UNSUPPORTED_COMMANDS.has(cmd)) {
+    die(`--worker has no effect on ${cmd}: it only selects a pool worker when starting or resuming a run ` +
+      `(staffer, research, review, implement, ask, continue, restart)`);
+  }
 
   if (MODES.includes(cmd)) return cmdRun(cmd, opts);
   switch (cmd) {

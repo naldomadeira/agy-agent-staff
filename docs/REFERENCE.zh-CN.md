@@ -123,7 +123,7 @@ agy 还有与 `--project` 体系关联的项目级权限规则，可以将权限
 | `--effort low\|medium\|high` | 指定推理强度，是 `gemini-3.8-flash-<effort>` 的简写 |
 | `--restricted` / `--unrestricted` | 覆盖本次运行的权限配置；`ask` 会忽略这两个参数 |
 | `--restrict <modes\|none>` | 用于 `setup`，设置或清除[仓库默认权限](#仓库级-policysetup---restrict) |
-| `--worker <id>` | 可选 worker 池：为本次运行显式选择某个已发现的 worker，或传入 `auto` 按负载自动选择；对不会调用 agy 的模式无效 |
+| `--worker <id>` | 可选 worker 池：为本次运行显式选择某个已发现的 worker，或传入 `auto` 按负载自动选择。仅在 `staffer`/`research`/`review`/`implement`/`ask`、`continue` 和 `restart` 上有效；在 `status`、`wait`、`result`、`cancel`、`observe`、`setup`、`workers` 上会直接报错，因为这些命令从不派发到 worker |
 | `--json` | 用于代码审查，按指定结构返回 JSON 格式的问题列表；默认使用 Markdown |
 | `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m |
 | `--prompt <text>` | 将任务正文作为一个参数传入，通常需要用引号包住 |
