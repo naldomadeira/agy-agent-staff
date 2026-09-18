@@ -124,13 +124,17 @@ agy 还有与 `--project` 体系关联的项目级权限规则，可以将权限
 | `--restricted` / `--unrestricted` | 覆盖本次运行的权限配置；`ask` 会忽略这两个参数 |
 | `--restrict <modes\|none>` | 用于 `setup`，设置或清除[仓库默认权限](#仓库级-policysetup---restrict) |
 | `--worker <id>` | 可选 worker 池：为本次运行显式选择某个已发现的 worker，或传入 `auto` 按负载自动选择。仅在 `staffer`/`research`/`review`/`implement`/`ask`、`continue` 和 `restart` 上有效；在 `status`、`wait`、`result`、`cancel`、`observe`、`setup`、`workers` 上会直接报错，因为这些命令从不派发到 worker |
-| `--json` | 用于代码审查，按指定结构返回 JSON 格式的问题列表；默认使用 Markdown |
-| `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m |
+| `--json` | 用于代码审查，按指定结构返回 JSON 格式的问题列表；默认使用 Markdown。仅在 `review` 和 `continue` 上有效（`continue` 时只有当被续接的会话原本就是 `review` 模式才会生效）；在其他命令上会直接报错 |
+| `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m。在 `wait`（等待本身的轮询超时，默认 100s）和 `restart`（重新派发时的新预算）上同样有效 |
 | `--prompt <text>` | 将任务正文作为一个参数传入，通常需要用引号包住 |
 | `--prompt-file <path>` | 从文件读取任务正文，适合较长的描述 |
 | `--stdin` | 从标准输入读取任务正文 |
 
 每次任务只能选择 `--prompt`、`--prompt-file` 和 `--stdin` 中的一个来源。同步或后台执行由模式决定，没有单独的切换参数。
+
+**参数作用范围。** 上表中的每个参数只在真正读取它的命令上有效；在其他命令上传入会在派发 agy 之前就报错，错误信息会说明参数名、当前命令，以及该参数实际有效的命令（`--worker` 那一行是这个模式的范例）。有两处作用范围比“所有运行类命令都适用”更窄，值得单独说明：
+- `restart` 只从本次调用里读取 `--worker` 和 `--timeout`——它会重放已保存任务的原始模型、权限配置和任务正文，所以 `--model`/`--effort`/`--restricted`/`--unrestricted`/`--conversation`/`--job` 在 `restart` 上会报错。`--prompt`/`--prompt-file`/`--stdin` 是唯一的例外：为了兼容旧的调用方式仍然接受，但会被忽略，因为 `restart` 总是用保存的任务正文重新构建 prompt。
+- `--continue`（布尔参数）在 `continue` 命令本身上会报错——`continue` 在读取这个参数之前已经确定了要续接哪个会话，所以它只在直接调用运行类命令时（如 `research --continue`）才有意义。
 
 ## 任务正文
 

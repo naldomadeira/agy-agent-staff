@@ -112,14 +112,6 @@ const AGY_SETTINGS = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'sett
 
 const MODES = ['staffer', 'research', 'review', 'implement', 'ask'];
 
-// --worker sits in the global VALUE_FLAGS set (parseFlags is shared across
-// every subcommand), so without this list it is silently accepted — and
-// silently ignored — by subcommands that never read opts.worker. A flag that
-// looks like it pinned a worker but did nothing is worse than an
-// unknown-flag error. Only run/resume commands (staffer/research/review/
-// implement/ask, continue, restart) act on it; everything else here dies.
-const WORKER_UNSUPPORTED_COMMANDS = new Set(['status', 'wait', 'result', 'cancel', 'observe', 'setup', 'workers']);
-
 const DEFAULTS = {
   model: {
     staffer: 'gemini-3.8-flash-medium',
@@ -525,6 +517,106 @@ function parseFlags(argv, { taskCommand = false } = {}) {
     }
   }
   return opts;
+}
+
+// Every subcommand shares one parseFlags() call, so a flag out of its real
+// scope was otherwise accepted — and silently ignored — by any subcommand
+// that never reads opts.<flag>. That first bit us as --worker (fixed below);
+// this map generalizes the fix to the whole flag surface instead of growing
+// another one-off unsupported-commands list per flag.
+//
+// Each entry was verified against the code that actually consults
+// opts.<name>, not assumed from the flag's name or its skill argument-hint
+// (see docs/REFERENCE.md's flag table and each skills/*/SKILL.md
+// argument-hint for the independent, human-facing cross-check). Notable
+// departures from "the flag's name suggests it applies everywhere":
+//   - `continue` (the boolean flag) is a no-op on the `continue` subcommand:
+//     cmdContinue always resolves a conversation id before calling
+//     resolveRun(), so resolveRun's `!conversation && opts.continue` branch
+//     never fires there. It only does something on a direct run command.
+//   - `restart` only ever reads opts.worker and opts.timeout from its own
+//     invocation; --model/--effort/--restricted/--unrestricted/--conversation
+//     on `restart` are silently discarded today (cmdRestart forwards the
+//     *stored* spec, not these), so they are scoped out here rather than
+//     accepted as another silent no-op.
+//   - --prompt/--prompt-file/--stdin on `restart` are the one deliberate
+//     exception to that rule: cmdRestart always rebuilds its prompt from the
+//     stored spec and never calls taskText(opts), so these are just as
+//     unread as the flags above — but an existing, documented invocation
+//     passes `restart <id> --prompt "ignored"` and expects it to succeed
+//     (tests/pool-integration.test.mjs), so they stay accepted-and-ignored
+//     here rather than newly rejected.
+//   - `restrict` is read on every run/continue call, but only to catch the
+//     likely --restricted typo and redirect the caller (resolveRun); its
+//     real, documented effect is on `setup`.
+//   - `json` is read unconditionally by `continue` (it forwards whatever was
+//     passed) but only changes anything when the resumed conversation's mode
+//     is `review` — same as a direct `review --json` call.
+const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', '_worker'];
+
+const FLAG_SCOPE = {
+  // task text (taskText(), called from cmdRun/cmdContinue). Also accepted,
+  // ignored, on `restart` — see the note above.
+  prompt: [...MODES, 'continue', 'restart'],
+  'prompt-file': [...MODES, 'continue', 'restart'],
+  stdin: [...MODES, 'continue', 'restart'],
+  // conversation selection / resumption
+  job: ['continue'],
+  conversation: [...MODES, 'continue'],
+  continue: [...MODES],
+  // model selection (resolveRun)
+  model: [...MODES, 'continue'],
+  effort: [...MODES, 'continue'],
+  // permission profile (resolveRun)
+  restricted: [...MODES, 'continue'],
+  unrestricted: [...MODES, 'continue'],
+  restrict: [...MODES, 'continue', 'setup'],
+  // execution (resolveRun / cmdRestart / cmdWait)
+  timeout: [...MODES, 'continue', 'restart', 'wait'],
+  worker: [...MODES, 'continue', 'restart'],
+  // review's schema-enforced findings (executeRun), also read through by continue
+  json: ['review', 'continue'],
+  // setup
+  apply: ['setup'],
+  // never read anywhere in the companion; setup's own dry run is already the
+  // default without --apply, so this is kept as an accepted no-op alias there
+  // rather than rejected — see tests/setup.test.mjs ("--dry-run is accepted
+  // explicitly and still writes nothing").
+  'dry-run': ['setup'],
+};
+
+const FLAG_SCOPE_DESCRIPTIONS = {
+  worker: 'it only selects a pool worker when starting or resuming a run',
+  prompt: 'it supplies the task text for a run',
+  'prompt-file': 'it supplies the task text for a run, read from a file',
+  stdin: 'it supplies the task text for a run, read from stdin',
+  job: 'it selects which job/conversation to resume',
+  conversation: 'it selects which agy conversation to resume or continue',
+  continue: "it reuses this mode's last conversation id when starting a run",
+  model: 'it selects the agy model for a run',
+  effort: 'it selects the agy model effort for a run',
+  restricted: 'it sets the permission profile for a run',
+  unrestricted: 'it sets the permission profile for a run',
+  restrict: 'it is either the --restricted typo guard on a run, or the per-repo policy flag on setup',
+  timeout: 'it sets the run/job time budget',
+  json: '(review) it asks for schema-enforced findings instead of free-form markdown',
+  apply: 'it confirms writing the setup allowlist',
+  'dry-run': "it is setup's own no-op preview flag",
+};
+
+/** Reject any flag outside the scope of the subcommand it was given to,
+ *  instead of letting parseFlags' shared, global flag set accept it and
+ *  leave it silently unread. An unrecognized subcommand is left alone here —
+ *  it gets its own "unknown subcommand" error further down. */
+function checkFlagScope(cmd, opts) {
+  if (!KNOWN_COMMANDS.includes(cmd)) return;
+  for (const name of Object.keys(opts)) {
+    if (name === '_') continue;
+    const allowed = FLAG_SCOPE[name];
+    if (!allowed || allowed.includes(cmd)) continue;
+    const reason = FLAG_SCOPE_DESCRIPTIONS[name] || `it is not read on ${cmd}`;
+    die(`--${name} has no effect on ${cmd}: ${reason} (valid on: ${allowed.join(', ')})`);
+  }
 }
 
 function fmtTokens(usage) {
@@ -2063,10 +2155,7 @@ function main() {
     );
   }
   const opts = parseFlags(rest, { taskCommand: MODES.includes(cmd) || cmd === 'continue' });
-  if (opts.worker && WORKER_UNSUPPORTED_COMMANDS.has(cmd)) {
-    die(`--worker has no effect on ${cmd}: it only selects a pool worker when starting or resuming a run ` +
-      `(staffer, research, review, implement, ask, continue, restart)`);
-  }
+  checkFlagScope(cmd, opts);
 
   if (MODES.includes(cmd)) return cmdRun(cmd, opts);
   switch (cmd) {
