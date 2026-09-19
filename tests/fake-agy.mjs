@@ -14,6 +14,10 @@
  *   FAKE_AGY_STATUS          status field             (default "SUCCESS")
  *   FAKE_AGY_CONVERSATION_ID conversation id          (default "conv-1")
  *   FAKE_AGY_SLEEP_MS        stall before answering   (default 0)
+ *   FAKE_AGY_EVENTS_DELAY_MS stall before writing the streaming init/events
+ *                            block below (default 0) — lets a test start
+ *                            following a job before any step event exists,
+ *                            instead of racing this process's own startup
  *   FAKE_AGY_EXIT            process exit code        (default 0)
  *   FAKE_AGY_TOUCH_FILE      create this file mid-"run" (default: touch nothing)
  *                            — simulates agy dirtying the working tree, which
@@ -98,6 +102,8 @@ if (commitMessage) {
 }
 
 const streaming = argv[argv.indexOf('--output-format') + 1] === 'stream-json';
+const eventsDelayMs = Number(process.env.FAKE_AGY_EVENTS_DELAY_MS || 0);
+if (eventsDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, eventsDelayMs));
 if (streaming && !process.env.FAKE_AGY_NO_JSON) {
   process.stdout.write(JSON.stringify({ event: 'init', init: { conversation_id: process.env.FAKE_AGY_CONVERSATION_ID ?? 'conv-1' } }) + '\n');
   if (process.env.FAKE_AGY_EVENTS) {
