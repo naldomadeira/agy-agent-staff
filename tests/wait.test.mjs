@@ -9,7 +9,30 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { sandbox, run, jobIdOf, jobLog, waitForJob } from './helpers.mjs';
+
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The job's published progress snapshot, or null before the first publish. */
+function progressOf(sb, jobId) {
+  const file = path.join(sb.repo, '.agy-staff', 'jobs', `${jobId}.progress.json`);
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+/** Poll until the worker has published at least one tool activity — the
+ *  same wait streaming.test.mjs uses before asserting on progress, needed
+ *  here because raw events land in the job's events file (what --follow
+ *  tails) slightly ahead of the debounced progress publish this checks. */
+async function waitForActivity(sb, jobId, { tries = 200, delayMs = 25 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    const snapshot = progressOf(sb, jobId);
+    if (snapshot?.recent_activities?.length) return snapshot;
+    await pause(delayMs);
+  }
+  throw new Error(`job ${jobId} never published a tool activity`);
+}
 
 describe('status <id> exit codes', () => {
   test('running → 2, done → 0', async () => {
@@ -128,5 +151,85 @@ describe('wait', () => {
     const r = run(sb, ['wait']);
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, new RegExp(`# Job ${id} `));
+  });
+});
+
+describe('wait --follow', () => {
+  // One tool step reported ACTIVE then DONE (what a real agy run streams for
+  // every tool call), plus an agent_response delta — the kind of event
+  // --follow must stay quiet about, since it has no tool_name and would be
+  // prose, not progress.
+  const events = [
+    { event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 7, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'pnpm typecheck' } } } },
+    { event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 7, step_type: 'tool', state: 'DONE', tool_name: 'run_command', duration_seconds: 5.5, tool_info: { parameters: { CommandLine: 'pnpm typecheck' } } } },
+    { event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 8, step_type: 'agent_response', state: 'ACTIVE', text_delta: 'Looking good so far.' } },
+  ];
+
+  test('prints step lines to stderr while the job runs; stdout keeps the plain running snapshot', async (t) => {
+    const sb = sandbox('wait-follow-live');
+    const release = path.join(sb.root, 'release');
+    t.after(() => fs.writeFileSync(release, 'finish')); // never leave the fake agy blocked past the test
+    // The fake agy delays its streaming output well past this dispatch call
+    // returning, so `wait --follow` below starts polling — and captures its
+    // "only new lines from here" offset — before any event exists, instead
+    // of racing the fake agy's own startup to land before that offset.
+    const started = run(sb, ['research', '--prompt', 'follow me'], {
+      FAKE_AGY_EVENTS: JSON.stringify(events),
+      FAKE_AGY_EVENTS_DELAY_MS: '400',
+      FAKE_AGY_RELEASE_FILE: release,
+    });
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id, '--follow', '--timeout', '2s']);
+    assert.equal(r.code, 2, `${r.stdout}${r.stderr}`);
+    assert.equal(JSON.parse(r.stdout).status, 'running', 'stdout is the same expiry snapshot as without --follow');
+    assert.match(r.stderr, /▶ run_command pnpm typecheck/);
+    assert.match(r.stderr, /✓ run_command pnpm typecheck \(5\.5s\)/);
+    assert.doesNotMatch(r.stderr, /Looking good so far\./, 'agent_response text is prose, not a step, and must not print');
+
+    fs.writeFileSync(release, 'finish');
+    const done = run(sb, ['wait', id]);
+    assert.equal(done.code, 0, done.stdout + done.stderr);
+  });
+
+  test('without the flag, stderr stays silent even though the job has step events (no regression of the default silence)', async (t) => {
+    const sb = sandbox('wait-no-follow-silent');
+    const release = path.join(sb.root, 'release');
+    t.after(() => fs.writeFileSync(release, 'finish'));
+    const started = run(sb, ['research', '--prompt', 'stay quiet'], { FAKE_AGY_EVENTS: JSON.stringify(events), FAKE_AGY_RELEASE_FILE: release });
+    const id = jobIdOf(started.stdout);
+    await waitForActivity(sb, id);
+
+    const r = run(sb, ['wait', id, '--timeout', '150ms']);
+    assert.equal(r.code, 2, `${r.stdout}${r.stderr}`);
+    assert.equal(r.stderr, '', 'no --follow means no progress lines at all');
+
+    fs.writeFileSync(release, 'finish');
+    assert.equal(run(sb, ['wait', id]).code, 0);
+  });
+
+  test('rejected on every subcommand but wait, coherent with FLAG_SCOPE', () => {
+    for (const cmd of ['status', 'result', 'cancel', 'observe', 'setup', 'workers']) {
+      const sb = sandbox(`wait-follow-scope-${cmd}`);
+      const r = run(sb, [cmd, '--follow']);
+      assert.equal(r.code, 1, `${cmd} --follow must use the usage-error exit code`);
+      assert.match(r.stderr, new RegExp(`--follow has no effect on ${cmd}`));
+      assert.match(r.stderr, /\(valid on: wait\)/);
+    }
+  });
+
+  test('a missing events.jsonl degrades --follow silently; the result is still delivered', () => {
+    const sb = sandbox('wait-follow-missing-events');
+    const started = run(sb, ['research', '--prompt', 'no events file']);
+    const id = jobIdOf(started.stdout);
+    const eventsFile = path.join(sb.repo, '.agy-staff', 'jobs', `${id}.events.jsonl`);
+    // Whether the worker has even created it yet is a race this test does not
+    // need to win: deleting it (or finding nothing to delete) both exercise
+    // the same "no file at this path" branch --follow must swallow.
+    try { fs.unlinkSync(eventsFile); } catch {}
+
+    const r = run(sb, ['wait', id, '--follow']);
+    assert.equal(r.code, 0, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /fake answer/);
   });
 });

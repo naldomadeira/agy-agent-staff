@@ -21,7 +21,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" <command> [args]
 
 Default flow: prepare the prompt → dispatch → wait for the final result → validate as needed. While a job is running, do not proactively call `observe`/`status`, read logs or inspect intermediate artifacts. Do not query progress for routine updates or create sleep/observe loops. Observe only when the user explicitly asks for progress; diagnose after receiving a failure or a result requiring intervention.
 
-1. Keep the returned job id. Start `wait <id> --timeout 10m` in the background, using the same unsandboxed context as launch. Use a separate wait for each job; never wait for several jobs serially in one shell.
+1. Keep the returned job id. Start `wait <id> --timeout 10m --follow` in the background, using the same unsandboxed context as launch — `--follow` writes each step to stderr as the job runs, so the background shell does not sit with no output for the whole wait. Use a separate wait for each job; never wait for several jobs serially in one shell.
 2. For **wait**, branch on the exit code:
 
 | Code | Meaning | Next action |

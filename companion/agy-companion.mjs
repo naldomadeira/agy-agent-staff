@@ -16,9 +16,13 @@
  *   observe [job-id]                immediate bounded snapshot in every job state
  *   restart <job-id>                explicitly relaunch the stored task
  *   status [job-id]                 list background jobs / show one job
- *   wait [job-id] [--timeout 100s]  block until the job finishes, then print
+ *   wait [job-id] [--timeout 100s] [--follow]
+ *                                   block until the job finishes, then print
  *                                   its result (exit 2 = still running: call
- *                                   it again)
+ *                                   it again). --follow tails the job's step
+ *                                   events to stderr while it waits, for a
+ *                                   caller collecting the wait in a background
+ *                                   shell that would otherwise sit silent
  *   result [job-id]                 print the stored output of a finished job
  *   cancel <job-id>                 kill a running background job
  *   setup [--apply]                 optional: install the evidence-gathering
@@ -416,7 +420,7 @@ function pidAlive(pid) {
 }
 
 const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker']);
-const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin']);
+const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
 // "unknown flag", so a 0.1 caller learns what replaced them.
@@ -574,6 +578,9 @@ const FLAG_SCOPE = {
   // execution (resolveRun / cmdRestart / cmdWait)
   timeout: [...MODES, 'continue', 'restart', 'wait'],
   worker: [...MODES, 'continue', 'restart'],
+  // wait's own opt-in progress feed (cmdWait); meaningless anywhere else,
+  // since only wait polls a job's events file at all
+  follow: ['wait'],
   // review's schema-enforced findings (executeRun), also read through by continue
   json: ['review', 'continue'],
   // setup
@@ -599,6 +606,7 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   unrestricted: 'it sets the permission profile for a run',
   restrict: 'it is either the --restricted typo guard on a run, or the per-repo policy flag on setup',
   timeout: 'it sets the run/job time budget',
+  follow: "it streams a running job's steps to stderr while wait polls for completion",
   json: '(review) it asks for schema-enforced findings instead of free-form markdown',
   apply: 'it confirms writing the setup allowlist',
   'dry-run': "it is setup's own no-op preview flag",
@@ -1657,17 +1665,100 @@ async function cmdWorkers() {
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --follow's progress marks, mirroring ~/.claude/hud/agy-follow.mjs (a
+// personal reference script, not a dependency: the format is reimplemented
+// here, not imported).
+const FOLLOW_MARKS = { ACTIVE: '▶', DONE: '✓', ERROR: '✗' };
+
+/** The one parameter of a tool step worth showing on its progress line, short
+ *  enough to fit. A path is reduced to its basename — the absolute path a
+ *  real tool call carries would swallow the rest of the line. */
+function followHint(parameters) {
+  if (!parameters || typeof parameters !== 'object') return '';
+  if (typeof parameters.CommandLine === 'string') return parameters.CommandLine;
+  for (const key of ['AbsolutePath', 'TargetFile', 'FilePath', 'Path']) {
+    if (typeof parameters[key] === 'string') return path.basename(parameters[key]);
+  }
+  if (typeof parameters.Query === 'string') return parameters.Query;
+  const first = Object.values(parameters).find((v) => typeof v === 'string');
+  return typeof first === 'string' ? first : '';
+}
+
+/** Render one raw NDJSON line from a job's events file as a compact progress
+ *  line on stderr — never stdout, which stays the result channel `wait`
+ *  always had. Silent on anything that is not a tool step_update: `init` is
+ *  connection metadata, not progress, and `agent_response` steps are the
+ *  model's own prose (no tool_name), which would dominate the feed if shown
+ *  one delta at a time — --follow exists to show what agy is *doing*, not
+ *  what it is saying, so those are dropped rather than rendered discreetly. */
+function followRenderLine(line) {
+  let event;
+  try { event = JSON.parse(line); } catch { return; }
+  if (event.event !== 'step_update') return;
+  const step = event.step_update || {};
+  if (!step.tool_name) return;
+  const mark = FOLLOW_MARKS[step.state] || '·';
+  // A DONE with no duration is noise: the ACTIVE line for the same step
+  // already announced it, and duration is what DONE adds.
+  if (step.state === 'DONE' && !Number.isFinite(step.duration_seconds)) return;
+  let hint = followHint(step.tool_info?.parameters);
+  if (hint.length > 72) hint = `${hint.slice(0, 71)}…`;
+  const secs = Number.isFinite(step.duration_seconds) ? ` (${step.duration_seconds.toFixed(1)}s)` : '';
+  const index = String(step.step_index ?? '').padStart(4);
+  process.stderr.write(`${index} ${mark} ${step.tool_name} ${hint}${secs}\n`);
+}
+
+/** Build the pump `--follow` calls on every poll tick. Tails a job's events
+ *  file incrementally — a byte offset plus a carry buffer for a line the
+ *  worker may still be mid-write on — instead of rereading the whole file,
+ *  which grows to hundreds of KB over a long job. Starts from the file's
+ *  current size, not its start: only steps that happen from this `wait`
+ *  onward are shown, the same "no invented history" rule cmdWait already
+ *  applies to a job that is already terminal (see its own comment). Never
+ *  throws: a missing, deleted (successful jobs unlink their events file —
+ *  see the `fs.unlinkSync` cleanup below) or otherwise unreadable file just
+ *  means nothing more prints, exactly as if --follow had not been passed —
+ *  the wait result is the one thing this must never put at risk. */
+function createEventsFollower(eventsFile) {
+  let offset = 0;
+  try { offset = fs.statSync(eventsFile).size; } catch { /* not written yet */ }
+  let buffer = '';
+  return function pump() {
+    let fd;
+    try {
+      fd = fs.openSync(eventsFile, 'r');
+      const size = fs.fstatSync(fd).size;
+      if (size <= offset) return;
+      const chunk = Buffer.alloc(size - offset);
+      fs.readSync(fd, chunk, 0, chunk.length, offset);
+      offset = size;
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? ''; // a trailing partial line waits for the next pump
+      for (const rawLine of lines) if (rawLine.trim()) followRenderLine(rawLine);
+    } catch { /* degrade silently — see function comment */ } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  };
+}
+
 /** Block until the job reaches a terminal state, then print its result —
  *  `wait` + `result` in one call. Bounded by its own --timeout (default 100s,
  *  chosen to sit under a typical harness per-command timeout); expiring is NOT
- *  a failure: exit code 2 means "still running — call wait again". */
+ *  a failure: exit code 2 means "still running — call wait again".
+ *
+ *  Wait is silent by default: callers use observe for progress, not periodic
+ *  liveness text. `--follow` opts a single caller into a live progress feed on
+ *  stderr instead, tailing the job's events file as the worker writes to it —
+ *  for a `wait` collected in a background shell, which otherwise shows
+ *  nothing at all for however long the job takes. stdout is untouched either
+ *  way: it stays the result channel `wait` always had. */
 async function cmdWait(opts) {
   const id = opts._[0] || null;
   const timeout = opts.timeout || '100s';
   const budget = durationToMs(timeout);
   if (!Number.isFinite(budget)) die(`invalid --timeout "${timeout}" (examples: 100s, 5m)`);
 
-  // Wait silently: callers use observe for progress, not periodic liveness text.
   // Read-only lookup: the poll loop must never write state.json, or it races
   // the worker's own final read-modify-write (see liveJobStatus).
   const findJob = () => {
@@ -1681,11 +1772,17 @@ async function cmdWait(opts) {
   const POLL_MS = 200;
   const start = Date.now();
   let status = liveJobStatus(job);
+  // Only ever created — and thus only ever prints anything — when the job is
+  // still running by the time this instance starts polling; a job that is
+  // already terminal is collected exactly as it was pre-follow (see the
+  // follower's own comment on why no history is replayed either way).
+  const pump = opts.follow && status === 'running' ? createEventsFollower(job.events_file) : null;
   while (status === 'running' && Date.now() - start < budget) {
     await sleepMs(Math.min(POLL_MS, budget - (Date.now() - start)));
     job = findJob();
     if (!job) die(`job record disappeared from state.json`);
     status = liveJobStatus(job);
+    if (pump) pump();
   }
 
   return renderJobResponse(job);
