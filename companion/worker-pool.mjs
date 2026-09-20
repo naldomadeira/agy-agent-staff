@@ -94,9 +94,9 @@ export async function discoverWorkers(options = {}) {
  */
 export function selectWorker({ workers = [], activeJobs = {}, requestedWorkerId, affinity } = {}) {
   const withinCapacity = (worker) => loadFor(worker, activeJobs) < normalizeCapacity(worker.capacity);
-  // A worker that exists but never answered the probe in time (`status:
-  // 'unknown'`) is not risked on a blind `auto` dispatch, but it is exactly
-  // what an operator naming `--worker <id>` explicitly is asking for.
+  // `unknown` is a worker that exists and did not answer the probe in time,
+  // not even on the retry. It counts as reachable — for an explicit
+  // `--worker <id>` and for `auto` alike.
   const reachable = (worker) => worker?.available === true || worker?.status === 'unknown';
   // Identity is resolved over the whole pool, then eligibility is checked.
   // Filtering first made a named worker that is merely busy fall through to a
@@ -105,12 +105,26 @@ export function selectWorker({ workers = [], activeJobs = {}, requestedWorkerId,
     const target = matchWorker(workers, affinityTarget(requestedWorkerId ?? affinity));
     return target && reachable(target) && withinCapacity(target) ? target : null;
   }
-  // Among workers confirmed available, more quota slack wins. Slack unknown
-  // on both sides, or tied (including two workers both at 0%), falls back to
-  // the older least-load rule, so a missing quota cache never blocks the pool.
+  // Order: workers that answered the probe first, then `unknown`; within each
+  // group, more quota slack wins, and load breaks the tie.
+  //
+  // `unknown` is eligible for `auto`, ranked last. Excluding it looked prudent
+  // and was not: the reason that state exists at all is a false negative that
+  // left two good profiles unused, and refusing them in `auto` repeats the
+  // same waste by another route — it turns "not there" into "there, but not
+  // counted on". A dispatch to a worker that turns out to be dead fails fast
+  // and loudly; idle capacity never fails, which is why nobody sees it.
   return workers
-    .filter((worker) => worker.available === true && withinCapacity(worker))
-    .sort((a, b) => bySlack(a, b) || loadFor(a, activeJobs) - loadFor(b, activeJobs))[0] ?? null;
+    .filter((worker) => reachable(worker) && withinCapacity(worker))
+    .sort(
+      (a, b) => byProbe(a, b) || bySlack(a, b) || loadFor(a, activeJobs) - loadFor(b, activeJobs),
+    )[0] ?? null;
+}
+
+/** A worker that answered the probe comes before one that did not. */
+function byProbe(a, b) {
+  const rank = (worker) => (worker?.available === true ? 0 : 1);
+  return rank(a) - rank(b);
 }
 
 /**

@@ -301,14 +301,42 @@ test('dois timeouts seguidos dão status unknown, não unavailable', async () =>
   assert.equal(solo.version, null);
 });
 
-test('worker unknown não é escolhido por auto, mas é escolhido por id explícito', () => {
+test('auto prefere quem respondeu à sonda, mas não descarta o unknown', () => {
   const workers = [
     { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 1 },
     { id: 'agy4', bin: 'agy4', available: false, status: 'unknown', capacity: 1 },
   ];
-  assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy', 'auto ignora o unknown mesmo com carga zero');
+  assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy', 'com um disponível livre, é esse');
   assert.equal(selectWorker({ workers, activeJobs: {}, requestedWorkerId: 'agy4' })?.id, 'agy4', 'pedido explícito seleciona o unknown');
   assert.equal(selectWorker({ workers, activeJobs: {}, affinity: { id: 'agy4', bin: 'agy4' } })?.id, 'agy4', 'afinidade também seleciona o unknown');
+});
+
+test('auto usa um unknown quando não há mais nada livre', () => {
+  // Capacidade parada não falha nunca, e por isso ninguém a vê. Um despacho
+  // para um worker que afinal está morto falha depressa e em voz alta.
+  const workers = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 1 },
+    { id: 'agy4', bin: 'agy4', available: false, status: 'unknown', capacity: 1 },
+  ];
+  const ocupado = [{ worker: { id: 'agy', bin: 'agy' } }];
+  assert.equal(selectWorker({ workers, activeJobs: ocupado }).id, 'agy4');
+});
+
+test('auto continua a recusar um unavailable, que é final', () => {
+  const workers = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 1 },
+    { id: 'agy9', bin: 'agy9', available: false, status: 'unavailable', capacity: 1 },
+  ];
+  const ocupado = [{ worker: { id: 'agy', bin: 'agy' } }];
+  assert.equal(selectWorker({ workers, activeJobs: ocupado }), null, 'binário ausente não é capacidade');
+});
+
+test('entre dois unknown, a folga de quota continua a desempatar', () => {
+  const workers = [
+    { id: 'agy4', bin: 'agy4', available: false, status: 'unknown', capacity: 1, quotaSlack: 10 },
+    { id: 'agy5', bin: 'agy5', available: false, status: 'unknown', capacity: 1, quotaSlack: 90 },
+  ];
+  assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy5');
 });
 
 // --- Quota: folga vinda do disco -------------------------------------------
