@@ -419,7 +419,7 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver']);
 const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
@@ -578,6 +578,10 @@ const FLAG_SCOPE = {
   // execution (resolveRun / cmdRestart / cmdWait)
   timeout: [...MODES, 'continue', 'restart', 'wait'],
   worker: [...MODES, 'continue', 'restart'],
+  // explicit commit authorization for a single implement run (resolveRun /
+  // buildPrompt / implementPostcondition); meaningless on every other mode
+  // and on continue, since it does not re-inject the prompt authorization.
+  deliver: ['implement'],
   // wait's own opt-in progress feed (cmdWait); meaningless anywhere else,
   // since only wait polls a job's events file at all
   follow: ['wait'],
@@ -606,6 +610,7 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   unrestricted: 'it sets the permission profile for a run',
   restrict: 'it is either the --restricted typo guard on a run, or the per-repo policy flag on setup',
   timeout: 'it sets the run/job time budget',
+  deliver: 'it authorizes git-commit delivery for a single implement run (only accepted value: commit)',
   follow: "it streams a running job's steps to stderr while wait polls for completion",
   json: '(review) it asks for schema-enforced findings instead of free-form markdown',
   apply: 'it confirms writing the setup allowlist',
@@ -683,6 +688,22 @@ function dirtyWorkspacePrompt() {
     lines.join('\n') +
     '\n```' +
     limitNote
+  );
+}
+
+/** Prompt-level commit authorization, injected only when the caller passed
+ *  --deliver commit on an implement run. Placeholder-based (like
+ *  dirtyWorkspacePrompt/{{WORKSPACE}}), not string concatenation in code, so
+ *  a run without the flag renders {{DELIVERY}} to '' and the prompt stays
+ *  byte-identical to a run made before this flag existed. */
+function deliveryAuthorizationPrompt(opts) {
+  if (opts.deliver !== 'commit') return '';
+  return (
+    '\n\n## Delivery authorization\n\n' +
+    '--deliver commit was passed for this run: you are explicitly authorized to commit the work you produce ' +
+    'here — the exception Rule 5 and the Guardrails below ask for. Push and opening/editing a PR remain out ' +
+    'of scope unless the task text itself asks for them. Commit before you finish — a run given --deliver ' +
+    'commit whose HEAD has not moved when you report done comes back for attention.'
   );
 }
 
@@ -1013,6 +1034,13 @@ function resolveRun(mode, opts, priorJob = null) {
   if (opts.effort && !['low', 'medium', 'high'].includes(opts.effort)) {
     die('--effort must be low|medium|high');
   }
+
+  // --deliver: scoped to implement only (see FLAG_SCOPE). The single
+  // accepted value keeps this a yes/no authorization, not a delivery-style
+  // picker — push/PR stay out of scope unless the task text itself asks.
+  if (opts.deliver !== undefined && opts.deliver !== 'commit') {
+    die(`--deliver accepts only "commit" (got "${opts.deliver}")`);
+  }
   let model;
   if (opts.model) {
     model = normalizeModel(opts.model, opts.effort);
@@ -1070,7 +1098,7 @@ function resolveRun(mode, opts, priorJob = null) {
   }
   if (profileSource === 'project') process.stderr.write(`agy-staff: profile=${profile} set by project policy (${configPath()})\n`);
   return { mode, model, profile, profileSource, background, timeout, conversation, parentJobId: prior?.id || null, originalCwd: prior?.cwd || null,
-    worker: prior?.worker || null };
+    worker: prior?.worker || null, deliver: opts.deliver === 'commit' };
 }
 
 /** Marker id of the pre-pool executable. It is never probed and never enters
@@ -1165,6 +1193,7 @@ function buildPrompt(mode, opts) {
     TASK: task,
     CONTEXT: context,
     WORKSPACE: mode === 'implement' ? dirtyWorkspacePrompt() : '',
+    DELIVERY: mode === 'implement' ? deliveryAuthorizationPrompt(opts) : '',
   });
 }
 
@@ -1262,13 +1291,21 @@ function implementDispatchWarning() {
  * leave an identical or clean tree too, and that is real work, not a noop.
  * A HEAD we could not read (see headSnapshot()) never counts as "unchanged":
  * we don't invent a verdict from a missing `git rev-parse`.
+ *
+ * `uncommitted` is a second, independent verdict added alongside `noop`: it
+ * is true whenever there is a delta in the working tree (`after.length > 0`)
+ * and HEAD did not move — whether or not that delta is new to this run. It
+ * says nothing on its own about whether that is a problem; --deliver commit
+ * is what turns it into one (see implementUncommittedMessage()).
  */
 function implementPostcondition(before, headBefore) {
-  if (!inGitRepo()) return { text: '', noop: false };
+  if (!inGitRepo()) return { text: '', noop: false, uncommitted: false };
   const after = porcelainSnapshot() || [];
   const headAfter = headBefore !== null ? headSnapshot() : null;
-  const noop = snapshotsEqual(before, after) && headBefore !== null && headAfter !== null && headBefore === headAfter;
-  if (!after.length) return { text: '\n[unrestricted] Working tree clean after implement.', noop };
+  const headUnchanged = headBefore !== null && headAfter !== null && headBefore === headAfter;
+  const noop = snapshotsEqual(before, after) && headUnchanged;
+  const uncommitted = after.length > 0 && headUnchanged;
+  if (!after.length) return { text: '\n[unrestricted] Working tree clean after implement.', noop, uncommitted };
   const diffStat = sh('git', ['diff', '--stat']).out;
   const delta = before ? porcelainDelta(before, after) : after;
   const untracked = delta
@@ -1289,8 +1326,9 @@ function implementPostcondition(before, headBefore) {
       (diffStat || '(only new files or committed by agy)');
   }
   if (untracked) out += `\nNew untracked files: ${untracked}`;
+  if (uncommitted) out += '\nUncommitted: this work exists in the working tree only — it was not delivered by commit.';
   out += '\nACTION FOR THE CALLING AGENT: inspect the current workspace (`git status --short`, `git diff`) and distinguish pre-run dirty paths from this run\'s delta. Continue the same agy conversation for follow-up work. If committing or opening a PR, first verify the task explicitly authorized that delivery.';
-  return { text: out, noop };
+  return { text: out, noop, uncommitted };
 }
 
 /**
@@ -1304,6 +1342,23 @@ function implementNoopMessage() {
     'Job needs attention: agy reported success but the repository is unchanged — no working tree delta ' +
     'and HEAD did not move. implement runs are expected to edit the working tree; review the report below ' +
     'against the task, then re-dispatch the job if the work still needs to happen.\n\n'
+  );
+}
+
+/**
+ * Fires when implementPostcondition() reports `uncommitted: true` on a run
+ * that explicitly requested --deliver commit: there is a real delta (or a
+ * pre-existing dirty tree agy left as-is) but HEAD never moved, so nothing
+ * was actually committed. Never fires alongside implementNoopMessage() — a
+ * true noop (nothing happened at all) keeps its own reason instead; see
+ * executeRun's opts.implementUncommitted assignment. Same neutral,
+ * action-first voice as implementNoopMessage().
+ */
+function implementUncommittedMessage() {
+  return (
+    'Job needs attention: --deliver commit was requested but HEAD did not move — the work in the working ' +
+    'tree was never committed. Review the report below against the task, then either commit the change ' +
+    'yourself or re-dispatch the job so agy finishes the delivery.\n\n'
   );
 }
 
@@ -1389,11 +1444,18 @@ async function executeRun(resolved, prompt, opts, execution = null) {
     // workerMain can turn a truly empty implement run into `attention`
     // without executeRun knowing anything about job records.
     opts.implementNoop = post.noop;
+    // Same side channel, for a run that explicitly asked for --deliver
+    // commit but never actually committed. Mutually exclusive with
+    // implementNoop: a true noop already gets its own attention reason
+    // above, so this only fires when real work exists but wasn't delivered.
+    opts.implementUncommitted = !post.noop && !!resolved.deliver && post.uncommitted;
   }
   if (treeReportApplies(resolved)) guard += treeDeltaReport(resolved.mode, treeBefore, treeAfter);
   opts.warnings ||= !!guard;
   const body = guard ? response + '\n' + guard : response;
-  return opts.implementNoop ? implementNoopMessage() + body : body;
+  if (opts.implementNoop) return implementNoopMessage() + body;
+  if (opts.implementUncommitted) return implementUncommittedMessage() + body;
+  return body;
 }
 
 async function cmdRun(mode, opts) {
@@ -1409,7 +1471,7 @@ async function cmdRun(mode, opts) {
     enterOriginalWorkspace(prior.cwd);
     if (prior.spec_file) { try { opts.json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
   }
-  const prompt = buildPrompt(mode, { prompt: task });
+  const prompt = buildPrompt(mode, { prompt: task, deliver: opts.deliver });
   return dispatch(resolved, prompt, { ...opts, workerPlan, promptSource: { kind: 'template', task } });
 }
 
@@ -1534,13 +1596,17 @@ async function workerMain(jobId) {
     });
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     // Result and conversation metadata are durable before completion is visible.
-    // implement is the only mode this can fire for (opts.implementNoop is
-    // only ever set inside the implementGuardApplies branch of executeRun):
-    // agy reported success, but the repository ended the run exactly as it
-    // started, so there is nothing here for the calling agent to build on.
+    // implement is the only mode either of these can fire for (opts.implementNoop
+    // and opts.implementUncommitted are only ever set inside the
+    // implementGuardApplies branch of executeRun): implementNoop means agy
+    // reported success but the repository ended the run exactly as it
+    // started; implementUncommitted means --deliver commit was requested and
+    // real work exists, but HEAD never moved, so nothing was delivered.
     job = finishJob(jobId, output + '\n', opts.implementNoop
       ? { status: 'attention', reason: 'implement_no_changes', warnings: opts.warnings }
-      : { status: 'done', warnings: opts.warnings });
+      : opts.implementUncommitted
+        ? { status: 'attention', reason: 'implement_uncommitted', warnings: opts.warnings }
+        : { status: 'done', warnings: opts.warnings });
     if (job.status === 'done' && !job.warnings) {
       for (const file of [job.events_file, job.progress_file]) {
         try { fs.unlinkSync(file); } catch (error) { process.stderr.write(`cleanup: ${error.message}\n`); }
@@ -1651,14 +1717,37 @@ function cmdStatus(opts) {
   }
 }
 
+/** How old a quota reading is, short enough for a table cell. A percentage
+ *  without its age is the kind of number that gets trusted for days. */
+function quotaAgeLabel(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+}
+
+/** The quota cell: slack with its age, or `-` when no reading exists. Absent
+ *  is a real answer here — a worker outside the profile scheme, or one whose
+ *  hook has never run, has no quota, and that is not a failure. */
+function quotaCell(worker) {
+  if (typeof worker.quotaSlack !== 'number') return '-';
+  const age = typeof worker.quotaAgeMs === 'number' ? ` (${quotaAgeLabel(worker.quotaAgeMs)})` : '';
+  return `${Math.round(worker.quotaSlack)}%${age}`;
+}
+
 async function cmdWorkers() {
   const workers = await discoverWorkers({ config: configPath() });
   const jobs = loadState().jobs || [];
   const active = jobs.filter((j) => liveJobStatus(j) === 'running');
-  process.stdout.write('id | executable | status | version | capacity | active jobs\n');
+  process.stdout.write('id | executable | status | version | capacity | active jobs | quota slack\n');
   for (const worker of workers) {
     const count = active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
-    process.stdout.write(`${worker.id} | ${worker.bin} | ${worker.available ? 'available' : 'unavailable'} | ${worker.version || '-'} | ${worker.capacity} | ${count}\n`);
+    // `status` carries the three-way verdict; `available` is the older boolean
+    // kept for callers that still read it. Printing the boolean here would
+    // collapse `unknown` back into `unavailable` — the exact false negative
+    // the three-way probe exists to remove.
+    const status = worker.status || (worker.available ? 'available' : 'unavailable');
+    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker)}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
 }

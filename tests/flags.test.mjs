@@ -266,6 +266,51 @@ describe('flag scope (generalized)', () => {
   });
 });
 
+describe('--deliver (implement commit authorization)', () => {
+  test('--deliver only accepts "commit"', () => {
+    const sb = sandbox('deliver-invalid-value');
+    const r = run(sb, ['implement', '--deliver', 'push', '--prompt', 'a task']);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /--deliver accepts only "commit" \(got "push"\)/);
+    assert.equal(agyCalls(sb).length, 0, 'agy must not be invoked');
+  });
+
+  test('--deliver needs a value', () => {
+    const sb = sandbox('deliver-missing-value');
+    const r = run(sb, ['implement', '--deliver', '--prompt', 'a task']);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /flag --deliver needs a value/);
+    assert.equal(agyCalls(sb).length, 0, 'agy must not be invoked');
+  });
+
+  for (const [cmd, extraArgs] of [
+    ['staffer', []],
+    ['research', []],
+    ['review', []],
+    ['ask', []],
+    ['continue', []],
+    ['restart', ['fake-job']],
+    ['status', []],
+    ['setup', []],
+  ]) {
+    test(`--deliver on ${cmd} dies naming the flag, the subcommand, and where it is valid`, () => {
+      const sb = sandbox(`deliver-scope-${cmd}`);
+      const r = run(sb, [cmd, ...extraArgs, '--deliver', 'commit']);
+      assert.equal(r.code, 1, `${cmd} --deliver must use the usage-error exit code (stdout: ${r.stdout} stderr: ${r.stderr})`);
+      assert.match(r.stderr, new RegExp(`--deliver has no effect on ${cmd}:`));
+      assert.match(r.stderr, /valid on: implement/);
+      assert.equal(agyCalls(sb).length, 0, 'agy must not be invoked');
+    });
+  }
+
+  test('implement still accepts --deliver commit', () => {
+    const sb = sandbox('deliver-accept-implement');
+    const r = run(sb, ['implement', '--deliver', 'commit', '--prompt', 'do it']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /has no effect on implement/);
+  });
+});
+
 describe('deprecated aliases', () => {
   test('--strict maps to restricted and warns once on stderr', () => {
     const sb = sandbox('alias-strict');

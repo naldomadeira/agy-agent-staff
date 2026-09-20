@@ -417,6 +417,128 @@ describe('tiered git guards: implement zero-delta postcondition', () => {
     assert.equal(res.code, 0, res.stderr);
     assert.doesNotMatch(res.stdout, /Job needs attention/);
     assert.match(res.stdout, /\[unrestricted\] Working tree clean after implement\./);
+    // clean tree → no delta, so the uncommitted-work warning must not fire
+    assert.doesNotMatch(res.stdout, /Uncommitted:/);
+  });
+
+  test('implement warns that work sits uncommitted in the tree, even without --deliver (clean before run)', async () => {
+    const sb = sandbox('uncommitted-warning-clean');
+    const started = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    // no --deliver flag: the postcondition text gains a warning, but status
+    // is unaffected — real edits with an unmoved HEAD are still 'done'.
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(
+      res.stdout,
+      /Uncommitted: this work exists in the working tree only — it was not delivered by commit\./
+    );
+  });
+
+  test('implement warns that work sits uncommitted in the tree, even without --deliver (dirty before run)', async () => {
+    const sb = sandbox('uncommitted-warning-dirty');
+    fs.writeFileSync(path.join(sb.repo, 'dirty.txt'), 'uncommitted\n');
+
+    const started = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-edit.txt'),
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(
+      res.stdout,
+      /Uncommitted: this work exists in the working tree only — it was not delivered by commit\./
+    );
+  });
+});
+
+describe('tiered git guards: implement --deliver commit', () => {
+  test('--deliver commit injects delivery authorization into the prompt', async () => {
+    const sb = sandbox('deliver-prompt');
+    const r = run(sb, ['implement', '--deliver', 'commit', '--prompt', 'a task'], {
+      FAKE_AGY_GIT_COMMIT: 'agy: deliver the fix',
+    });
+    assert.equal(r.code, 0, r.stderr);
+    const id = jobIdOf(r.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    const [argv] = await waitForCalls(sb, 1);
+    const prompt = promptOf(argv);
+    assert.match(prompt, /## Delivery authorization/);
+    assert.match(prompt, /--deliver commit was passed for this run/);
+    assert.match(prompt, /you are explicitly authorized to commit/);
+  });
+
+  test('without --deliver the prompt has no delivery authorization section (unchanged prompt)', async () => {
+    const sb = sandbox('deliver-prompt-absent');
+    const r = run(sb, ['implement', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
+    assert.equal(r.code, 0, r.stderr);
+    const id = jobIdOf(r.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    const [argv] = await waitForCalls(sb, 1);
+    const prompt = promptOf(argv);
+    assert.doesNotMatch(prompt, /## Delivery authorization/);
+    assert.doesNotMatch(prompt, /\{\{DELIVERY\}\}/);
+    assert.doesNotMatch(prompt, /--deliver commit was passed/);
+  });
+
+  test('--deliver commit with unmoved HEAD is flagged for attention (implement_uncommitted)', async () => {
+    const sb = sandbox('deliver-uncommitted');
+    const started = run(sb, ['implement', '--deliver', 'commit', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    // real delta, but agy never committed it despite --deliver commit
+    assert.equal(await waitForJob(sb, id), 'attention');
+    assert.equal(run(sb, ['status', id]).code, 5);
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 5, res.stderr);
+    assert.match(res.stdout, /Job needs attention: --deliver commit was requested but HEAD did not move/);
+    assert.match(res.stdout, /re-dispatch the job so agy finishes the delivery/);
+    assert.match(
+      res.stdout,
+      /Uncommitted: this work exists in the working tree only — it was not delivered by commit\./
+    );
+  });
+
+  test('--deliver commit that actually commits stays done, exit 0', async () => {
+    const sb = sandbox('deliver-committed');
+    const started = run(sb, ['implement', '--deliver', 'commit', '--prompt', 'commit the fix'], {
+      FAKE_AGY_GIT_COMMIT: 'agy: deliver the fix',
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const res = run(sb, ['result', id]);
+    assert.equal(res.code, 0, res.stderr);
+    assert.doesNotMatch(res.stdout, /Job needs attention/);
+  });
+
+  test('a true no-op with --deliver commit keeps the original implement_no_changes reason', async () => {
+    // Nothing happened at all (no delta, HEAD unmoved): that is still the
+    // more fundamental problem, so it must not be shadowed by the new
+    // implement_uncommitted reason.
+    const sb = sandbox('deliver-noop');
+    const started = run(sb, ['implement', '--deliver', 'commit', '--prompt', 'a task']);
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'attention');
+
+    const res = run(sb, ['result', id]);
+    assert.match(res.stdout, /Job needs attention: agy reported success but the repository is unchanged/);
+    assert.doesNotMatch(res.stdout, /--deliver commit was requested but HEAD did not move/);
   });
 });
 

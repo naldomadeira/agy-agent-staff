@@ -84,6 +84,27 @@ Warning-free success removes intermediate stream/snapshot files after results ar
 
 Quote errors and add a concise diagnosis. For sandbox/permission errors or an apparent crash without a result, check that collection uses the same unsandboxed context as launch; see `references/troubleshooting.md`. For restricted empty responses, relay the companion's permission guidance. Do not switch repositories to bypass a precondition.
 
+## Recommended prompt shape for dispatched work
+
+Background jobs come back consistently better when the prompt follows this shape, in order:
+CONTEXT (which repo and worktree, which branch, who else is running in parallel) · WHAT YOU WILL DO
+(one task, the absolute path to its spec, "read it whole before writing a line") · WHY THIS TASK
+EXISTS (the real problem, in two sentences, with concrete evidence) · WHAT ALREADY EXISTS ON THIS
+BRANCH (what other tasks left ready to reuse instead of rebuilding) · EXECUTION ORDER, numbered,
+not to be skipped · FILES YOU MAY / MAY NOT TOUCH (explicit lists; "if you find yourself editing
+another file, STOP and report") · PITFALL (the trap specific to this repo) · VERIFICATION (exact
+commands) · DELIVERY (commit policy) · REPORT (what was delivered, literal command output, and any
+point where the task contradicts the real code).
+
+Two parts of that shape carry disproportionate weight:
+
+- **REPORT must explicitly ask for contradictions between the spec and the real code.** Without
+  that instruction an executor quietly works around a mismatch instead of surfacing it; asking for
+  it turns the executor into a defect detector instead of a code-around machine.
+- **VERIFICATION must give a numeric baseline, not "tests pass."** A number like "65 suites, 581
+  tests, zero failures" gives the executor an objective bar to compare against — without one, a
+  pre-existing failure and a real regression read identically in its report.
+
 ## Host compatibility
 
 When this skill or its referenced instructions require a tool that the current environment does not provide, use available capabilities to achieve an equivalent result. Adapt only the tool-specific execution method; preserve the task goal, authorization requirements, explicit confirmation steps, result delivery, and stopping conditions.
