@@ -87,11 +87,16 @@ test('inclui AGY_POOL_BINS e configuração explícita com id e capacidade', asy
 
 test('deduplica e aplica id/capacidade da configuração ao bin já descoberto', async () => {
   const workers = await discoverWorkers({
-    env: { AGY_POOL_BINS: 'agy' }, path: '/fake', config: { workers: [{ id: 'primary', bin: 'agy', capacity: 4 }] }, probe: available('agy'),
+    // A folga de quota vem do disco (ver testes de quota, mais abaixo); um
+    // diretório de cache isolado e vazio é o que impede este teste de ler
+    // ~/.codex-profiles/cache da máquina que o corre.
+    env: { AGY_POOL_BINS: 'agy', AGY_QUOTA_CACHE_DIR: path.join(os.tmpdir(), 'agy-quota-cache-empty-does-not-exist') },
+    path: '/fake', config: { workers: [{ id: 'primary', bin: 'agy', capacity: 4 }] }, probe: available('agy'),
   });
   assert.equal(workers.filter((worker) => worker.bin === 'agy').length, 1);
   assert.deepEqual(workers.find((worker) => worker.bin === 'agy'), {
-    id: 'primary', bin: 'agy', available: true, version: 'agy-1.0.0', capacity: 4,
+    id: 'primary', bin: 'agy', available: true, status: 'available', version: 'agy-1.0.0', capacity: 4,
+    quotaSlack: null, quotaAgeMs: null,
   });
 });
 
@@ -211,4 +216,209 @@ test('afinidade ocupada não migra para um homónimo com o mesmo nome de execut�
   const error = thrown(() => reserveWorker(state, { workers, affinity, isRunning: running }));
   assert.equal(error.reason, 'worker_busy');
   assert.match(error.message, /worker agy2 for this job is busy/);
+});
+
+// --- Sonda: classes de erro e uma nova tentativa --------------------------
+
+/** Mimics what a rejected execFile promise looks like on a timeout kill:
+ *  `killed: true` and `signal: 'SIGTERM'`, with `code` left `null` — verified
+ *  by actually running `execFile` against a slow child process. */
+function timeoutError() {
+  return Object.assign(new Error('command timed out'), { killed: true, signal: 'SIGTERM', code: null });
+}
+
+function systemError(code) {
+  return Object.assign(new Error(code), { code });
+}
+
+// discoverWorkers always probes the default candidates (agy/agy2/agy3)
+// alongside anything configured, and does so concurrently — so call counts
+// below are tracked per bin, in a Map, rather than with one shared counter.
+
+test('ENOENT não faz retry e dá unavailable', async () => {
+  const calls = new Map();
+  const probe = async (bin) => {
+    calls.set(bin, (calls.get(bin) ?? 0) + 1);
+    throw systemError('ENOENT');
+  };
+  const workers = await discoverWorkers({ env: {}, path: '/fake', probe });
+  assert.ok(workers.length > 0);
+  for (const worker of workers) {
+    assert.equal(worker.status, 'unavailable');
+    assert.equal(worker.available, false);
+    assert.equal(calls.get(worker.bin), 1, `sem retry para ${worker.bin}`);
+  }
+});
+
+test('EACCES/EPERM/ENOTDIR também são finais, sem retry', async () => {
+  for (const code of ['EACCES', 'EPERM', 'ENOTDIR']) {
+    const calls = new Map();
+    const probe = async (bin) => {
+      calls.set(bin, (calls.get(bin) ?? 0) + 1);
+      throw systemError(code);
+    };
+    const workers = await discoverWorkers({ env: {}, path: '/fake', probe });
+    assert.equal(workers.every((worker) => worker.status === 'unavailable'), true, code);
+    assert.equal([...calls.values()].every((n) => n === 1), true, `sem retry para ${code}`);
+  }
+});
+
+test('timeout faz exatamente uma segunda tentativa, com um timeout maior', async () => {
+  const calls = new Map();
+  const probe = async (bin, { timeoutMs }) => {
+    const seen = calls.get(bin) ?? [];
+    seen.push(timeoutMs);
+    calls.set(bin, seen);
+    if (bin === '/opt/agy-solo' && seen.length === 1) throw timeoutError();
+    if (bin !== '/opt/agy-solo') throw new Error('not found');
+    return { available: true, version: `${bin}-1.0.0` };
+  };
+  const workers = await discoverWorkers({
+    env: {}, path: '/fake', probe, timeoutMs: 1500, retryTimeoutMs: 5000,
+    config: { workers: [{ id: 'solo', bin: '/opt/agy-solo' }] },
+  });
+  const solo = workers.find((worker) => worker.id === 'solo');
+  assert.deepEqual(calls.get('/opt/agy-solo'), [1500, 5000], 'exatamente uma nova tentativa, com o timeout maior');
+  assert.equal(solo.status, 'available');
+  assert.equal(solo.available, true);
+});
+
+test('dois timeouts seguidos dão status unknown, não unavailable', async () => {
+  const calls = new Map();
+  const probe = async (bin) => {
+    calls.set(bin, (calls.get(bin) ?? 0) + 1);
+    if (bin === '/opt/agy-solo') throw timeoutError();
+    throw new Error('not found');
+  };
+  const workers = await discoverWorkers({
+    env: {}, path: '/fake', probe,
+    config: { workers: [{ id: 'solo', bin: '/opt/agy-solo' }] },
+  });
+  const solo = workers.find((worker) => worker.id === 'solo');
+  assert.equal(calls.get('/opt/agy-solo'), 2);
+  assert.equal(solo.status, 'unknown');
+  assert.equal(solo.available, false, 'available continua booleano para quem já o lê');
+  assert.equal(solo.version, null);
+});
+
+test('worker unknown não é escolhido por auto, mas é escolhido por id explícito', () => {
+  const workers = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 1 },
+    { id: 'agy4', bin: 'agy4', available: false, status: 'unknown', capacity: 1 },
+  ];
+  assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy', 'auto ignora o unknown mesmo com carga zero');
+  assert.equal(selectWorker({ workers, activeJobs: {}, requestedWorkerId: 'agy4' })?.id, 'agy4', 'pedido explícito seleciona o unknown');
+  assert.equal(selectWorker({ workers, activeJobs: {}, affinity: { id: 'agy4', bin: 'agy4' } })?.id, 'agy4', 'afinidade também seleciona o unknown');
+});
+
+// --- Quota: folga vinda do disco -------------------------------------------
+
+function quotaDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'agy-quota-cache-'));
+}
+
+function writeQuota(dir, profile, { usedPercent, capturedAtMs }) {
+  fs.writeFileSync(
+    path.join(dir, `agy-quota-${profile}.json`),
+    JSON.stringify({ profile, used_percent: usedPercent, captured_at: capturedAtMs / 1000 })
+  );
+}
+
+test('lê a folga e a idade de um diretório de cache temporário', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuota(dir, 'principal', { usedPercent: 30, capturedAtMs: now - 10 * 60 * 1000 });
+
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir },
+    path: '/fake',
+    now,
+    probe: available('agy'),
+  });
+
+  const agy = workers.find((worker) => worker.bin === 'agy');
+  assert.equal(agy.quotaSlack, 70);
+  assert.equal(agy.quotaAgeMs, 10 * 60 * 1000);
+});
+
+test('mapeia agy2..agy5 para profile2..profile5 pelo nome do executável', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuota(dir, 'profile3', { usedPercent: 90, capturedAtMs: now });
+
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy3' },
+    path: '/fake',
+    now,
+    probe: available('agy3'),
+  });
+
+  const agy3 = workers.find((worker) => worker.bin === 'agy3');
+  assert.equal(agy3.quotaSlack, 10);
+});
+
+test('cache ausente não parte nada: folga e idade ficam null', async () => {
+  const dir = quotaDir();
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir }, path: '/fake', probe: available('agy') });
+  const agy = workers.find((worker) => worker.bin === 'agy');
+  assert.equal(agy.quotaSlack, null);
+  assert.equal(agy.quotaAgeMs, null);
+});
+
+test('JSON corrompido não parte nada: folga fica null', async () => {
+  const dir = quotaDir();
+  fs.writeFileSync(path.join(dir, 'agy-quota-principal.json'), '{ not json');
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir }, path: '/fake', probe: available('agy') });
+  const agy = workers.find((worker) => worker.bin === 'agy');
+  assert.equal(agy.quotaSlack, null);
+});
+
+test('worker sem ficheiro de quota correspondente não tem folga, sem ser erro', async () => {
+  const dir = quotaDir();
+  writeQuota(dir, 'principal', { usedPercent: 10, capturedAtMs: Date.now() });
+  const workers = await discoverWorkers({
+    env: { AGY_BIN: '/opt/agy-primary', AGY_QUOTA_CACHE_DIR: dir },
+    path: '/fake',
+    probe: available('/opt/agy-primary'),
+  });
+  const custom = workers.find((worker) => worker.bin === '/opt/agy-primary');
+  assert.equal(custom.quotaSlack, null);
+});
+
+test('auto prefere maior folga entre workers elegíveis', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuota(dir, 'principal', { usedPercent: 80, capturedAtMs: now }); // agy: 20% de folga
+  writeQuota(dir, 'profile2', { usedPercent: 10, capturedAtMs: now }); // agy2: 90% de folga
+
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir },
+    path: '/fake',
+    now,
+    probe: available('agy', 'agy2'),
+  });
+
+  assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy2');
+});
+
+test('auto cai na regra de menor carga quando a folga é desconhecida ou está empatada', () => {
+  const workers = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 5, quotaSlack: null },
+    { id: 'agy2', bin: 'agy2', available: true, status: 'available', capacity: 5, quotaSlack: null },
+  ];
+  assert.equal(selectWorker({ workers, activeJobs: { agy: 3, agy2: 1 } }).id, 'agy2');
+
+  const tied = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 5, quotaSlack: 50 },
+    { id: 'agy2', bin: 'agy2', available: true, status: 'available', capacity: 5, quotaSlack: 50 },
+  ];
+  assert.equal(selectWorker({ workers: tied, activeJobs: { agy: 2, agy2: 0 } }).id, 'agy2');
+});
+
+test('quando todos estão a 0% de folga, auto ainda escolhe pela regra antiga', () => {
+  const workers = [
+    { id: 'agy', bin: 'agy', available: true, status: 'available', capacity: 5, quotaSlack: 0 },
+    { id: 'agy2', bin: 'agy2', available: true, status: 'available', capacity: 5, quotaSlack: 0 },
+  ];
+  assert.equal(selectWorker({ workers, activeJobs: { agy: 4, agy2: 1 } }).id, 'agy2');
 });
