@@ -1717,14 +1717,37 @@ function cmdStatus(opts) {
   }
 }
 
+/** How old a quota reading is, short enough for a table cell. A percentage
+ *  without its age is the kind of number that gets trusted for days. */
+function quotaAgeLabel(ms) {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+}
+
+/** The quota cell: slack with its age, or `-` when no reading exists. Absent
+ *  is a real answer here — a worker outside the profile scheme, or one whose
+ *  hook has never run, has no quota, and that is not a failure. */
+function quotaCell(worker) {
+  if (typeof worker.quotaSlack !== 'number') return '-';
+  const age = typeof worker.quotaAgeMs === 'number' ? ` (${quotaAgeLabel(worker.quotaAgeMs)})` : '';
+  return `${Math.round(worker.quotaSlack)}%${age}`;
+}
+
 async function cmdWorkers() {
   const workers = await discoverWorkers({ config: configPath() });
   const jobs = loadState().jobs || [];
   const active = jobs.filter((j) => liveJobStatus(j) === 'running');
-  process.stdout.write('id | executable | status | version | capacity | active jobs\n');
+  process.stdout.write('id | executable | status | version | capacity | active jobs | quota slack\n');
   for (const worker of workers) {
     const count = active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
-    process.stdout.write(`${worker.id} | ${worker.bin} | ${worker.available ? 'available' : 'unavailable'} | ${worker.version || '-'} | ${worker.capacity} | ${count}\n`);
+    // `status` carries the three-way verdict; `available` is the older boolean
+    // kept for callers that still read it. Printing the boolean here would
+    // collapse `unknown` back into `unavailable` — the exact false negative
+    // the three-way probe exists to remove.
+    const status = worker.status || (worker.available ? 'available' : 'unavailable');
+    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker)}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
 }

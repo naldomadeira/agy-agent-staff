@@ -42,6 +42,14 @@ const argv = process.argv.slice(2);
 if (process.env.FAKE_AGY_CWD_FILE) fs.writeFileSync(process.env.FAKE_AGY_CWD_FILE, process.cwd());
 
 if (argv.includes('--version')) {
+  // A probe that never answers in time is how a worker becomes `unknown`.
+  // Busy-wait, not setTimeout: the pool kills the process on timeout, and a
+  // pending timer would let the runtime exit early and answer after all.
+  const delayMs = Number(process.env.FAKE_AGY_VERSION_DELAY_MS || 0);
+  if (delayMs > 0) {
+    const until = Date.now() + delayMs;
+    while (Date.now() < until) {}
+  }
   process.stdout.write('1.1.13-fake\n');
   process.exit(0);
 }

@@ -147,3 +147,55 @@ describe('companion worker pool integration', () => {
     assert.match(fs.readFileSync(record.result_file, 'utf8'), /failed to launch agy|became unavailable/);
   });
 });
+
+describe('workers table reports what discovery found', () => {
+  /** A quota cache of the shape the external hook writes, in the sandbox. */
+  function quotaCache(sb, entries) {
+    const dir = path.join(sb.root, 'quota-cache');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [profile, value] of Object.entries(entries)) {
+      fs.writeFileSync(path.join(dir, `agy-quota-${profile}.json`), JSON.stringify(value));
+    }
+    return dir;
+  }
+
+  test('quota slack is printed with its age, and absence prints as a dash', () => {
+    const sb = sandbox('workers-quota-column');
+    const bins = workersFor(sb, 2);
+    const dir = quotaCache(sb, {
+      // 21% used, captured two hours ago → 79% slack, age 2h.
+      profile2: { used_percent: 21, captured_at: (Date.now() - 2 * 3600_000) / 1000 },
+      // profile3 deliberately absent: no reading is a real answer.
+    });
+    const result = run(sb, ['workers'], { AGY_POOL_BINS: bins.join(','), AGY_QUOTA_CACHE_DIR: dir });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /id \| executable \| status \| version \| capacity \| active jobs \| quota slack/);
+    assert.match(result.stdout, /agy2.*\| 79% \(2h\)/);
+    assert.match(result.stdout, /agy3.*\| -$/m);
+  });
+
+  test('a worker that never answers the probe prints unknown, not unavailable', () => {
+    const sb = sandbox('workers-unknown-row');
+    const bins = workersFor(sb, 1);
+    // Both attempts expire well before the fake binary answers, which is the
+    // only way to reach `unknown` end to end. Printing `unavailable` here is
+    // the exact false negative this row exists to prevent.
+    const result = run(sb, ['workers'], {
+      AGY_POOL_BINS: bins.join(','),
+      AGY_PROBE_TIMEOUT_MS: '60',
+      AGY_PROBE_RETRY_TIMEOUT_MS: '60',
+      FAKE_AGY_VERSION_DELAY_MS: '400',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /agy2 \|.*\| unknown \|/);
+    assert.doesNotMatch(result.stdout, /agy2 \|.*\| unavailable \|/);
+  });
+
+  test('a bin that does not exist still prints unavailable, with no retry cost', () => {
+    const sb = sandbox('workers-unavailable-row');
+    const missing = path.join(sb.root, 'agy9-nao-existe');
+    const result = run(sb, ['workers'], { AGY_POOL_BINS: missing });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /agy9-nao-existe \|.*\| unavailable \|/);
+  });
+});

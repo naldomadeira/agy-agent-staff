@@ -8,8 +8,18 @@ import os from 'node:os';
 const execFileAsync = promisify(execFile);
 const DEFAULT_CAPACITY = 1;
 const DEFAULT_CANDIDATES = ['agy', 'agy2', 'agy3'];
+const DEFAULT_TIMEOUT_MS = 1500;
 const DEFAULT_RETRY_TIMEOUT_MS = 5000;
 const DEFAULT_QUOTA_CACHE_DIR = pathModule.join(os.homedir(), '.codex-profiles', 'cache');
+
+/** A positive millisecond count from the environment, or null. Anything else
+ *  — empty, zero, negative, not a number — is ignored rather than obeyed: a
+ *  typo that silently set the probe timeout to zero would mark every worker
+ *  `unknown`, which is worse than the default it replaced. */
+function envTimeout(value) {
+  const ms = Number(value);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
 
 /**
  * Descobre os workers AGY configurados ou disponíveis no PATH.
@@ -54,7 +64,15 @@ export async function discoverWorkers(options = {}) {
   disambiguateIds(bins);
 
   return Promise.all(bins.map(async (entry) => {
-    const result = await probeWorker(entry.bin, { env, timeoutMs: options.timeoutMs, retryTimeoutMs: options.retryTimeoutMs, probe: options.probe });
+    const result = await probeWorker(entry.bin, {
+      env,
+      // Explicit options win; the environment is the escape hatch for a
+      // machine where the wrappers are genuinely slower than the defaults.
+      timeoutMs: options.timeoutMs ?? envTimeout(env.AGY_PROBE_TIMEOUT_MS) ?? DEFAULT_TIMEOUT_MS,
+      retryTimeoutMs:
+        options.retryTimeoutMs ?? envTimeout(env.AGY_PROBE_RETRY_TIMEOUT_MS) ?? DEFAULT_RETRY_TIMEOUT_MS,
+      probe: options.probe,
+    });
     const quota = await readQuota(quotaCacheDir, entry.bin, now);
     return {
       id: entry.id,
@@ -251,7 +269,7 @@ async function loadConfig(config) {
  *
  * @returns {Promise<{status:'available'|'unavailable'|'unknown', version:string|null}>}
  */
-async function probeWorker(bin, { env, timeoutMs = 1500, retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS, probe }) {
+async function probeWorker(bin, { env, timeoutMs = DEFAULT_TIMEOUT_MS, retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS, probe }) {
   const attempt = (ms) => (probe ? probeOnce(bin, { env, timeoutMs: ms, probe }) : execProbeOnce(bin, { env, timeoutMs: ms }));
 
   const first = await attempt(timeoutMs);

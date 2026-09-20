@@ -18,7 +18,11 @@ node "<skill-dir>/../../companion/agy-companion.mjs" workers
 node "<skill-dir>/../../companion/agy-companion.mjs" <staffer|research|review|implement|ask> --worker <id|auto> --prompt "task"
 ```
 
-`workers` prints one row per worker: id, executable, availability, version, capacity, and active jobs. Pass an id from its first column to `--worker`; `--worker auto` picks the available worker with the lowest active-job count. A busy pinned worker is reported as busy, with its load and capacity — that is a reason to wait or cancel, never to dispatch the same job elsewhere.
+`workers` prints one row per worker: id, executable, status, version, capacity, active jobs, and quota slack. Pass an id from its first column to `--worker`; `--worker auto` prefers the worker with the most quota slack, falling back to the lowest active-job count when slack is unknown or tied. A busy pinned worker is reported as busy, with its load and capacity — that is a reason to wait or cancel, never to dispatch the same job elsewhere.
+
+**Status is three-way, not a boolean.** `available` answered `--version`; `unavailable` is not there (no such binary, or not executable); `unknown` exists but did not answer in time, even after a longer retry. `unknown` is excluded from `--worker auto` — never dispatch blind — but you can still pin it by id. The distinction earns its keep: a wrapper that provisions a keychain on first use takes seconds to answer, and calling that "unavailable" sends you hunting an installation problem that is not there.
+
+**Quota slack is a reading off disk, and it carries its age.** It comes from whatever hook writes the quota cache; this command only reads. A worker with no reading shows `-`, which is a real answer and not a failure. Read the age next to the number: `93% (3m)` and `93% (2d)` are not the same claim.
 
 > [!IMPORTANT]
 > Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../agy-jobs/references/troubleshooting.md`.
