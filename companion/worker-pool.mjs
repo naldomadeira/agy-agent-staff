@@ -105,20 +105,30 @@ export function selectWorker({ workers = [], activeJobs = {}, requestedWorkerId,
     const target = matchWorker(workers, affinityTarget(requestedWorkerId ?? affinity));
     return target && reachable(target) && withinCapacity(target) ? target : null;
   }
-  // Among workers confirmed available, more quota slack wins; slack that is
-  // unknown for either side, or tied (including two workers both at 0%),
-  // falls back to the older least-load rule so a stale or missing quota
-  // cache never blocks the pool.
+  // Among workers confirmed available, more quota slack wins. Slack unknown
+  // on both sides, or tied (including two workers both at 0%), falls back to
+  // the older least-load rule, so a missing quota cache never blocks the pool.
   return workers
     .filter((worker) => worker.available === true && withinCapacity(worker))
     .sort((a, b) => bySlack(a, b) || loadFor(a, activeJobs) - loadFor(b, activeJobs))[0] ?? null;
 }
 
+/**
+ * Ordena por folga, e trata "desconhecida" como pior do que qualquer folga
+ * medida.
+ *
+ * Desconhecida não quer dizer cheia: pode ser um worker sem ficheiro de quota,
+ * ou um cujas janelas reiniciaram todas — e esse último até é provavelmente o
+ * mais livre de todos. Mesmo assim perde para um número medido, porque
+ * "provavelmente livre" não é "livre" e `auto` escolhe sozinho, sem ninguém
+ * a confirmar o palpite. Quando nada é conhecido, ninguém ganha aqui e a
+ * decisão cai na carga, como antes de existir quota nenhuma.
+ */
 function bySlack(a, b) {
-  if (typeof a.quotaSlack === 'number' && typeof b.quotaSlack === 'number' && a.quotaSlack !== b.quotaSlack) {
-    return b.quotaSlack - a.quotaSlack;
-  }
-  return 0;
+  const known = (worker) => typeof worker.quotaSlack === 'number';
+  if (known(a) !== known(b)) return known(a) ? -1 : 1;
+  if (!known(a)) return 0;
+  return b.quotaSlack - a.quotaSlack;
 }
 
 /**
@@ -340,13 +350,48 @@ async function readQuota(cacheDir, bin, now) {
   } catch {
     return null;
   }
-  const usedPercent = Number(data?.used_percent);
   const capturedAt = Number(data?.captured_at);
-  if (!Number.isFinite(usedPercent) || !Number.isFinite(capturedAt)) return null;
-  return {
-    slack: Math.max(0, Math.min(100, 100 - usedPercent)),
-    ageMs: Math.max(0, now - capturedAt * 1000),
-  };
+  if (!Number.isFinite(capturedAt)) return null;
+  const slack = slackFrom(data, now);
+  if (slack === null) return null;
+  return { slack, ageMs: Math.max(0, now - capturedAt * 1000) };
+}
+
+/**
+ * A folga a partir de uma leitura de quota, ignorando janelas que já
+ * reiniciaram.
+ *
+ * Um `used_percent` só vale enquanto a janela que o contou ainda estiver a
+ * correr. Depois do `resets_at` o contador esvaziou-se e o número guardado
+ * passa a descrever um passado que já não conta — ler uma captura de há 11h
+ * e anunciar "17% de folga" quando a janela de 5h virou entretanto é dizer
+ * uma coisa falsa com cara de facto. Aconteceu.
+ *
+ * As janelas são independentes (5h e 7 dias apertam separadamente), por isso
+ * a regra é por janela: descarta as que reiniciaram, e a folga sai da mais
+ * apertada das que restam.
+ *
+ * Se TODAS reiniciaram, a resposta é `null` — desconhecida — e não 100%.
+ * Um contador esvaziado sugere que a conta está livre, mas "provavelmente
+ * livre" não é "livre", e devolver 100% punha um worker sobre o qual não se
+ * sabe nada à frente de outro com leitura fresca e folga real.
+ */
+function slackFrom(data, now) {
+  const buckets = data?.buckets && typeof data.buckets === 'object'
+    ? Object.values(data.buckets)
+    : [{ used_percent: data?.used_percent, resets_at: data?.resets_at }];
+  const live = buckets
+    .filter((bucket) => {
+      const resetsAt = Number(bucket?.resets_at);
+      // Sem `resets_at` não há como saber se a janela virou; conta na mesma,
+      // porque descartar uma leitura por lhe faltar um campo opcional seria
+      // trocar um número conservador por nenhum.
+      return !Number.isFinite(resetsAt) || resetsAt * 1000 > now;
+    })
+    .map((bucket) => Number(bucket?.used_percent))
+    .filter((used) => Number.isFinite(used));
+  if (!live.length) return null;
+  return Math.max(0, Math.min(100, 100 - Math.max(...live)));
 }
 
 /** `agy` is `principal`; `agy2`..`agy5` are `profile2`..`profile5`. Derived

@@ -385,6 +385,101 @@ test('worker sem ficheiro de quota correspondente não tem folga, sem ser erro',
   assert.equal(custom.quotaSlack, null);
 });
 
+/** Uma leitura com janelas nomeadas, como a que o hook escreve de verdade. */
+function writeQuotaBuckets(dir, profile, { capturedAtMs, buckets }) {
+  fs.writeFileSync(
+    path.join(dir, `agy-quota-${profile}.json`),
+    JSON.stringify({
+      profile,
+      captured_at: capturedAtMs / 1000,
+      buckets: Object.fromEntries(
+        Object.entries(buckets).map(([name, b]) => [
+          name,
+          { used_percent: b.usedPercent, resets_at: b.resetsAtMs / 1000 },
+        ])
+      ),
+    })
+  );
+}
+
+test('uma janela que já reiniciou não conta para a folga', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  // Os números reais que expuseram o defeito: uma captura de 11h atrás com a
+  // janela de 5h a 83%, já reiniciada desde então, e a de 7 dias a 23% ainda
+  // a correr. A leitura ingénua anunciava 17% de folga; a conta estava a 77%,
+  // como a captura seguinte confirmou.
+  writeQuotaBuckets(dir, 'principal', {
+    capturedAtMs: now - 11 * 3600_000,
+    buckets: {
+      '5h': { usedPercent: 83, resetsAtMs: now - 3600_000 },
+      '7d': { usedPercent: 23, resetsAtMs: now + 5 * 24 * 3600_000 },
+    },
+  });
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir }, path: '/fake', now, probe: available('agy'),
+  });
+  assert.equal(workers.find((worker) => worker.bin === 'agy').quotaSlack, 77);
+});
+
+test('a janela mais apertada ainda a correr é a que manda', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  // O caso da conta principal: a janela curta reiniciou, mas a longa está a
+  // 100% por mais dias. Tratar a reiniciada como livre daria folga total a
+  // uma conta esgotada.
+  writeQuotaBuckets(dir, 'principal', {
+    capturedAtMs: now - 2 * 24 * 3600_000,
+    buckets: {
+      '5h': { usedPercent: 38, resetsAtMs: now - 2 * 24 * 3600_000 },
+      '7d': { usedPercent: 100, resetsAtMs: now + 3 * 24 * 3600_000 },
+    },
+  });
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir }, path: '/fake', now, probe: available('agy'),
+  });
+  assert.equal(workers.find((worker) => worker.bin === 'agy').quotaSlack, 0);
+});
+
+test('todas as janelas reiniciadas dá folga desconhecida, não 100%', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'principal', {
+    capturedAtMs: now - 8 * 3600_000,
+    buckets: {
+      '5h': { usedPercent: 90, resetsAtMs: now - 3600_000 },
+      '7d': { usedPercent: 60, resetsAtMs: now - 600_000 },
+    },
+  });
+  const workers = await discoverWorkers({
+    env: { AGY_QUOTA_CACHE_DIR: dir }, path: '/fake', now, probe: available('agy'),
+  });
+  // Um contador esvaziado sugere conta livre, mas "provavelmente livre" não é
+  // "livre": 100% aqui punha um worker desconhecido à frente de um com folga
+  // medida.
+  assert.equal(workers.find((worker) => worker.bin === 'agy').quotaSlack, null);
+});
+
+test('auto não prefere folga desconhecida a folga real', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'principal', {
+    capturedAtMs: now - 8 * 3600_000,
+    buckets: { '5h': { usedPercent: 90, resetsAtMs: now - 3600_000 } },
+  });
+  writeQuotaBuckets(dir, 'profile2', {
+    capturedAtMs: now,
+    buckets: { '7d': { usedPercent: 40, resetsAtMs: now + 3 * 24 * 3600_000 } },
+  });
+  const workers = await discoverWorkers({
+    env: { AGY_POOL_BINS: 'agy,agy2', AGY_QUOTA_CACHE_DIR: dir },
+    path: '/fake', now, probe: () => ({ available: true, version: '1.0.0' }),
+  });
+  assert.equal(workers.find((worker) => worker.bin === 'agy').quotaSlack, null);
+  assert.equal(workers.find((worker) => worker.bin === 'agy2').quotaSlack, 60);
+  assert.equal(selectWorker({ workers, activeJobs: {} }).bin, 'agy2');
+});
+
 test('auto prefere maior folga entre workers elegíveis', async () => {
   const dir = quotaDir();
   const now = Date.now();
