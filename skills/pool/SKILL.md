@@ -43,4 +43,9 @@ The default capacity is one active job per worker. Select the available worker w
 
 Parallelize only independent tasks with separate ownership and acceptance criteria. Dependent tasks remain sequential. Never parallelize writes in the same worktree automatically: use different worktrees, or obtain explicit authorization for the shared-worktree exception. Keep each job's worker affinity for `continue` and `restart`; an unavailable original worker is reported rather than silently migrated.
 
+A fresh worktree does not inherit a gitignored `.env` — it is untracked, so `git worktree add` leaves
+it out. Left unnoticed, this reads as a regression (whole suites failing on a missing environment
+variable) rather than the setup gap it actually is. Copy it in when creating the worktree, for
+example `cp <repo>/.env <worktree>/.env`, before dispatching a job into it.
+
 Completion means the companion reports the selected worker, affinity, and each job's result; the lead still reviews and integrates all outputs.
