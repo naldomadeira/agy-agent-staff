@@ -60,6 +60,16 @@ export function run(sb, args, extraEnv = {}, { input } = {}) {
       HOME: sb.home,
       USERPROFILE: sb.home, // os.homedir() reads this on Windows, HOME elsewhere
       AGY_BIN: FAKE_AGY,
+      // The companion reads these straight from its own process.env, so the
+      // maintainer's shell leaks in through the `...process.env` spread above
+      // exactly like any other inherited var. Blank them by default so a test
+      // that doesn't care about the pool gets the CLI's built-in defaults
+      // regardless of what's set outside; `...extraEnv` below still lets a
+      // test that DOES care override any of them.
+      AGY_POOL_BINS: '',
+      AGY_QUOTA_CACHE_DIR: '',
+      AGY_PROBE_TIMEOUT_MS: '',
+      AGY_PROBE_RETRY_TIMEOUT_MS: '',
       FAKE_AGY_ARGV_FILE: sb.argvFile,
       // The fake agy answers in microseconds; a real one takes seconds. Keep a
       // realistic minimum latency so these suites measure the interface, not

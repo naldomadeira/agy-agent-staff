@@ -33,7 +33,13 @@ function envTimeout(value) {
  * @returns {Promise<Array<{id:string, bin:string, version:string|null, available:boolean, status:'available'|'unavailable'|'unknown', capacity:number, quotaSlack:number|null, quotaAgeMs:number|null}>>}
  */
 export async function discoverWorkers(options = {}) {
-  const env = { ...process.env, ...(options.env ?? {}) };
+  // `options.env`, when given, is the WHOLE environment discovery sees — it is
+  // not layered on top of process.env. A test that hands in `{}` means "no
+  // vars, full stop"; merging process.env underneath would let the host shell
+  // (AGY_POOL_BINS, AGY_BIN, …) leak into results the test thinks it controls.
+  // Every production caller omits `options.env`, so this changes nothing for
+  // the CLI: it still reads the real process.env.
+  const env = options.env !== undefined ? { ...options.env } : { ...process.env };
   if (options.path !== undefined) env.PATH = options.path;
   const now = options.now ?? Date.now();
   const quotaCacheDir = env.AGY_QUOTA_CACHE_DIR?.trim() || DEFAULT_QUOTA_CACHE_DIR;

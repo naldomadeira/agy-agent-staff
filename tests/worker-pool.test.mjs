@@ -70,6 +70,29 @@ test('prioriza AGY_BIN e deduplica binários', async () => {
   assert.deepEqual(workers.map((worker) => worker.bin), ['/opt/agy-primary', 'agy2', 'agy3', 'agy']);
 });
 
+test('um `env` explícito é a totalidade do ambiente, não um extra sobre o do processo', async () => {
+  // Regression: discoverWorkers used to merge process.env underneath
+  // options.env, so a maintainer's shell (AGY_POOL_BINS=agy4,agy5, say) leaked
+  // into every test that thought it fully controlled the environment via
+  // `env: {}`. Set the same vars here on the real process and confirm they
+  // are invisible to discovery once an explicit `env` is supplied.
+  const restoreBins = process.env.AGY_POOL_BINS;
+  const restoreBin = process.env.AGY_BIN;
+  process.env.AGY_POOL_BINS = 'agy4,agy5';
+  process.env.AGY_BIN = '/opt/host-only-agy';
+  try {
+    const workers = await discoverWorkers({
+      env: {},
+      path: '/fake',
+      probe: available('agy', 'agy2', 'agy3'),
+    });
+    assert.deepEqual(workers.map((worker) => worker.bin), ['agy', 'agy2', 'agy3']);
+  } finally {
+    if (restoreBins === undefined) delete process.env.AGY_POOL_BINS; else process.env.AGY_POOL_BINS = restoreBins;
+    if (restoreBin === undefined) delete process.env.AGY_BIN; else process.env.AGY_BIN = restoreBin;
+  }
+});
+
 test('inclui AGY_POOL_BINS e configuração explícita com id e capacidade', async () => {
   const workers = await discoverWorkers({
     env: { AGY_POOL_BINS: 'agy2 agy3' },
