@@ -23,6 +23,22 @@ function refused(result, active) {
   assert.equal(result.stdout, '');
 }
 
+/**
+ * Release a hand-built lock directory the same way `withStateLock`
+ * (companion/state-lock.mjs) releases a real one: unlink the marker, then
+ * rmdir. The instant the marker is gone the directory is empty, and a
+ * contender that has been retrying `renameSync(candidate, lock)` can win the
+ * race and replace it with its own (non-empty) candidate before this rmdir
+ * runs — that is a fair acquisition, not a bug, and `state-lock.mjs`'s own
+ * release path tolerates the resulting ENOTEMPTY for exactly this reason.
+ * Mirroring it here (instead of a bare rmdirSync) is what makes this test
+ * deterministic rather than an occasional false failure.
+ */
+function releaseLock(lock, marker) {
+  fs.unlinkSync(marker);
+  try { fs.rmdirSync(lock); } catch (error) { if (error.code !== 'ENOTEMPTY' && error.code !== 'ENOENT') throw error; }
+}
+
 test('initializing jobs reject follow-ups before a conversation or PID is available', () => {
   const sb = sandbox('continue-initializing');
   fs.mkdirSync(path.dirname(stateFile(sb)));
@@ -70,7 +86,7 @@ test('simultaneous follow-ups recheck occupancy inside registration and leave no
   const owner = `owner-${process.pid}-${randomUUID()}`;
   let pending = [];
   t.after(async () => {
-    if (fs.existsSync(path.join(lock, owner))) { fs.unlinkSync(path.join(lock, owner)); fs.rmdirSync(lock); }
+    if (fs.existsSync(path.join(lock, owner))) releaseLock(lock, path.join(lock, owner));
     await Promise.allSettled(pending);
     fs.writeFileSync(release, 'finish');
     for (const j of state(sb).jobs) run(sb, ['cancel', j.id]);
@@ -82,7 +98,12 @@ test('simultaneous follow-ups recheck occupancy inside registration and leave no
   fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, owner), '');
   const invoke = () => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [COMPANION, 'continue', '--conversation', conversation, '--prompt', 'contender'], {
+      // Neutralize the same host pool vars run() blanks in helpers.mjs (a
+      // maintainer's AGY_POOL_BINS et al. must not change which worker this
+      // spawn lands on) — this test builds its env by hand instead of
+      // through run(), so it needs the same defaults repeated here.
       cwd: sb.repo, env: { ...process.env, HOME: sb.home, USERPROFILE: sb.home, AGY_BIN: FAKE_AGY,
+        AGY_POOL_BINS: '', AGY_QUOTA_CACHE_DIR: '', AGY_PROBE_TIMEOUT_MS: '', AGY_PROBE_RETRY_TIMEOUT_MS: '',
         FAKE_AGY_ARGV_FILE: sb.argvFile, FAKE_AGY_RELEASE_FILE: release },
     });
     let stdout = '', stderr = '';
@@ -92,7 +113,7 @@ test('simultaneous follow-ups recheck occupancy inside registration and leave no
   pending = [invoke(), invoke()];
   // Both callers have passed the first guard and are waiting for this lock.
   await until(() => fs.readdirSync(dir).filter(n => n.startsWith('state.json.lock.owner-')).length === 2);
-  fs.unlinkSync(path.join(lock, owner)); fs.rmdirSync(lock);
+  releaseLock(lock, path.join(lock, owner));
   const results = await Promise.all(pending);
   assert.deepEqual(results.map(r => r.code).sort(), [0, 1]);
   const active = jobIdOf(results.find(r => r.code === 0).stdout);
