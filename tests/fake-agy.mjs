@@ -33,6 +33,26 @@
  *   FAKE_AGY_NO_JSON         die before printing any payload (default exit 1),
  *                            with FAKE_AGY_STDERR on stderr — simulates agy
  *                            being killed by a harness sandbox pre-JSON
+ *   FAKE_AGY_QUOTA           deterministic quota-exhaustion shortcut: sets
+ *                            status ERROR (unless FAKE_AGY_STATUS is already
+ *                            given) and a payload `error` reproducing agy's
+ *                            real RESOURCE_EXHAUSTED/429 shape, so tests don't
+ *                            repeat the literal string. Ignored if
+ *                            FAKE_AGY_ERROR is already set.
+ *   FAKE_AGY_QUOTA_RESETS    the "Resets in" duration text (default
+ *                            "4h1m13s", the production incident sample); an
+ *                            empty string omits "Resets in" entirely
+ *   FAKE_AGY_USAGE           JSON object for the payload `usage` field
+ *                            (default: absent — see below)
+ *   FAKE_AGY_DURATION_SECONDS payload `duration_seconds`  (default: absent)
+ *   FAKE_AGY_NUM_TURNS       payload `num_turns`          (default: absent)
+ *
+ * Telemetry (usage/duration_seconds/num_turns) is opt-in and absent by
+ * default: several regression tests assert the exact stdout of `wait`/
+ * `result`'s delivered header, which renders nothing extra when a job
+ * carries no telemetry (Fase 1, item 6). A test that wants the header's
+ * Usage line, or the job record's persisted fields, opts in with the three
+ * knobs above.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,6 +81,17 @@ if (argvFile) {
   } catch {
     /* recording is best-effort */
   }
+}
+
+// Deterministic quota-exhaustion simulation (agy-agent-staff Fase 1, item 1):
+// reproduce AGY's real RESOURCE_EXHAUSTED/429 shape without repeating the
+// literal string in every test that needs it.
+if (process.env.FAKE_AGY_QUOTA && !process.env.FAKE_AGY_ERROR) {
+  process.env.FAKE_AGY_STATUS ||= 'ERROR';
+  const resets = process.env.FAKE_AGY_QUOTA_RESETS ?? '4h1m13s';
+  process.env.FAKE_AGY_ERROR =
+    'RESOURCE_EXHAUSTED (code 429): Individual quota reached for model gemini-3.8-flash-medium.' +
+    (resets ? ` Resets in ${resets}` : '');
 }
 
 if (argv[0] === 'models' || argv.includes('models')) {
@@ -151,10 +182,12 @@ const payload = {
   status: process.env.FAKE_AGY_STATUS || 'SUCCESS',
   response: process.env.FAKE_AGY_RESPONSE ?? 'fake answer',
   conversation_id: process.env.FAKE_AGY_CONVERSATION_ID ?? 'conv-1',
-  duration_seconds: 1,
-  num_turns: 1,
-  usage: { input_tokens: 1, output_tokens: 1 },
 };
+// Opt-in telemetry (Fase 1, item 6) — see the FAKE_AGY_USAGE/
+// FAKE_AGY_DURATION_SECONDS/FAKE_AGY_NUM_TURNS doc comment above.
+if (process.env.FAKE_AGY_USAGE) payload.usage = JSON.parse(process.env.FAKE_AGY_USAGE);
+if (process.env.FAKE_AGY_DURATION_SECONDS) payload.duration_seconds = Number(process.env.FAKE_AGY_DURATION_SECONDS);
+if (process.env.FAKE_AGY_NUM_TURNS) payload.num_turns = Number(process.env.FAKE_AGY_NUM_TURNS);
 if (process.env.FAKE_AGY_ERROR) payload.error = process.env.FAKE_AGY_ERROR;
 
 if (process.env.FAKE_AGY_STDERR) process.stderr.write(process.env.FAKE_AGY_STDERR + '\n');

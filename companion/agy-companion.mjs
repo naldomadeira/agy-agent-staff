@@ -16,13 +16,25 @@
  *   observe [job-id]                immediate bounded snapshot in every job state
  *   restart <job-id>                explicitly relaunch the stored task
  *   status [job-id]                 list background jobs / show one job
- *   wait [job-id] [--timeout 100s] [--follow]
+ *   wait [job-id] [--timeout 100s] [--follow] [--until-done]
  *                                   block until the job finishes, then print
- *                                   its result (exit 2 = still running: call
- *                                   it again). --follow tails the job's step
- *                                   events to stderr while it waits, for a
- *                                   caller collecting the wait in a background
- *                                   shell that would otherwise sit silent
+ *                                   its result. Exit 2 always means the job
+ *                                   is still alive and nothing was delivered
+ *                                   — call it again; never pipe wait without
+ *                                   pipefail/PIPESTATUS, or a lost exit code
+ *                                   reads a soft-expiry snapshot as a
+ *                                   delivered result. --follow tails the
+ *                                   job's step events to stderr while it
+ *                                   waits, for a caller collecting the wait
+ *                                   in a background shell that would
+ *                                   otherwise sit silent. --until-done blocks
+ *                                   with no timeout ceiling (mutually
+ *                                   exclusive with --timeout): meant to be
+ *                                   launched as a background command in
+ *                                   hosts with background-job notifications
+ *                                   (Claude Code's run_in_background); in
+ *                                   hosts without that (Codex), keep
+ *                                   `wait --timeout 10m` and re-arm instead
  *   result [job-id]                 print the stored output of a finished job
  *   cancel <job-id>                 kill a running background job
  *   setup [--apply]                 optional: install the evidence-gathering
@@ -80,8 +92,11 @@
  *
  * Job exit codes (`status <id>` and `wait`): 0 = done, 2 = running (for wait:
  * still running when its own timeout expired — call it again), 3 = error or
- * crashed, 4 = canceled, 5 = attention (resumable timeout). 1 stays the generic companion error (bad id, etc.),
- * so a caller can loop on "exit code 2" with zero output parsing.
+ * crashed, 4 = canceled, 5 = attention (resumable timeout), 6 = quota_exhausted
+ * (the model's quota is exhausted; switch worker/model or wait for `resets_in`
+ * — never `continue` on the same model before the reset). 1 stays the generic
+ * companion error (bad id, etc.), so a caller can loop on "exit code 2" with
+ * zero output parsing.
  *
  * Review is prompt-based: the subject ("Review PR #730", "Review changes
  * against master") is described in the task text and agy gathers the evidence
@@ -420,7 +435,7 @@ function pidAlive(pid) {
 }
 
 const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver']);
-const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow']);
+const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
 // "unknown flag", so a 0.1 caller learns what replaced them.
@@ -585,6 +600,8 @@ const FLAG_SCOPE = {
   // wait's own opt-in progress feed (cmdWait); meaningless anywhere else,
   // since only wait polls a job's events file at all
   follow: ['wait'],
+  // wait's no-ceiling variant (cmdWait); same scoping reason as --follow
+  'until-done': ['wait'],
   // review's schema-enforced findings (executeRun), also read through by continue
   json: ['review', 'continue'],
   // setup
@@ -612,6 +629,7 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   timeout: 'it sets the run/job time budget',
   deliver: 'it authorizes git-commit delivery for a single implement run (only accepted value: commit)',
   follow: "it streams a running job's steps to stderr while wait polls for completion",
+  'until-done': 'it blocks wait until the job reaches a terminal state, with no timeout ceiling',
   json: '(review) it asks for schema-enforced findings instead of free-form markdown',
   apply: 'it confirms writing the setup allowlist',
   'dry-run': "it is setup's own no-op preview flag",
@@ -638,6 +656,57 @@ function fmtTokens(usage) {
   if (usage.thinking_tokens) parts.push(`think ${usage.thinking_tokens}`);
   if (usage.cache_read_tokens) parts.push(`cache ${usage.cache_read_tokens}`);
   return parts.join(', ');
+}
+
+/** Pulls the token/duration/turn fields out of a raw agy result payload, for
+ *  persisting onto the job record (Fase 1, item 6). Returns null when the
+ *  payload carried none of them, so a legacy job (or one whose execution
+ *  never reached a parsed payload at all — missing_result, hard timeout)
+ *  simply gets no telemetry fields, rather than an object of undefineds. */
+function extractTelemetry(payload) {
+  if (!payload) return null;
+  const fields = {};
+  if (payload.usage && typeof payload.usage === 'object') fields.usage = payload.usage;
+  if (payload.duration_seconds != null) fields.duration_seconds = payload.duration_seconds;
+  if (payload.num_turns != null) fields.num_turns = payload.num_turns;
+  return Object.keys(fields).length ? fields : null;
+}
+
+function fmtNum(n) {
+  return Number(n).toLocaleString('en-US');
+}
+
+/** "19m37s"-style duration, matching the shape of the numbers a maintainer
+ *  actually scans a report for — not a stopwatch to the millisecond. */
+function fmtDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}h${m}m${s}s`;
+  if (m) return `${m}m${s}s`;
+  return `${s}s`;
+}
+
+/** One compact line rendered right under the delivered `# Job ...` header for
+ *  a terminal job (Fase 1, item 6) — the same in/out/think/cache shape as
+ *  fmtTokens' worker-log line, plus duration and turn count, so the cost of a
+ *  run is visible where `wait`/`result` actually deliver it instead of only
+ *  in the worker log nobody tails until after the fact. Missing parts are
+ *  omitted; the whole line is omitted for a job with no known telemetry at
+ *  all (old records, or a terminal state whose payload never carried it). */
+function usageLine(job) {
+  const parts = [];
+  const u = job.usage;
+  if (u) {
+    if (u.input_tokens != null) parts.push(`in ${fmtNum(u.input_tokens)}`);
+    if (u.output_tokens != null) parts.push(`out ${fmtNum(u.output_tokens)}`);
+    if (u.thinking_tokens) parts.push(`think ${fmtNum(u.thinking_tokens)}`);
+    if (u.cache_read_tokens) parts.push(`cache ${fmtNum(u.cache_read_tokens)}`);
+  }
+  if (job.duration_seconds != null) parts.push(fmtDuration(job.duration_seconds));
+  if (job.num_turns != null) parts.push(`${job.num_turns} turns`);
+  return parts.length ? `Usage: ${parts.join(' · ')}\n` : '';
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +785,49 @@ function durationToMs(d) {
   if (!m) return null;
   const mult = { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2]];
   return Math.round(parseFloat(m[1]) * mult);
+}
+
+/** Parses AGY's own "resets in" text (e.g. "4h1m13s", "45s", "10m", "2h") —
+ *  unlike durationToMs (a single companion-timeout unit like "10m"), this
+ *  accepts the h/m/s combined shape AGY actually prints. Returns null for
+ *  anything else (missing, empty, or a shape this doesn't recognize), so the
+ *  continue/restart quota warning (Fase 1, item 7) can fall back to warning
+ *  without a time claim instead of guessing. */
+function parseResetsIn(text) {
+  if (!text || typeof text !== 'string') return null;
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(text.trim());
+  if (!m || !(m[1] || m[2] || m[3])) return null;
+  const h = Number(m[1] || 0), min = Number(m[2] || 0), s = Number(m[3] || 0);
+  return ((h * 60 + min) * 60 + s) * 1000;
+}
+
+/** Fase 1, item 7: a job that just ended `quota_exhausted` still gets
+ *  `continue`d or `restart`ed on the same model far more often than not —
+ *  the failure is fresh, the conversation is right there. This never blocks
+ *  (the caller decided to continue), it only makes sure they know the same
+ *  quota is very likely still exhausted. Silent for every other status,
+ *  for a different target model, and once the reset window has clearly
+ *  passed; when the window can't be computed (no/unparseable resets_in, or
+ *  no finished_at) it still warns, just without repeating a time it doesn't
+ *  actually know. */
+function warnIfContinuingIntoQuota(prior, resolvedModel) {
+  if (!prior || prior.status !== 'quota_exhausted') return;
+  if (!prior.model || prior.model !== resolvedModel) return;
+  const resetMs = parseResetsIn(prior.resets_in);
+  const finishedAt = prior.finished_at ? Date.parse(prior.finished_at) : NaN;
+  if (resetMs != null && Number.isFinite(finishedAt)) {
+    if (Date.now() >= finishedAt + resetMs) return; // window has clearly passed
+    process.stderr.write(
+      `agy-staff warning: job ${prior.id} ended quota_exhausted on model ${prior.model} ` +
+        `(resets in ${prior.resets_in} from ${prior.finished_at}); continuing on the same model will likely fail again — ` +
+        'pass --model <other> or choose another worker (see workers).\n'
+    );
+    return;
+  }
+  process.stderr.write(
+    `agy-staff warning: job ${prior.id} ended quota_exhausted on model ${prior.model}; ` +
+      'continuing on the same model will likely fail again — pass --model <other> or choose another worker (see workers).\n'
+  );
 }
 
 
@@ -909,6 +1021,64 @@ function runAgy(invoke) {
   return { payload, stderr, exit: r.status ?? 0 };
 }
 
+/**
+ * AGY's individual-quota 429 (RESOURCE_EXHAUSTED, "Individual quota reached",
+ * "quota exceeded", or "rate limit") is a distinct terminal state, not a
+ * generic error: the recovery is "use a different worker/model, or wait for
+ * the reset", never "continue on the same model". A pure function so it can
+ * be reasoned about (and tested) independently of triageResult's control
+ * flow: it reads ONLY the final AGY result's status/error field and the
+ * diagnostic stderr alongside it — never `payload.response`, so a model that
+ * merely *mentions* "429" or "quota" in its answer (e.g. summarizing a bug
+ * report) is never misclassified. A tool-level 429 the agent already
+ * recovered from ends with status SUCCESS and is filtered out below before
+ * any pattern is even tried; a caller that never reaches SUCCESS status
+ * checks this from the payload's status/error, not from response content.
+ */
+const QUOTA_PATTERNS = [
+  /RESOURCE_EXHAUSTED/i,
+  /\bcode\s*429\b/i,
+  /quota exceeded/i,
+  /Individual quota reached/i,
+];
+// Loose enough for AGY's one-line final error, too loose for stderr: that is
+// an 8 KiB tail of agy's raw log, where a retried 429 or a stray "pid 429"
+// can precede an unrelated failure.
+const QUOTA_ERROR_ONLY_PATTERNS = [/\b429\b/, /rate.?limit/i];
+
+function classifyTerminalFailure({ status, error, stderr }) {
+  if (String(status || '').toUpperCase() === 'SUCCESS') return null;
+  const text = `${error || ''}\n${stderr || ''}`;
+  const matched = QUOTA_PATTERNS.some((re) => re.test(text)) ||
+    QUOTA_ERROR_ONLY_PATTERNS.some((re) => re.test(String(error || '')));
+  if (!matched) return null;
+  // The literal duration AGY prints after "Resets in" (e.g. "4h1m13s") —
+  // never a computed date: the companion has no reliable clock-skew story
+  // against AGY's own reset timer, so it only ever repeats what AGY said.
+  const resets = /Resets in\s+([0-9a-zA-Z]+)/i.exec(text);
+  return { resets_in: resets ? resets[1] : null };
+}
+
+/** Never suggests `continue` on the same model — the one recovery this
+ *  status must not imply, since the quota that just ran out belongs to the
+ *  model/worker, not to the conversation. */
+function quotaRecoveryNote() {
+  return (
+    'Switch to another worker or model with headroom (see `workers`), or wait for the reset. ' +
+    'Do not `continue` on the same model before the reset.'
+  );
+}
+
+/** The quota_exhausted report, shared verbatim by the sync (`ask`) and
+ *  background paths: both must start with "Quota exhausted:" (spec) and
+ *  preserve any partial response text agy produced before the quota error. */
+function quotaExhaustedMessage({ model, resetsIn, response }) {
+  let msg = `Quota exhausted: model ${model}${resetsIn ? `, resets in ${resetsIn}` : ' (reset time not reported)'}.`;
+  msg += `\n${quotaRecoveryNote()}`;
+  if (response) msg += `\n\nPartial response received before the quota error:\n\n${response}`;
+  return msg;
+}
+
 /** Triage the agy result into distinct classes with distinct guidance
  *  (never cross-suggested), or return the response text on success.
  *  1. status ERROR / nonzero exit, but response text came back
@@ -938,6 +1108,16 @@ function triageResult({ payload, stderr, exit }, mode, profile, profileSource, r
   }
 
   if ((status && status !== 'SUCCESS') || exit !== 0) {
+    // Checked before the response-preserving branch below: a quota error with
+    // partial response text must still become quota_exhausted, not
+    // done_with_warnings — see classifyTerminalFailure's own comment.
+    const quota = classifyTerminalFailure({ status: payload.status, error: payload.error, stderr });
+    if (quota) {
+      throw Object.assign(
+        new Error(quotaExhaustedMessage({ model: requestedModel || DEFAULTS.model[mode], resetsIn: quota.resets_in, response })),
+        { reason: 'quota_exhausted', resets_in: quota.resets_in }
+      );
+    }
     if (response) {
       // Preserve response text and diagnostics for the orchestrator to assess.
       process.stderr.write(
@@ -1264,6 +1444,111 @@ function snapshotsEqual(a, b) {
   return x.length === y.length && x.every((line, i) => line === y[i]);
 }
 
+// ---------------------------------------------------------------------------
+// Partial work inventory (Fase 1, item 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic `## Partial work` Markdown inventory for a non-done terminal
+ * job. Built entirely from porcelain/HEAD snapshots the caller already
+ * gathered (executeRun's catch, its implement/verification attention
+ * branches, and workerMain's fallback for a cancellation caught outside
+ * executeRun) — no second snapshot mechanism, per the production incident
+ * this closes: a quota-killed implement left 8 defects in the workspace and
+ * the orchestrator never noticed the files. Pure given its inputs, except for
+ * one bounded, read-only `git log` call when HEAD actually moved (cheaper
+ * than plumbing that list through every call site for the common case where
+ * HEAD never moves). Never copies file contents or environment values, and
+ * never writes anything — the job report is the only artifact.
+ *
+ * `unavailable: true` is for a crashed job discovered later by refreshJobs:
+ * the worker died before ever recording a workspace snapshot, so there is
+ * nothing to inventory — say so instead of inventing data from absent
+ * inputs.
+ */
+function partialWorkReport({ status, reason, beforeLines = null, afterLines = null, headBefore = null, headAfter = null, finished = false, unavailable = false }) {
+  const out = ['## Partial work', `- Terminal state: ${status}${reason && reason !== status ? ` (${reason})` : ''}`];
+  if (unavailable) {
+    out.push('- Inventory unavailable: worker exited before recording the workspace.');
+    out.push('- Inspect: `git status --short; git diff; git diff --cached`');
+    out.push('- Verification: not confirmed; do not treat this work as accepted.');
+    return out.join('\n') + '\n';
+  }
+
+  const completeness = [];
+  let moved = false;
+  if (headBefore === null && headAfter === null) {
+    out.push('- HEAD: unknown (not a git repo)');
+  } else if (headBefore === null || headAfter === null) {
+    out.push('- HEAD: unknown (one of the before/after readings failed)');
+    completeness.push('HEAD reading failed for one side of the run');
+  } else {
+    moved = headBefore !== headAfter;
+    const fmt = (h) => (h === UNBORN_HEAD ? '(no commits yet)' : h);
+    out.push(`- HEAD: ${fmt(headBefore)} → ${fmt(headAfter)} (moved: ${moved ? 'yes' : 'no'})`);
+  }
+
+  const PATH_CAP = 50;
+  if (afterLines === null) {
+    out.push('- Dirty paths after the run: unknown (git status unavailable after the run)');
+    completeness.push('git status was unavailable after the run');
+  } else {
+    const beforeMap = beforeLines ? new Map(beforeLines.map((line) => [line.slice(3), line])) : null;
+    if (!beforeLines) completeness.push('no snapshot was taken before this run started; paths below are shown without before/after attribution');
+    // Porcelain status, not content: a path already ` M` before the run that
+    // the agent edited again is still ` M`, so "dirty after the run" is all
+    // this list can claim for it (content hashing is Fase 2).
+    out.push(`- Dirty paths after the run (${afterLines.length}):`);
+    if (!afterLines.length) out.push('  (working tree clean)');
+    for (const line of afterLines.slice(0, PATH_CAP)) {
+      const p = line.slice(3);
+      const untracked = line.startsWith('??');
+      const staged = !untracked && line[0] !== ' ';
+      const tags = [];
+      if (untracked) tags.push('untracked');
+      if (staged) tags.push('staged');
+      if (beforeMap) {
+        const prior = beforeMap.get(p);
+        if (prior === undefined) tags.push('new this run');
+        else if (prior !== line) tags.push('already dirty before the run; status changed');
+        else tags.push('already dirty before the run; content change not tracked');
+      }
+      out.push(`  - ${p}${tags.length ? ` (${tags.join('; ')})` : ''}`);
+    }
+    if (afterLines.length > PATH_CAP) out.push(`  … and ${afterLines.length - PATH_CAP} more`);
+  }
+
+  // A repo's very first commit moves HEAD from UNBORN_HEAD, and "<unborn>..sha"
+  // is not a valid git revision range — the full log up to headAfter already
+  // *is* everything the run made, since nothing existed before it.
+  const logRange = headBefore === UNBORN_HEAD ? headAfter : headBefore && headAfter ? `${headBefore}..${headAfter}` : null;
+  if (moved && logRange) {
+    const LOG_CAP = 20;
+    const log = sh('git', ['log', '--oneline', logRange]);
+    const commits = log.code === 0 && log.out ? log.out.split('\n') : [];
+    out.push(`- Commits made by the run (\`git log --oneline ${logRange}\`):`);
+    if (!commits.length) out.push('  (none found in that range)');
+    for (const line of commits.slice(0, LOG_CAP)) out.push(`  ${line}`);
+    if (commits.length > LOG_CAP) out.push(`  … and ${commits.length - LOG_CAP} more`);
+  }
+
+  const inspect = ['git status --short', 'git diff', 'git diff --cached'];
+  if (moved && logRange) inspect.push(`git log ${logRange}`);
+  out.push(`- Inspect: \`${inspect.join('; ')}\``);
+  if (moved && afterLines && !afterLines.length) {
+    completeness.push('HEAD moved and the working tree is clean, so `git diff`/`git diff --cached` show nothing — inspect the commits above instead');
+  }
+
+  out.push('- Verification: not confirmed; do not treat this work as accepted.');
+  if (finished) out.push('- Note: the agent reported finishing the task; the only unconfirmed step is verification.');
+
+  out.push(completeness.length
+    ? `- Inventory completeness: incomplete — ${completeness.join('; ')}.`
+    : '- Inventory completeness: complete (before/after status and HEAD were captured for this run).');
+
+  return out.join('\n') + '\n';
+}
+
 function implementGuardApplies(resolved) {
   return resolved.profile === 'unrestricted' && resolved.mode === 'implement';
 }
@@ -1382,10 +1667,163 @@ function treeDeltaReport(mode, before, after) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Verification-pending detection (Fase 1, item 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * A run that reports SUCCESS while its own text admits a verification is
+ * still in flight — "I have started `pnpm build` and am awaiting its
+ * completion" — is not done. Production incident: a job like that ended
+ * `done`, and a broken build nearly shipped; in one report the admission was
+ * the FIRST line, so only scanning the tail would have missed it.
+ * detectPendingVerification() is a pure function so it can be reasoned about
+ * (and tested) independently of executeRun/workerMain's control flow: it
+ * only ever reads the text handed to it, never job/process state.
+ *
+ * Conservative by construction:
+ *  - every pattern is tied to verification/build/test/background-process
+ *    wording (EN + PT, pt-BR and pt-PT), never a bare "waiting" — ordinary
+ *    prose about waiting on something unrelated (a user's answer, an
+ *    approval) does not match any of them;
+ *  - fenced code blocks and blockquote lines (`> ...`) are masked out before
+ *    matching: a quoted/historical mention inside one of those (e.g.
+ *    relaying someone else's status update, or a code sample) is not the
+ *    worker's own claim. Nothing else is exempted — in particular, past-tense
+ *    narration like "Earlier I was awaiting its completion" is NOT specially
+ *    filtered: the patterns are already narrow enough that adding tense
+ *    detection would trade a real miss for a rare false positive, and a real
+ *    miss is exactly the failure mode this function exists to close;
+ *  - a pending mention with explicit completion evidence LATER in the same
+ *    text ("build passed", "tests passed", "concluído com sucesso", ...) is
+ *    cleared — the worker followed up and confirmed the result itself.
+ */
+const PENDING_VERIFICATION_SCAN_CAP = 64 * 1024;
+const PENDING_VERIFICATION_WINDOW = PENDING_VERIFICATION_SCAN_CAP / 2;
+
+const PENDING_VERIFICATION_PATTERNS = [
+  // English
+  /\bam awaiting its completion\b/i,
+  /\bwill wait for it to complete\b/i,
+  /\bwaiting for (?:the )?(?:build|tests?|suite|it) to (?:complete|finish)\b/i,
+  /\b(?:build|tests?|suite|it|command|process|check)\s+(?:is|are)\s+still running\b/i,
+  /\bstarted\b[^.\n]{0,60}\bin the background\b/i,
+  // Portuguese (pt-BR and pt-PT)
+  /\baguardando a conclus[ãa]o\b/i,
+  /\baguardando (?:o|a) (?:build|su[íi]te|testes?)\b/i,
+  // "à espera do build", never "à espera de aprovação"
+  /\bespera d[oae]\s+(?:build|testes?|su[íi]te|conclus[ãa]o|verifica[çc][ãa]o)\b/i,
+  /\bainda (?:est[áa]|a) (?:correr|rodar)\b/i,
+  /\bem execu[çc][ãa]o em segundo plano\b/i,
+];
+
+const VERIFICATION_COMPLETE_PATTERNS = [
+  /\bbuild passed\b/i,
+  /\bbuild succeeded\b/i,
+  /\btests? passed\b/i,
+  /\ball \d+ tests? pass(?:ed)?\b/i,
+  /✓\s*compiled successfully/i,
+  /conclu[íi]do com sucesso/i,
+  // Bare "passou" is also "passou a usar"; only a verification that passed clears.
+  /\b(?:build|testes?|su[íi]te|verifica[çc][ãa]o)\s+(?:passou|passaram)\b/i,
+];
+
+/** Blanks out (same length, so match offsets stay valid) fenced code blocks
+ *  and blockquote lines — the only two "this is quoted, not asserted"
+ *  signals this function trusts. An unterminated fence (odd number of ```
+ *  markers) is left unmasked: conservative in the direction of still
+ *  catching it rather than silently swallowing the rest of the text. */
+function maskQuotedRegions(text) {
+  const withoutFences = text.replace(/```[\s\S]*?```/g, (m) => ' '.repeat(m.length));
+  return withoutFences
+    .split('\n')
+    .map((line) => (/^\s*>/.test(line) ? ' '.repeat(line.length) : line))
+    .join('\n');
+}
+
+function scanMatches(text, patterns, offset) {
+  const matches = [];
+  for (const pattern of patterns) {
+    const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`);
+    let m;
+    while ((m = re.exec(text))) {
+      matches.push({ index: offset + m.index, end: offset + m.index + m[0].length });
+      if (m[0].length === 0) re.lastIndex += 1; // guard against a zero-width pattern looping forever
+    }
+  }
+  return matches;
+}
+
+/** "The exact sentence" for the evidence quote: widen from the match to the
+ *  nearest sentence/line boundary on each side. Approximate on purpose — a
+ *  human-readable quote for the report, not a parse tree. */
+function sentenceAround(text, start, end) {
+  const before = text.slice(0, start);
+  const boundary = Math.max(before.lastIndexOf('\n'), before.lastIndexOf('. '), before.lastIndexOf('! '), before.lastIndexOf('? '));
+  const sentenceStart = boundary === -1 ? 0 : boundary + (text[boundary] === '\n' ? 1 : 2);
+  const after = text.slice(end);
+  const endMatch = /[.!?\n]/.exec(after);
+  const sentenceEnd = endMatch ? end + endMatch.index + 1 : text.length;
+  return text.slice(sentenceStart, sentenceEnd).trim();
+}
+
+/** Scans the WHOLE report, capped at ~64 KiB: under the cap the entire text
+ *  is one window; over it, the head and tail 32 KiB are scanned separately
+ *  (still catches a pending admission as the very first line of a long
+ *  report, and an explicit completion later in the tail still clears it). */
+function detectPendingVerification(text) {
+  if (!text) return { incomplete: false };
+  const original = String(text);
+  const windows = original.length <= PENDING_VERIFICATION_SCAN_CAP
+    ? [{ slice: original, offset: 0 }]
+    : [
+        { slice: original.slice(0, PENDING_VERIFICATION_WINDOW), offset: 0 },
+        { slice: original.slice(-PENDING_VERIFICATION_WINDOW), offset: original.length - PENDING_VERIFICATION_WINDOW },
+      ];
+
+  const pending = [];
+  const complete = [];
+  for (const { slice, offset } of windows) {
+    const masked = maskQuotedRegions(slice);
+    pending.push(...scanMatches(masked, PENDING_VERIFICATION_PATTERNS, offset));
+    complete.push(...scanMatches(masked, VERIFICATION_COMPLETE_PATTERNS, offset));
+  }
+  if (!pending.length) return { incomplete: false };
+  pending.sort((a, b) => a.index - b.index);
+  for (const match of pending) {
+    if (complete.some((c) => c.index > match.index)) continue; // explicit completion evidence follows — cleared
+    return { incomplete: true, evidence: sentenceAround(original, match.index, match.end) };
+  }
+  return { incomplete: false };
+}
+
+/** Only the modes that deliver work: implement and staffer (which can edit
+ *  and run commands). research and review routinely describe processes that
+ *  are not theirs ("the migration is still running in prod"), and ask has no
+ *  tools at all. No profile gate (unlike implementGuardApplies): a restricted
+ *  run's own claim of a pending build is still a claim the caller must check. */
+function verificationGuardApplies(resolved) {
+  return resolved.mode === 'implement' || resolved.mode === 'staffer';
+}
+
+/** Same neutral, action-first voice as implementNoopMessage()/
+ *  implementUncommittedMessage(): a report, not an accusation. */
+function verificationIncompleteMessage(evidence) {
+  return (
+    'Job needs attention: the worker declared a verification still pending — ' +
+    `"${evidence}". Run the pending verification yourself before accepting this work.\n\n`
+  );
+}
+
 async function executeRun(resolved, prompt, opts, execution = null) {
   const workspaceBefore = resolved.mode === 'ask' ? null : porcelainSnapshot();
+  // HEAD before the run, for every mode that can edit or commit — not just
+  // implement. partialWorkReport() (Fase 1, item 3) needs it for any
+  // non-done terminal state, so this is captured once here instead of only
+  // inside the implement guard below. Cheap and failure-tolerant; see
+  // headSnapshot().
+  const runHeadBefore = resolved.mode === 'ask' ? null : headSnapshot();
   const implementBefore = implementGuardApplies(resolved) ? workspaceBefore : null;
-  const implementHeadBefore = implementGuardApplies(resolved) ? headSnapshot() : null;
   const treeBefore = treeReportApplies(resolved) ? workspaceBefore : null;
 
   const invoke = {
@@ -1402,12 +1840,29 @@ async function executeRun(resolved, prompt, opts, execution = null) {
   try {
     result = execution ? await execution(invoke) : runAgy(invoke);
     rememberConversation(resolved, result.payload.conversation_id, opts.jobId);
+    // Captured before triageResult, which throws for quota_exhausted/
+    // response_timeout/error: the payload (and whatever telemetry it
+    // carries) already exists at this point regardless of which branch
+    // triageResult takes below, so workerMain's catch block can still
+    // persist it on the job record (Fase 1, item 6).
+    opts.telemetry = extractTelemetry(result.payload);
     response = triageResult(result, resolved.mode, resolved.profile, resolved.profileSource, resolved.model);
   } catch (error) {
+    const afterLines = porcelainSnapshot();
     error.workspace = {
       before: excerpt(workspaceBefore?.join('\n') ?? 'Git status unavailable', 3000),
-      after: excerpt(porcelainSnapshot()?.join('\n') ?? 'Git status unavailable', 3000),
+      after: excerpt(afterLines?.join('\n') ?? 'Git status unavailable', 3000),
       note: 'Inspect git status --short, git diff and git diff --cached. Status cannot detect further edits to already dirty files; no workspace rollback was performed.' };
+    // Gathered for workerMain's `## Partial work` Markdown section (Fase 1,
+    // item 3), built later once the final status/reason are known. Kept off
+    // error.workspace deliberately: that object is embedded verbatim in the
+    // JSON diagnostic packet below, and the Markdown section already carries
+    // this same path list in readable form — duplicating it as JSON too
+    // would just double the report's size for no new information.
+    error.partialWorkspace = {
+      beforeLines: workspaceBefore, afterLines,
+      headBefore: runHeadBefore, headAfter: resolved.mode === 'ask' ? null : headSnapshot(),
+    };
     if (error.reason === 'response_timeout' && !resolved.background) {
       const conversation = result.payload.conversation_id;
       const recovery = timeoutRecovery({ ...resolved, conversation_id: conversation });
@@ -1416,6 +1871,15 @@ async function executeRun(resolved, prompt, opts, execution = null) {
         conversation_id: conversation || null, mode: resolved.mode, model: resolved.model,
         profile: resolved.profile, recovery,
       }, null, 2)}`, conversation ? 5 : 1);
+    }
+    if (error.reason === 'quota_exhausted' && !resolved.background) {
+      const conversation = result.payload.conversation_id;
+      die(`${error.message}\n${JSON.stringify({
+        status: 'quota_exhausted', reason: 'quota_exhausted',
+        conversation_id: conversation || null, mode: resolved.mode, model: resolved.model,
+        profile: resolved.profile, resets_in: error.resets_in || null,
+        recovery: quotaRecovery({ resets_in: error.resets_in }),
+      }, null, 2)}`, 6);
     }
     throw error;
   }
@@ -1438,7 +1902,7 @@ async function executeRun(resolved, prompt, opts, execution = null) {
   // Guard output is part of the body: the calling agent must act on it.
   let guard = '';
   if (implementGuardApplies(resolved)) {
-    const post = implementPostcondition(implementBefore, implementHeadBefore);
+    const post = implementPostcondition(implementBefore, runHeadBefore);
     guard += post.text;
     // Stashed on opts (the same side channel `warnings` already uses) so
     // workerMain can turn a truly empty implement run into `attention`
@@ -1451,10 +1915,34 @@ async function executeRun(resolved, prompt, opts, execution = null) {
     opts.implementUncommitted = !post.noop && !!resolved.deliver && post.uncommitted;
   }
   if (treeReportApplies(resolved)) guard += treeDeltaReport(resolved.mode, treeBefore, treeAfter);
+  // Same side channel again: a SUCCESS report whose own text still admits a
+  // pending build/test/verification. Scanned on agy's raw response only,
+  // never on the guard text above (diff --stat etc. are ours, not the
+  // worker's claim). Lowest precedence of the three checked below — only
+  // consulted when neither implementNoop nor implementUncommitted already
+  // fired. The exception-driven terminal states (quota_exhausted,
+  // response_timeout, canceled, hard_timeout, error) never reach this line
+  // at all — they throw out of executeRun above — so this can never override
+  // them either.
+  opts.pendingVerification = verificationGuardApplies(resolved) ? detectPendingVerification(response) : null;
   opts.warnings ||= !!guard;
   const body = guard ? response + '\n' + guard : response;
+  // implement_no_changes gets no Partial work section: an unchanged
+  // repository has nothing to inventory (Fase 1, item 3).
   if (opts.implementNoop) return implementNoopMessage() + body;
-  if (opts.implementUncommitted) return implementUncommittedMessage() + body;
+  // A fresh snapshot here (not the one implementPostcondition/treeDeltaReport
+  // already took) keeps this section correct even though it runs after those
+  // guards executed their own git calls; cheap and read-only.
+  if (opts.implementUncommitted) {
+    const partial = partialWorkReport({ status: 'attention', reason: 'implement_uncommitted',
+      beforeLines: workspaceBefore, afterLines: porcelainSnapshot(), headBefore: runHeadBefore, headAfter: headSnapshot() });
+    return implementUncommittedMessage() + body + '\n' + partial;
+  }
+  if (opts.pendingVerification?.incomplete) {
+    const partial = partialWorkReport({ status: 'attention', reason: 'verification_incomplete',
+      beforeLines: workspaceBefore, afterLines: porcelainSnapshot(), headBefore: runHeadBefore, headAfter: headSnapshot(), finished: true });
+    return verificationIncompleteMessage(opts.pendingVerification.evidence) + body + '\n' + partial;
+  }
   return body;
 }
 
@@ -1559,7 +2047,7 @@ async function workerMain(jobId) {
   const onSignal = () => controller.abort();
   process.on('SIGTERM', onSignal);
   process.on('SIGINT', onSignal);
-  let job, cancelTimer;
+  let job, cancelTimer, opts;
   try {
     job = updateJob(jobId, { worker_started_at: new Date().toISOString(), worker_pid: process.pid, worker_identity: processIdentity(process.pid) });
     process.stderr.write(`[agy-staff] worker started ${jobId} pid=${process.pid} at ${job.worker_started_at}\n`);
@@ -1580,7 +2068,7 @@ async function workerMain(jobId) {
       const current = available.find((w) => w.id === spec.resolved.worker.id && w.bin === spec.resolved.worker.bin);
       if (!current?.available) throw new Error(`worker ${spec.resolved.worker.id} (${spec.resolved.worker.bin}) became unavailable after job creation; no automatic migration was attempted`);
     }
-    const opts = { ...spec.opts, jobId };
+    opts = { ...spec.opts, jobId };
     const output = await executeRun(spec.resolved, spec.prompt, opts, (invoke) => {
       const agy = agyCommand(agyArgs(invoke, 'stream-json'), invoke.worker?.bin || AGY_BIN);
       return runStreaming({ binary: agy.cmd, args: agy.args, job,
@@ -1596,17 +2084,23 @@ async function workerMain(jobId) {
     });
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     // Result and conversation metadata are durable before completion is visible.
-    // implement is the only mode either of these can fire for (opts.implementNoop
-    // and opts.implementUncommitted are only ever set inside the
-    // implementGuardApplies branch of executeRun): implementNoop means agy
-    // reported success but the repository ended the run exactly as it
-    // started; implementUncommitted means --deliver commit was requested and
-    // real work exists, but HEAD never moved, so nothing was delivered.
+    // implement is the only mode either implementNoop or implementUncommitted
+    // can fire for (opts.implementNoop and opts.implementUncommitted are only
+    // ever set inside the implementGuardApplies branch of executeRun):
+    // implementNoop means agy reported success but the repository ended the
+    // run exactly as it started; implementUncommitted means --deliver commit
+    // was requested and real work exists, but HEAD never moved, so nothing
+    // was delivered. pendingVerification fires for implement and staffer (see
+    // verificationGuardApplies): the worker's own report admits a
+    // verification — a build, a test suite — is still in flight.
+    const telemetry = opts.telemetry || {};
     job = finishJob(jobId, output + '\n', opts.implementNoop
-      ? { status: 'attention', reason: 'implement_no_changes', warnings: opts.warnings }
+      ? { status: 'attention', reason: 'implement_no_changes', warnings: opts.warnings, ...telemetry }
       : opts.implementUncommitted
-        ? { status: 'attention', reason: 'implement_uncommitted', warnings: opts.warnings }
-        : { status: 'done', warnings: opts.warnings });
+        ? { status: 'attention', reason: 'implement_uncommitted', warnings: opts.warnings, ...telemetry }
+        : opts.pendingVerification?.incomplete
+          ? { status: 'attention', reason: 'verification_incomplete', warnings: opts.warnings, pending_evidence: opts.pendingVerification.evidence, ...telemetry }
+          : { status: 'done', warnings: opts.warnings, ...telemetry });
     if (job.status === 'done' && !job.warnings) {
       for (const file of [job.events_file, job.progress_file]) {
         try { fs.unlinkSync(file); } catch (error) { process.stderr.write(`cleanup: ${error.message}\n`); }
@@ -1621,12 +2115,36 @@ async function workerMain(jobId) {
     if (!job) throw error;
     const reason = job.cancel_requested_at ? 'canceled' : error.reason || 'agy_error';
     const status = job.status === 'canceled' || reason === 'canceled' ? 'canceled'
+      : reason === 'quota_exhausted' ? 'quota_exhausted'
       : isTimeoutReason(reason) && job.conversation_id ? 'attention' : 'error';
+    // A cancellation detected right after executeRun already returned
+    // successfully (the signal fired in the small window between the agy
+    // call finishing and this check, back near the top of the try block)
+    // never passes through executeRun's own catch, so error.partialWorkspace
+    // is absent — fall back to a snapshot taken here. There is no "before"
+    // reading at this point; the section's completeness note says so rather
+    // than inventing one.
+    const workspaceSnapshot = error.partialWorkspace || {
+      beforeLines: null, afterLines: porcelainSnapshot(), headBefore: null, headAfter: headSnapshot(),
+    };
+    const partial = partialWorkReport({ status, reason, ...workspaceSnapshot });
     job = finishJob(jobId, (completed) => {
       const report = { ...diagnosticPacket(completed), result_exists: true, reason: completed.reason,
         workspace: error.workspace, last_snapshot: readObservation(completed) };
-      return `${completed.status === 'attention' ? 'Job needs attention' : 'Job failed'}:\n${completed.reason === 'canceled' ? 'Execution canceled.' : error.message}\n\n${JSON.stringify(report, null, 2)}\n`;
-    }, (current) => current.cancel_requested_at ? { status: 'canceled', reason: 'canceled' } : { status, reason });
+      // quota_exhausted's own message already opens with "Quota exhausted:"
+      // (spec: the report starts with that literal prefix) — no generic
+      // "Job failed"/"Job needs attention" label in front of it.
+      const label = completed.status === 'quota_exhausted' ? null
+        : completed.status === 'attention' ? 'Job needs attention' : 'Job failed';
+      const body = completed.reason === 'canceled' ? 'Execution canceled.' : error.message;
+      return `${label ? `${label}:\n` : ''}${body}\n\n${partial}\n${JSON.stringify(report, null, 2)}\n`;
+    }, (current) => {
+      const telemetry = opts?.telemetry || {};
+      return current.cancel_requested_at
+        ? { status: 'canceled', reason: 'canceled', ...telemetry }
+        : status === 'quota_exhausted' ? { status, reason, resets_in: error.resets_in ?? null, ...telemetry }
+        : { status, reason, ...telemetry };
+    });
     process.exitCode = JOB_EXIT_CODES[job.status] ?? 1;
   } finally {
     clearInterval(cancelTimer);
@@ -1647,10 +2165,10 @@ function refreshJobs(state) {
 }
 
 function liveJobStatus(job) {
-  if (['done', 'canceled', 'error', 'attention'].includes(job.status)) return job.status;
+  if (['done', 'canceled', 'error', 'attention', 'quota_exhausted'].includes(job.status)) return job.status;
   try {
     const final = JSON.parse(fs.readFileSync(job.result_file + '.status.json', 'utf8'));
-    if (['done', 'error', 'canceled', 'attention'].includes(final.status)) return final.status;
+    if (['done', 'error', 'canceled', 'attention', 'quota_exhausted'].includes(final.status)) return final.status;
   } catch {}
   if (pidAlive(job.pid)) return 'running';
   // New jobs publish an explicit result status; never infer success from an
@@ -1678,7 +2196,7 @@ function workerTag(worker) {
 // Machine-readable job exit codes shared by `status <id>` and `wait`.
 // 1 stays the generic companion error, so callers can loop on "code 2"
 // without parsing any output.
-const JOB_EXIT_CODES = { done: 0, running: 2, error: 3, crashed: 3, canceled: 4, attention: 5 };
+const JOB_EXIT_CODES = { done: 0, running: 2, error: 3, crashed: 3, canceled: 4, attention: 5, quota_exhausted: 6 };
 
 function cmdStatus(opts) {
   const state = loadState();
@@ -1695,6 +2213,7 @@ function cmdStatus(opts) {
       const log = readTail(job.log_file);
       process.stdout.write(log.split('\n').slice(-10).join('\n') + '\n');
     } else if (job.status === 'crashed' && !fs.existsSync(job.result_file)) {
+      process.stdout.write(`\n${partialWorkReport({ status: 'crashed', reason: job.reason || 'worker_crashed', unavailable: true })}\n`);
       process.stdout.write(JSON.stringify(diagnosticPacket(job), null, 2) + '\n');
       process.stdout.write(`\n${CRASH_SANDBOX_HINT}\n`);
     }
@@ -1844,9 +2363,16 @@ function createEventsFollower(eventsFile) {
  *  way: it stays the result channel `wait` always had. */
 async function cmdWait(opts) {
   const id = opts._[0] || null;
+  const untilDone = Boolean(opts['until-done']);
+  if (untilDone && opts.timeout) {
+    die('--until-done and --timeout are mutually exclusive: --until-done blocks with no ceiling, --timeout sets one — pass one or the other');
+  }
   const timeout = opts.timeout || '100s';
-  const budget = durationToMs(timeout);
-  if (!Number.isFinite(budget)) die(`invalid --timeout "${timeout}" (examples: 100s, 5m)`);
+  // --until-done removes the ceiling outright rather than picking a large
+  // number: a finite "very long" timeout still has to be chosen right, and
+  // the whole point of this flag is not choosing.
+  const budget = untilDone ? Infinity : durationToMs(timeout);
+  if (!untilDone && !Number.isFinite(budget)) die(`invalid --timeout "${timeout}" (examples: 100s, 5m)`);
 
   // Read-only lookup: the poll loop must never write state.json, or it races
   // the worker's own final read-modify-write (see liveJobStatus).
@@ -1874,7 +2400,7 @@ async function cmdWait(opts) {
     if (pump) pump();
   }
 
-  return renderJobResponse(job);
+  return renderJobResponse(job, { waitNotice: true });
 }
 
 function findJob(id) {
@@ -1930,6 +2456,21 @@ function timeoutRecovery(job) {
   };
 }
 
+/** Same recovery shape as timeoutRecovery(), for a job that ended
+ *  quota_exhausted: never `continue` on the same model before the reset. */
+function quotaRecovery(job) {
+  return { resets_in: job.resets_in || null, workers: 'workers', note: quotaRecoveryNote() };
+}
+
+/** Same recovery shape again, for a job that ended verification_incomplete:
+ *  the fix is neither "wait" (quota) nor "resume the timed-out conversation"
+ *  (timeout) — it's "go run the thing the worker said it was still waiting
+ *  on", so the note says that and carries the quoted evidence along. */
+function pendingVerificationRecovery(job) {
+  return { evidence: job.pending_evidence || null, inspect: 'git status --short; git diff',
+    note: 'Run the pending verification yourself (the build/test/suite the worker\'s report mentioned) before accepting this work. No automatic retry or continuation.' };
+}
+
 function diagnosticPacket(job) {
   let logBytes = null;
   try { logBytes = fs.statSync(job.log_file).size; } catch {}
@@ -1940,7 +2481,10 @@ function diagnosticPacket(job) {
     log_state: logBytes === null ? 'missing' : logBytes === 0 ? 'empty' : 'present',
     result_exists: fs.existsSync(job.result_file), log_file: job.log_file, events_file: job.events_file || null,
     conversation_id: job.conversation_id || null, model: job.model || null, profile: job.profile || null,
-    recovery: isTimeoutReason(job.reason) ? timeoutRecovery(job) : { inspect: 'git status --short; git diff', spec_file: job.spec_file || null,
+    resets_in: job.resets_in || null,
+    recovery: job.reason === 'quota_exhausted' ? quotaRecovery(job)
+      : job.reason === 'verification_incomplete' ? pendingVerificationRecovery(job)
+      : isTimeoutReason(job.reason) ? timeoutRecovery(job) : { inspect: 'git status --short; git diff', spec_file: job.spec_file || null,
       continue: job.conversation_id ? `continue --job ${job.id} --prompt "Continue after inspecting partial workspace changes"` : null,
       restart: `restart ${job.id}`, note: 'Inspect partial workspace changes first. Recovery creates a linked new job with a fresh budget; nothing is retried automatically.' },
   };
@@ -1964,14 +2508,30 @@ function readTerminalObservation(job, status) {
       instruction: 'Collect the existing wait session if one is pending; otherwise use result for the full output.',
     },
   };
+  // Fase 1, item 6: the same telemetry the delivered header's Usage line
+  // draws on, so an observer never has to wait for a full `result`/`wait`
+  // collection just to see the cost of a finished run. Falls back to the
+  // sidecar the same way resets_in already does above/below.
+  const usage = job.usage || final.usage || null;
+  if (usage) snapshot.usage = usage;
+  const durationSeconds = job.duration_seconds ?? final.duration_seconds ?? null;
+  if (durationSeconds != null) snapshot.duration_seconds = durationSeconds;
+  const numTurns = job.num_turns ?? final.num_turns ?? null;
+  if (numTurns != null) snapshot.num_turns = numTurns;
   if (status !== 'done') {
     const reason = job.reason || final.reason || (status === 'crashed' ? 'worker_crashed' : status === 'canceled' ? 'canceled' : 'job_error');
     const packet = diagnosticPacket({ ...job, ...final, reason });
+    const resetsIn = job.resets_in || final.resets_in || null;
     Object.assign(snapshot, {
       reason,
-      summary: status === 'attention' ? 'Timeout with a resumable conversation; ask the user whether to continue.'
+      summary: status === 'quota_exhausted'
+        ? `Quota exhausted${resetsIn ? ` — resets in ${resetsIn}` : ' (reset time not reported)'}; switch to another worker/model with headroom or wait for the reset.`
+        : reason === 'verification_incomplete' ? 'The worker\'s own report admits a pending verification; run it yourself before accepting this work.'
+        : status === 'attention' ? 'Timeout with a resumable conversation; ask the user whether to continue.'
         : reason === 'hard_timeout' ? 'Execution stopped at its hard limit.' : `Job ${status}; inspect the retained report and diagnostics.`,
       conversation_id: job.conversation_id || null, model: job.model || null, profile: job.profile || null,
+      resets_in: resetsIn,
+      pending_evidence: job.pending_evidence || final.pending_evidence || null,
       worker_started_at: job.worker_started_at || null, pid: job.pid, agy_pid: job.agy_pid || null,
       log_state: packet.log_state, log_bytes: packet.log_bytes,
       details: { diagnostics: job.log_file, raw_output: job.events_file || null, snapshot: job.progress_file || null },
@@ -1983,7 +2543,7 @@ function readTerminalObservation(job, status) {
   return boundSnapshot(snapshot);
 }
 
-function renderJobResponse(initial, { observeOnly = false } = {}) {
+function renderJobResponse(initial, { observeOnly = false, waitNotice = false } = {}) {
   let job = findJob(initial.id);
   let status = liveJobStatus(job);
   if (status === 'running') {
@@ -1993,6 +2553,14 @@ function renderJobResponse(initial, { observeOnly = false } = {}) {
     status = liveJobStatus(job);
     if (status === 'running') {
       process.stdout.write(JSON.stringify(snapshot) + '\n');
+      // stderr only, never stdout: an orchestrator piping `wait ... | tail`
+      // and losing the exit code has read this exact JSON as a delivered
+      // result in production. waitNotice is only ever true from cmdWait —
+      // this same branch is also reached by `observe`, which must stay
+      // exactly as quiet as it always was.
+      if (waitNotice) {
+        process.stderr.write(`STILL RUNNING — job ${job.id}, ${snapshot.elapsed_seconds}s elapsed. Exit 2: not delivered; call wait again.\n`);
+      }
       process.exitCode = 2;
       return;
     }
@@ -2010,10 +2578,13 @@ function renderJobResponse(initial, { observeOnly = false } = {}) {
     // wait is the mandatory collection path, so this header is where the
     // selected worker has to survive: without it the delivered result was the
     // one place that dropped the job's pool identity.
-    process.stdout.write(`# Job ${job.id} (${job.mode}, ${status}) — AGY worker: ${workerLabel(job.worker)}\n\n`);
+    process.stdout.write(`# Job ${job.id} (${job.mode}, ${status}) — AGY worker: ${workerLabel(job.worker)}\n${usageLine(job)}\n`);
     process.stdout.write(fs.readFileSync(job.result_file, 'utf8'));
   } else {
     process.stdout.write(`Job ${job.id} (${job.mode}) finished with status ${status} and no stored result. Log: ${job.log_file}\n`);
+    if (status === 'crashed') {
+      process.stdout.write(`\n${partialWorkReport({ status, reason: job.reason || 'worker_crashed', unavailable: true })}\n`);
+    }
     process.stdout.write(JSON.stringify(diagnosticPacket(job), null, 2) + '\n');
     if (status === 'crashed') process.stdout.write(`\n${CRASH_SANDBOX_HINT}\n`);
   }
@@ -2042,7 +2613,8 @@ function cmdResult(opts) {
   if (!fs.existsSync(job.result_file)) {
     let msg = `job ${job.id} (${job.status}) has no stored result. Log: ${job.log_file}`;
     if (job.status === 'crashed') {
-      msg += `\n${JSON.stringify(diagnosticPacket(job), null, 2)}\n\n${CRASH_SANDBOX_HINT}`;
+      msg += `\n\n${partialWorkReport({ status: 'crashed', reason: job.reason || 'worker_crashed', unavailable: true })}` +
+        `\n${JSON.stringify(diagnosticPacket(job), null, 2)}\n\n${CRASH_SANDBOX_HINT}`;
     }
     die(msg);
   }
@@ -2126,6 +2698,7 @@ async function cmdContinue(opts) {
   if (!task) die('continue needs follow-up text');
   enterOriginalWorkspace(prior?.cwd);
   const resolved = resolveRun(mode, { ...opts, conversation }, prior);
+  warnIfContinuingIntoQuota(prior, resolved.model);
   const workerPlan = await planWorker(opts, prior);
   const workspace = mode === 'implement' ? dirtyWorkspacePrompt() : '';
   const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}`;
@@ -2142,6 +2715,10 @@ async function cmdRestart(opts) {
   const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
   enterOriginalWorkspace(spec.cwd);
   const resolved = { ...spec.resolved, conversation: null, timeout: DEFAULTS.timeout[job.mode] };
+  // restart has no --model of its own (see FLAG_SCOPE: `model` does not list
+  // `restart`), so it always reuses the original job's model — the warning
+  // only needs to check the job's own status/window (Fase 1, item 7).
+  warnIfContinuingIntoQuota(job, resolved.model);
   const workerPlan = await planWorker(opts, job);
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;

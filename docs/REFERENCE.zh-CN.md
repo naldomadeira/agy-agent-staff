@@ -125,8 +125,9 @@ agy 还有与 `--project` 体系关联的项目级权限规则，可以将权限
 | `--restrict <modes\|none>` | 用于 `setup`，设置或清除[仓库默认权限](#仓库级-policysetup---restrict) |
 | `--worker <id>` | 可选 worker 池：为本次运行显式选择某个已发现的 worker，或传入 `auto` 按负载自动选择。仅在 `staffer`/`research`/`review`/`implement`/`ask`、`continue` 和 `restart` 上有效；在 `status`、`wait`、`result`、`cancel`、`observe`、`setup`、`workers` 上会直接报错，因为这些命令从不派发到 worker |
 | `--json` | 用于代码审查，按指定结构返回 JSON 格式的问题列表；默认使用 Markdown。仅在 `review` 和 `continue` 上有效（`continue` 时只有当被续接的会话原本就是 `review` 模式才会生效）；在其他命令上会直接报错 |
-| `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m。在 `wait`（等待本身的轮询超时，默认 100s）和 `restart`（重新派发时的新预算）上同样有效 |
-| `--follow` | （仅 `wait`）轮询期间把任务的步骤事件实时输出到标准错误：每一步一行 `▶`/`✓`/`✗`，附工具名和简短的参数提示。`wait` 的标准输出不受影响；不加 `--follow` 时行为和之前完全一样，保持静默。只显示本次 `wait` 开始之后发生的步骤，不会补发之前的历史 |
+| `--timeout <dur>` | 后台任务的执行时限，默认 60m，最长 120m；AGY 会收到相同的响应超时参数。同步 `ask` 的默认响应超时为 2m。在 `wait`（等待本身的轮询超时，默认 100s）和 `restart`（重新派发时的新预算）上同样有效；与 `wait` 的 `--until-done` 同时传入会报错——两者是同一件事的两种互斥写法 |
+| `--follow` | （仅 `wait`）轮询期间把任务的步骤事件实时输出到标准错误：每一步一行 `▶`/`✓`/`✗`，附工具名和简短的参数提示。`wait` 的标准输出不受影响；不加 `--follow` 时行为和之前完全一样，保持静默。只显示本次 `wait` 开始之后发生的步骤，不会补发之前的历史。可以和 `--until-done` 一起使用 |
+| `--until-done` | （仅 `wait`）阻塞到任务进入终态为止，没有超时上限——不需要选择 `--timeout` 的值，也不会应用任何超时。与 `--timeout` 互斥（用法错误，退出码 1）。轮询节奏和崩溃检测与普通 `wait` 完全相同，因此中途消失的 worker 仍会让本次等待以 `crashed` 结束，而不是无限挂起。详见[退出码 2 与 `--until-done`](#退出码-2-与---until-done) |
 | `--prompt <text>` | 将任务正文作为一个参数传入，通常需要用引号包住 |
 | `--prompt-file <path>` | 从文件读取任务正文，适合较长的描述 |
 | `--stdin` | 从标准输入读取任务正文 |
@@ -182,7 +183,19 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 默认流程是：写好 prompt → 派发 → 等待最终结果 → 按需验收。任务运行中不主动 `observe`、查 `status`、读日志或检查中间产物，也不为例行汇报查询进度。只有用户明确询问进度时才观测；收到失败或需要介入的结果后再诊断。
 
-`wait [id] [--timeout <dur>] [--follow]` 会等到任务完成，或本次等待到期。完成时返回完整结果；等待到期但任务仍在运行时，返回当前的 JSON 快照，并让 worker 继续执行。普通的工具活动不会提前结束等待。直接运行 `wait` 时默认等待 100 秒，技能建议显式使用 `--timeout 10m`。退出码 2 只表示本次等待到期，应继续等待同一任务；附带快照不要求检查进度或介入。加上 `--follow` 会在等待期间把任务的步骤实时输出到标准错误——适合在后台 shell 里收集的 `wait`，否则它在返回之前不会有任何输出；不加这个参数时 `wait` 仍然和以前一样静默，标准输出也不受影响。
+`wait [id] [--timeout <dur>] [--follow] [--until-done]` 会等到任务完成，或本次等待到期。完成时返回完整结果；等待到期但任务仍在运行时，返回当前的 JSON 快照，并让 worker 继续执行。普通的工具活动不会提前结束等待。直接运行 `wait` 时默认等待 100 秒，技能建议显式使用 `--timeout 10m`。退出码 2 只表示本次等待到期，应继续等待同一任务；附带快照不要求检查进度或介入。加上 `--follow` 会在等待期间把任务的步骤实时输出到标准错误——适合在后台 shell 里收集的 `wait`，否则它在返回之前不会有任何输出；不加这个参数时 `wait` 仍然和以前一样静默，标准输出也不受影响，且可以和 `--until-done` 同时使用。`--until-done` 会完全去掉超时上限，一直阻塞到任务进入终态；下面详细说明退出码 2 的含义，以及什么时候该用 `--until-done`。
+
+<a id="退出码-2-与---until-done"></a>
+
+#### 退出码 2 与 `--until-done`
+
+**退出码 2 永远表示任务仍在运行、什么都没有交付。** 等待到期时，标准输出是纯 JSON（一份观察快照，字段里带 `"status":"running"`）——如果调用方对标准输出直接 `JSON.parse`，无论这次调用是到期还是交付，得到的都是这份未变化的快照。正因如此，`wait` 在到期时还会向**标准错误**额外写一行：`STILL RUNNING — job <id>, <n>s elapsed. Exit 2: not delivered; call wait again.`（`<n>` 是任务启动以来经过的整数秒数）。这一行只出现在 `wait` 自己的到期路径上，终态任务不会有，`observe`/`status` 也不会打印——因为只有 `wait` 才会把“仍在运行”表述成“需要再调用一次”。
+
+这一行的存在是因为单看标准输出并不安全：曾经有编排逻辑把 `wait ... | tail` 接进管道，退出码在管道里丢失，标准输出上的这份 JSON 被当成了已交付的结果。**不要在没有捕获退出码的情况下给 `wait` 接管道**——`wait ... | tail`（或任何管道）在 shell 默认关闭 `pipefail` 的情况下都会丢掉退出码；请用 `set -o pipefail` 并检查 `${PIPESTATUS[0]}`（bash）或等效机制，或者干脆不要给 `wait` 的输出接管道，改用文件/变量捕获。
+
+`--until-done` 是“自己反复重新发起有限 `--timeout`”之外的另一种选择：它没有时限，按普通 `wait` 相同的轮询节奏阻塞，并且能像普通 `wait` 一样识别已经消失的 worker（没有存活 PID 又没有保存结果时，同样以 `crashed` 结束等待，不会无限挂起）。具体用哪种方式取决于宿主环境：
+- **支持后台任务通知的宿主（Claude Code 的 `run_in_background`）**——把 `wait <id> --until-done` 作为后台命令启动，交给宿主自己的完成通知唤醒会话；不需要轮询或重新发起。
+- **不支持这种通知的宿主（Codex）**——前台调用 `--until-done` 会占住整个会话，且中途无法查看或中断；应继续沿用原有方式：`wait --timeout 10m`，每次退出码为 2 时重新调用。
 
 `observe [id]` 用于立即查看任务。运行中返回进展，完成后返回最终状态、结果路径和收取提示；失败、取消或崩溃时，还会附上有长度限制的诊断和恢复信息。它始终返回 JSON，最多 8 KiB，不包含完整报告。
 
@@ -212,9 +225,9 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 `cancel <id>` 会先记录取消请求，等 worker 保存取消报告并将任务状态设为 `canceled` 后才返回成功。它会保留已经崩溃的任务的诊断信息，也不会仅凭保存的 PID 就向一个未经身份核实的进程发送信号。缺少取消通道的旧任务会明确报错。取消命令报错时，应检查任务和日志，不能据此认定执行已经停止。中断 `wait` 只会结束等待，不会取消后台任务。
 
-需要继续已有会话时，使用 `continue --job <id> --prompt "..."`。它会沿用所选任务的模式、模型和权限配置，创建一个关联的新任务。也可以用 `--conversation <id>` 选择已记录的会话。显式指定模型或权限参数时，会覆盖继承的值。
+需要继续已有会话时，使用 `continue --job <id> --prompt "..."`。它会沿用所选任务的模式、模型和权限配置，创建一个关联的新任务。也可以用 `--conversation <id>` 选择已记录的会话。显式指定模型或权限参数时，会覆盖继承的值。如果被续接的任务以 `quota_exhausted` 结束，而这次续接又会沿用同一个模型，`continue` 会在派发之前向标准错误打印一行警告——并不会阻止派发——说明任务、模型，以及已知的重置时间窗口；详见下文[配额耗尽](#配额耗尽quota_exhausted)。
 
-`restart <id>` 会用原任务和配置重新开始，但不复用原会话。新任务会重新生成当前工作区的上下文。对于旧版本保存的任务规格，companion 会将其中的旧快照标记为历史信息，再追加当前上下文。
+`restart <id>` 会用原任务和配置重新开始，但不复用原会话。新任务会重新生成当前工作区的上下文。对于旧版本保存的任务规格，companion 会将其中的旧快照标记为历史信息，再追加当前上下文。`restart` 没有自己的 `--model` 参数，因此总是沿用原任务的模型；如果原任务以 `quota_exhausted` 结束，它也会收到和 `continue` 相同的配额窗口警告。
 
 继续或重启前，应先用 `git status` 和 `git diff` 检查上一次执行留下的修改。你可以从同一 Git 工作树（worktree）的根目录或任意子目录发起恢复，任务实际执行时会回到原工作目录。通用 `continue` 命令遇到未登记的会话 ID 会报错，不会搜索其他工作树或启动 AGY。如果目标会话对应的任务仍在运行（无论是通用 `continue`，还是某个模式的 `--continue`/`--conversation`），companion 会以退出码 1 拒绝，并返回该任务的 ID 和状态；后续指令不会排队，需要先等待或取消。
 
@@ -227,15 +240,34 @@ review --prompt "Review the patch at /tmp/change.patch"
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 本次调用结束、答复已交付，状态为 `done`；不代表任务已验收 |
-| `2` | 任务仍在运行，状态为 `running` |
+| `2` | 任务仍在运行，状态为 `running`；**没有交付任何结果** |
 | `3` | 任务失败或进程崩溃，状态为 `error` 或 `crashed` |
-| `5` | 可续跑超时，状态为 `attention`；询问用户是否继续，确认后才恢复。`result` 对此状态也返回 5，其他状态保留原有退出行为 |
 | `4` | 任务已取消，状态为 `canceled` |
+| `5` | 状态为 `attention`：可续跑超时、`implement_no_changes`、`implement_uncommitted`，或 `verification_incomplete`（详见下文）。`result` 对此状态也返回 5，其他状态保留原有退出行为 |
+| `6` | 状态为 `quota_exhausted`（详见下文） |
 | `1` | 命令本身出错，例如参数无效或任务不存在 |
+
+`result` 对 `attention` 同样返回退出码 5；对其余终态（包括 `quota_exhausted`）维持原有的退出码 0，不会额外发明一个 6。
+
+<a id="配额耗尽quota_exhausted"></a>
+
+### 配额耗尽（`quota_exhausted`）
+
+如果 AGY 自身返回 429（状态/错误字段里出现 `RESOURCE_EXHAUSTED`、`code 429`/`429`、`quota exceeded`、`Individual quota reached`，或 `rate limit`——只看 AGY 自己的状态字段，不看回答正文，所以一个只是在讨论别人 429 问题的任务不会被误判），任务会以 `quota_exhausted` 结束，而不是 `error`，并保存 `model` 和 `resets_in`。`resets_in` 是 AGY 在 “Resets in” 之后打印的原始时长（例如 `4h1m13s`），不是换算出来的日期；AGY 没有报告时就留空，不会编造。工具调用层面已经恢复的 429（最终状态是 `SUCCESS`）仍然算 `done`；超时、网络错误、401/403、无效模型 ID 和无法解析的结果各自保留原来的分类，都不会归为 `quota_exhausted`。报告（`result.md`，以及 `wait`/`result` 打印的内容）以 `Quota exhausted: model <model>, resets in <resets_in>.` 开头（未知时写 `(reset time not reported)`），接着给出恢复建议：换一个有余量的 worker 或模型（见 `workers`），或者等到重置——**重置之前不要在同一个模型上 `continue`**。`resets_in` 和同样的恢复建议会出现在 `diagnosticPacket`、`observe` 的终态快照、`status <id>` 的任务 JSON、`wait` 和 `result` 里。各命令的退出码遵循自己原有的约定（`wait`/`status <id>`/`observe`：6；同步 `ask`：6；`result`：0，和其他非 attention 终态一样）。这个状态出现之前写入的旧任务记录没有 `resets_in` 字段，读取时按空值处理，不影响正常展示。
+
+### 未完成的验证（`verification_incomplete`）
+
+如果一次运行报告了 `SUCCESS`，但正文里仍然承认某项验证还没做完——例如 “I have started `pnpm build` and am awaiting its completion”、“waiting for the tests to finish”、“the build is still running”，葡萄牙语（巴西/葡萄牙两种写法都覆盖）如 “aguardando a conclusão do build”、“à espera do build”——任务会以 `attention` 结束，而不是 `done`：曾经真实发生过一次事故，这样一句话恰好出现在报告的第一行，结果没验证完的构建就这样上线了，所以这项检查会扫描整份回答（上限约 64 KiB；更长的报告只扫描头尾两段），而不只是看结尾。匹配规则比较保守，只针对验证/构建/测试/后台进程相关的英文和葡萄牙语表述——无关上下文里的“等待”（比如一个设计决定、“à espera de aprovação”、一个特意留着运行的开发服务器）不会触发它。如果同一份报告后面出现了明确的完成证据（“build passed”、“tests passed”、“✓ Compiled successfully”、“concluído com sucesso”、“o build passou” 等），这项待处理提示会被清除，任务仍然算 `done`。出现在代码块或引用行（`> ...`）里的提及会被当成引用，不算 worker 自己的声明，不会触发；除此之外没有别的豁免，所以用过去时叙述同样会被标记出来——这项检查的目的正是不漏掉上面那种事故形状的报告。它只用于会交付实际工作的模式——`implement` 和 `staffer`，不论 `--restricted`/`--unrestricted`，因为声明本身就是信号；`research` 和 `review` 不受影响，因为它们经常描述不属于自己的流程，`ask` 又没有工具。优先级：`verification_incomplete` 不会覆盖 `implement_no_changes`、`implement_uncommitted`、`quota_exhausted`、取消、硬超时或普通错误——真正的空跑或没交付的提交是更根本的问题，即使回答读起来也像是在等待，也保留它原本的原因。报告前面会加一句 `Job needs attention: the worker declared a verification still pending — "<quoted evidence>". Run the pending verification yourself before accepting this work.`，后面接 worker 完整的原始回答（diff/会话信息按 `done` 任务同样的方式保留）。任务记录里会带上 `reason: "verification_incomplete"` 和 `pending_evidence`（引用的那句话），两者都会出现在 `status <id>` 的任务 JSON 和 `observe` 的终态快照里；`diagnosticPacket` 的恢复提示指向“自己把那项验证跑一遍”，而不是重试。
+
+### 未完成工作清单（`## Partial work`）
+
+除 `done` 之外的每一份终态报告（`error`、`quota_exhausted`、`canceled`、来自硬超时/响应超时的 `attention`、`verification_incomplete`、`implement_uncommitted`）都会在正文和 JSON 诊断包之间追加一段固定格式的 `## Partial work`：终态；`HEAD: <before> → <after> (moved: yes/no)`（不是 Git 仓库时写 “unknown (not a git repo)”）；运行后的脏路径列表（最多 50 条，逐条标注 `untracked`、`staged`、`new this run`，或者——对运行前就已经是脏路径的情况——标注 `status changed`、`content change not tracked`，因为这里比较的是 porcelain 状态，不是文件内容）；HEAD 移动时列出本次运行产生的提交（`git log --oneline`，最多 20 条）；用于检查的确切命令 `git status --short; git diff; git diff --cached`（HEAD 移动时再加一条 `git log <before>..<after>`）；一行 `Verification: not confirmed`（提醒不要把这份工作当作已验收）；以及信息不全时给出的说明（没有 Git、没有运行前快照、HEAD 移动进了一个干净的树导致 `git diff` 什么都不显示，或者列表被截断）。`verification_incomplete` 会额外说明 agent 已经报告完成——唯一没确认的只是验证这一步。`implement_no_changes`（真正的空跑）没有这一段：没有什么可清点的。事后发现的崩溃任务如果没有保存快照，会写 “Inventory unavailable: worker exited before recording the workspace” 加上检查命令，不会编造数据。这一段用的是工作区检查早已拍下的 porcelain/HEAD 快照，没有另外的快照机制，也不会复制文件内容或环境变量。
 
 ### 输出与本地记录
 
 标准输出保存任务结果，以及需要随结果展示的工作区警告。`[agy-staff]` 开头的运行信息记录模式、权限、模型、耗时、用量和会话 ID；前台运行时写入标准错误，后台运行时写入 `jobs/<id>.log`。这些信息供调用方排查问题，不属于回答正文，也不会写入 `jobs/<id>.result.md`。
+
+**用量摘要。** 当 AGY 自己的结果带有 token/耗时/轮数统计时，终态任务会把它们保存到任务记录的 `usage` 字段（`input_tokens`/`output_tokens`/`thinking_tokens`/`cache_read_tokens`，视实际上报了哪些而定）、`duration_seconds` 和 `num_turns`；`wait`/`result` 会在交付结果时，紧跟 `# Job <id> (<mode>, <status>) — AGY worker: ...` 表头下面打印一行简短摘要，例如 `Usage: in 1,728,044 · out 12,301 · think 40,112 · cache 1,200,000 · 19m37s · 42 turns`。缺失的部分会省略；如果整份任务根本没有任何已知的用量数据（旧记录，或者某个终态的载荷从没带过这项信息，例如结果出来之前就崩溃了），这一整行都会省略。同样的字段也会出现在 `status <id>` 的任务 JSON 和 `observe` 的终态快照里（`usage`、`duration_seconds`、`num_turns`）。前台 `ask` 本来就会在标准错误里打印自己的用量信息，不受这项变化影响。
 
 仓库内的状态保存在 `<repo>/.agy-staff/`。`state.json` 记录会话和任务状态，更新时使用短事务锁；进度查询只读取状态。`config.json` 保存可选的仓库权限策略。
 
@@ -257,7 +289,7 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 遇到 `agy reported an error (status ERROR)` 时，companion 会保留 agy 的原始错误，仅在错误文本与已知情况匹配时补充提示。例如，模型 ID 无效时提示运行 `agy models`，登录过期时提示交互式运行 `agy` 重新登录。
 
-如果 AGY 报错时已经返回回答文本，companion 会尝试交付回答，并给出 `done_with_warnings` 警告。这种情况下退出码为 `0`，回答写入标准输出，警告写入标准错误；如果没有回答且命中超时分类，已知会话时改为 `attention`（退出码 5），其他情况按失败处理。
+如果 AGY 报错时已经返回回答文本，companion 会尝试交付回答，并给出 `done_with_warnings` 警告。这种情况下退出码为 `0`，回答写入标准输出，警告写入标准错误；如果没有回答且命中超时分类，已知会话时改为 `attention`（退出码 5），其他情况按失败处理。配额耗尽是独立的终态，不属于这条通用路径——参见上文[配额耗尽](#配额耗尽quota_exhausted)（`quota_exhausted`，退出码 6）。
 
 ### 终端里可以运行，agent 环境里却提示权限或认证错误
 

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { sandbox, run, agyCalls, jobIdOf, promptOf } from './helpers.mjs';
+import { execFileSync } from 'node:child_process';
+import { sandbox, run, agyCalls, jobIdOf, promptOf, waitForJob } from './helpers.mjs';
 
 const state = sb => JSON.parse(fs.readFileSync(path.join(sb.repo, '.agy-staff/state.json'), 'utf8'));
 const timeoutEnv = {
@@ -77,11 +78,16 @@ for (const status of ['ERROR', 'TIMEOUT']) {
 
 test('#8 unrelated errors and timeout without conversation stay errors; complete answers survive', () => {
   const sb = sandbox('timeout-boundaries');
-  for (const error of ['tool timeout waiting for response', 'network timeout waiting for response', '401 Unauthorized', 'quota exceeded', 'invalid model selection']) {
+  for (const error of ['tool timeout waiting for response', 'network timeout waiting for response', '401 Unauthorized', 'invalid model selection']) {
     const r = run(sb, ['ask', '--prompt', 'question'], { ...timeoutEnv, FAKE_AGY_ERROR: error });
     assert.equal(r.code, 1, error + r.stderr);
     assert.doesNotMatch(r.stderr, /Ask the user whether to continue/);
   }
+  // "quota exceeded" is now its own terminal state (quota_exhausted, exit 6 —
+  // Fase 1, item 1), not a generic error; see tests/triage.test.mjs.
+  const quota = run(sb, ['ask', '--prompt', 'question'], { ...timeoutEnv, FAKE_AGY_ERROR: 'quota exceeded' });
+  assert.equal(quota.code, 6, quota.stderr);
+  assert.match(quota.stderr, /Quota exhausted:/);
   const noId = run(sb, ['ask', '--prompt', 'question'], { ...timeoutEnv, FAKE_AGY_CONVERSATION_ID: '' });
   assert.equal(noId.code, 1);
   const complete = run(sb, ['ask', '--prompt', 'question'], { ...timeoutEnv, FAKE_AGY_RESPONSE: 'finished answer' });
@@ -108,6 +114,93 @@ test('#8 explicit foreground timeout and background no-ID/ceiling boundaries', (
   assert.equal(packet.recovery.suggested_timeout, '120m');
   assert.equal(packet.recovery.at_timeout_ceiling, true);
   assert.match(run(sb, ['result', capped]).stdout, /narrower task/);
+});
+
+// ---------------------------------------------------------------------------
+// Fase 1, item 3: every non-done terminal job report gets an actionable
+// `## Partial work` inventory, built from the same porcelain/HEAD snapshots
+// the workspace guard already takes (no second snapshot mechanism).
+// ---------------------------------------------------------------------------
+
+for (const [label, env, expectStatus] of [
+  ['ERROR', { FAKE_AGY_STATUS: 'ERROR', FAKE_AGY_RESPONSE: '' }, 'error'],
+  ['quota_exhausted', { FAKE_AGY_QUOTA: '1', FAKE_AGY_RESPONSE: '' }, 'quota_exhausted'],
+]) {
+  test(`Partial work: a background job that touched the workspace then ended ${label} inventories it`, async () => {
+    const sb = sandbox(`partial-${label}`);
+    const started = run(sb, ['implement', '--prompt', 'a task'], { ...env, FAKE_AGY_TOUCH_FILE: 'partial.txt' });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), expectStatus);
+    const res = run(sb, ['result', id]);
+    assert.match(res.stdout, /## Partial work/);
+    assert.match(res.stdout, new RegExp(`- Terminal state: ${expectStatus}`));
+    assert.match(res.stdout, /- Dirty paths after the run \(1\):\n {2}- partial\.txt \(untracked; new this run\)/);
+    assert.match(res.stdout, /- Inspect: `git status --short; git diff; git diff --cached`/);
+    assert.match(res.stdout, /- Verification: not confirmed; do not treat this work as accepted\./);
+    assert.match(res.stdout, /- Inventory completeness: complete/);
+  });
+}
+
+test('Partial work: a hard-timeout job inventories the file the agent left behind', async () => {
+  const sb = sandbox('partial-hard-timeout');
+  const started = run(sb, ['implement', '--timeout', '800ms', '--prompt', 'task'], {
+    FAKE_AGY_SLEEP_MS: '5000', FAKE_AGY_TOUCH_FILE: 'partial.txt',
+  });
+  const id = jobIdOf(started.stdout);
+  const result = run(sb, ['wait', id]);
+  assert.equal(result.code, 5, result.stdout + result.stderr);
+  assert.match(result.stdout, /## Partial work/);
+  assert.match(result.stdout, /- Terminal state: attention \(hard_timeout\)/);
+  assert.match(result.stdout, /partial\.txt \(untracked; new this run\)/);
+  assert.match(result.stdout, /- Verification: not confirmed; do not treat this work as accepted\./);
+});
+
+test('Partial work: a run that commits then errors reports HEAD moved and lists the commit', async () => {
+  const sb = sandbox('partial-commit-then-error');
+  const started = run(sb, ['implement', '--prompt', 'a task'], {
+    FAKE_AGY_STATUS: 'ERROR', FAKE_AGY_RESPONSE: '', FAKE_AGY_GIT_COMMIT: 'partial commit by agy',
+  });
+  const id = jobIdOf(started.stdout);
+  assert.equal(await waitForJob(sb, id), 'error');
+  const res = run(sb, ['result', id]);
+  assert.match(res.stdout, /- HEAD: \(no commits yet\) → [0-9a-f]{7,40} \(moved: yes\)/);
+  assert.match(res.stdout, /- Commits made by the run \(`git log --oneline [0-9a-f]{7,40}`\):/);
+  assert.match(res.stdout, /partial commit by agy/);
+  assert.match(res.stdout, /- Inspect: `git status --short; git diff; git diff --cached; git log [0-9a-f]{7,40}`/);
+});
+
+test('Partial work: a path already dirty before the run that changes again is marked, not just listed', async () => {
+  const sb = sandbox('partial-already-dirty');
+  fs.writeFileSync(path.join(sb.repo, 'pre-staged.txt'), 'v1');
+  execFileSync('git', ['add', 'pre-staged.txt'], { cwd: sb.repo });
+  const started = run(sb, ['implement', '--prompt', 'a task'], {
+    FAKE_AGY_STATUS: 'ERROR', FAKE_AGY_RESPONSE: '', FAKE_AGY_TOUCH_FILE: 'pre-staged.txt',
+  });
+  const id = jobIdOf(started.stdout);
+  assert.equal(await waitForJob(sb, id), 'error');
+  const res = run(sb, ['result', id]);
+  assert.match(res.stdout, /- pre-staged\.txt \(staged; already dirty before the run; status changed\)/);
+});
+
+test('Partial work: a done job never gets the section', async () => {
+  const sb = sandbox('partial-done');
+  const started = run(sb, ['staffer', '--prompt', 'a task'], { FAKE_AGY_TOUCH_FILE: 'ok.txt' });
+  const id = jobIdOf(started.stdout);
+  assert.equal(await waitForJob(sb, id), 'done');
+  const res = run(sb, ['result', id]);
+  assert.doesNotMatch(res.stdout, /## Partial work/);
+});
+
+test('Partial work: outside a git repository the completeness note says so instead of a path list', async () => {
+  const sb = sandbox('partial-non-git', { git: false });
+  const started = run(sb, ['staffer', '--prompt', 'a task'], { FAKE_AGY_STATUS: 'ERROR', FAKE_AGY_RESPONSE: '' });
+  const id = jobIdOf(started.stdout);
+  assert.equal(await waitForJob(sb, id), 'error');
+  const res = run(sb, ['result', id]);
+  assert.match(res.stdout, /## Partial work/);
+  assert.match(res.stdout, /- HEAD: unknown \(not a git repo\)/);
+  assert.match(res.stdout, /- Dirty paths after the run: unknown \(git status unavailable after the run\)/);
+  assert.match(res.stdout, /- Inventory completeness: incomplete/);
 });
 
 test('#9 both execution paths attach the repository even when launched in a subdirectory with spaces', () => {

@@ -15,6 +15,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { sandbox, run, agyCalls, jobIdOf, waitForJob, waitForCalls, promptOf } from './helpers.mjs';
+import { ROOT } from '../scripts/generate-pi-skills.mjs';
+
+const skillText = name => fs.readFileSync(path.join(ROOT, 'skills', name, 'SKILL.md'), 'utf8');
 
 describe('staffer: the general-purpose mode', () => {
   test('prompt is minimal: task + environment + guardrails, no role or output framing', async () => {
@@ -321,5 +324,56 @@ describe('.agy-staff/ hygiene is automatic', () => {
     const r = run(sb, ['ask', '--prompt', 'a question']);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(fs.readFileSync(exclude, 'utf8'), before);
+  });
+});
+
+describe('canonical skills document the Fase 1 result-truthing surface', () => {
+  test('jobs documents the new terminal states and the exit-2-is-never-delivery rule', () => {
+    const jobs = skillText('jobs');
+    assert.match(jobs, /quota_exhausted/);
+    assert.match(jobs, /verification_incomplete/);
+    assert.match(jobs, /--until-done/);
+    // exit 2 must be documented as "not delivered", not merely "still running"
+    assert.match(jobs, /\bnot delivered\b/i);
+    assert.match(jobs, /never pipe `wait`/i);
+    // exit 5 is documented as more than just a resumable timeout
+    assert.match(jobs, /implement_no_changes/);
+    assert.match(jobs, /implement_uncommitted/);
+  });
+
+  test('the persona/pool skills that dispatch or collect jobs mention the new states', () => {
+    for (const name of ['staffer', 'researcher', 'reviewer', 'implementer']) {
+      const text = skillText(name);
+      // each persona defers to jobs/SKILL.md for recovery, which now covers
+      // quota/verification/partial-work; this is a light smoke check that the
+      // pointer survived and nothing here contradicts it
+      assert.match(text, /\.\.\/jobs\/SKILL\.md/, `${name}: must defer to jobs/SKILL.md`);
+    }
+  });
+
+  test('the Codex permission wording is conditional, not "always escalate"', () => {
+    for (const name of ['ask', 'staffer', 'reviewer', 'researcher', 'implementer', 'pool', 'lead']) {
+      const text = skillText(name);
+      assert.doesNotMatch(
+        text,
+        /In Codex, request escalated permissions for the command\./,
+        `${name}: unconditional Codex escalation wording must be gone`
+      );
+    }
+    // the surviving guidance names the concrete failure signal and the escape hatch
+    for (const name of ['ask', 'staffer', 'reviewer', 'researcher', 'implementer', 'pool', 'lead']) {
+      const text = skillText(name);
+      assert.match(text, /sandbox blocks them/, `${name}: missing conditional permission wording`);
+      assert.match(text, /just run it/, `${name}: missing the "already granted" branch`);
+    }
+    const troubleshooting = fs.readFileSync(
+      path.join(ROOT, 'skills', 'jobs', 'references', 'troubleshooting.md'),
+      'utf8'
+    );
+    assert.doesNotMatch(
+      troubleshooting,
+      /In Codex, request escalated permissions for the command\./
+    );
+    assert.match(troubleshooting, /sandbox blocks them/);
   });
 });

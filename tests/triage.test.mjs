@@ -10,7 +10,12 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { sandbox, run, jobIdOf, jobLog, waitForJob, agyCalls } from './helpers.mjs';
+
+const stateFile = sb => path.join(sb.repo, '.agy-staff', 'state.json');
+const readState = sb => JSON.parse(fs.readFileSync(stateFile(sb), 'utf8'));
 
 const CATALOG_WITHOUT_38 = [
   'Fetching available models...',
@@ -76,6 +81,216 @@ describe('cause hints are conditional on the error text', () => {
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /Likely cause: invalid model id/);
     assert.doesNotMatch(r.stderr, /expired auth|exhausted quota/);
+  });
+});
+
+describe('quota_exhausted classification (Fase 1, item 1)', () => {
+  test('RESOURCE_EXHAUSTED with "Resets in" is classified quota_exhausted: exit 6, model + resets_in + recovery, never suggests continuing on the same model', () => {
+    const sb = sandbox('quota-resets');
+    const r = run(sb, ['ask', '--prompt', 'a question'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached for model gemini-3.8-flash-low. Resets in 4h1m13s',
+    });
+    assert.equal(r.code, 6, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /Quota exhausted: model gemini-3\.8-flash-low, resets in 4h1m13s\./m);
+    assert.match(r.stderr, /workers/);
+    assert.match(r.stderr, /Do not `continue` on the same model/);
+  });
+
+  test('a 429/rate-limit error with no "Resets in" text never invents a reset time', () => {
+    const sb = sandbox('quota-no-resets');
+    const r = run(sb, ['ask', '--prompt', 'a question'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: '429 rate limit exceeded',
+    });
+    assert.equal(r.code, 6, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /Quota exhausted: model gemini-3\.8-flash-low \(reset time not reported\)\./m);
+    assert.doesNotMatch(r.stderr, /resets in/i);
+  });
+
+  test('a quota ERROR with partial response text still becomes quota_exhausted and preserves the partial text — it must not fall into done_with_warnings', () => {
+    const sb = sandbox('quota-partial-response');
+    const r = run(sb, ['ask', '--prompt', 'a question'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'partial answer produced before the quota error',
+      FAKE_AGY_ERROR: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 45s',
+    });
+    assert.equal(r.code, 6, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /Quota exhausted: model gemini-3\.8-flash-low, resets in 45s\./m);
+    assert.match(r.stderr, /partial answer produced before the quota error/);
+    assert.doesNotMatch(r.stderr, /done_with_warnings|agy-staff warning: agy reported status ERROR/);
+  });
+
+  test('401/403 auth errors are never classified as quota', () => {
+    const sb = sandbox('quota-not-auth');
+    const r = run(sb, ['ask', '--prompt', 'hello'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: '401 Unauthorized: Invalid credentials',
+    });
+    assert.notEqual(r.code, 6);
+    assert.doesNotMatch(r.stderr, /Quota exhausted/);
+    assert.match(r.stderr, /expired auth/);
+  });
+
+  test('an invalid-model error is never classified as quota', () => {
+    const sb = sandbox('quota-not-model');
+    const r = run(sb, ['ask', '--prompt', 'hello'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: 'model gemini-3.8-flash-low is not recognized as a known model',
+    });
+    assert.notEqual(r.code, 6);
+    assert.doesNotMatch(r.stderr, /Quota exhausted/);
+  });
+
+  test('a retried 429 or a stray "429" in agy stderr does not turn an unrelated ERROR into quota', () => {
+    const sb = sandbox('quota-not-stderr-noise');
+    const r = run(sb, ['ask', '--prompt', 'hello'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: 'stream closed unexpectedly',
+      FAKE_AGY_STDERR: 'tool http_get: got 429, rate limit hit, retrying\nworker pid 429 exited',
+    });
+    assert.notEqual(r.code, 6, `${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /Quota exhausted/);
+  });
+
+  test('RESOURCE_EXHAUSTED reported only on agy stderr is still quota', () => {
+    const sb = sandbox('quota-stderr-strong');
+    const r = run(sb, ['ask', '--prompt', 'hello'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: '',
+      FAKE_AGY_ERROR: 'request failed',
+      FAKE_AGY_STDERR: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h',
+    });
+    assert.equal(r.code, 6, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /resets in 2h\./);
+  });
+
+  test('SUCCESS with "429"/"quota" mentioned in the response body stays done — response text is never scanned for classification', () => {
+    const sb = sandbox('quota-not-success-body');
+    const r = run(sb, ['ask', '--prompt', 'summarize this bug report'], {
+      FAKE_AGY_STATUS: 'SUCCESS',
+      FAKE_AGY_RESPONSE: 'The bug report mentions a 429 RESOURCE_EXHAUSTED error from an unrelated API. Resets in 3 days per their docs. Quota exceeded, they said.',
+    });
+    assert.equal(r.code, 0, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /429 RESOURCE_EXHAUSTED/);
+    assert.doesNotMatch(r.stderr, /Quota exhausted:/);
+  });
+
+  test('missing_result (agy killed before producing JSON) is never classified as quota', async () => {
+    const sb = sandbox('quota-not-missing-result');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_NO_JSON: '1',
+      FAKE_AGY_STDERR: 'operation not permitted',
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+    const res = run(sb, ['result', id]);
+    assert.doesNotMatch(res.stdout, /Quota exhausted/);
+  });
+});
+
+describe('continue/restart into a quota_exhausted window warns without blocking (Fase 1, item 7)', () => {
+  const quotaEnv = { FAKE_AGY_QUOTA: '1', FAKE_AGY_RESPONSE: '', FAKE_AGY_QUOTA_RESETS: '4h1m13s' };
+
+  test('continue --job <id> on the same model within the reset window warns on stderr, then still dispatches', async () => {
+    const sb = sandbox('quota-continue-warn');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], quotaEnv);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    const r = run(sb, ['continue', '--job', id, '--prompt', 'try again']);
+    assert.match(
+      r.stderr,
+      new RegExp(
+        `agy-staff warning: job ${id} ended quota_exhausted on model gemini-3\\.8-flash-high ` +
+          '\\(resets in 4h1m13s from .+\\); continuing on the same model will likely fail again — ' +
+          'pass --model <other> or choose another worker \\(see workers\\)\\.'
+      )
+    );
+    assert.equal(r.code, 0, r.stderr); // a warning, never a block
+  });
+
+  test('bare `continue --conversation <id>` resolving to the same quota_exhausted job also warns', async () => {
+    const sb = sandbox('quota-continue-bare');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], {
+      ...quotaEnv, FAKE_AGY_CONVERSATION_ID: 'quota-conv',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    const r = run(sb, ['continue', '--conversation', 'quota-conv', '--prompt', 'try again']);
+    assert.match(r.stderr, new RegExp(`agy-staff warning: job ${id} ended quota_exhausted on model gemini-3\\.8-flash-high`));
+  });
+
+  test('restart reusing the same model warns the same way', async () => {
+    const sb = sandbox('quota-restart-warn');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], quotaEnv);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    const r = run(sb, ['restart', id]);
+    assert.match(r.stderr, new RegExp(`agy-staff warning: job ${id} ended quota_exhausted on model gemini-3\\.8-flash-high`));
+  });
+
+  test('no warning once the reset window has clearly passed', async () => {
+    const sb = sandbox('quota-continue-window-passed');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], quotaEnv);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    // Fake the job's finished_at well past the 4h1m13s reset window, exactly
+    // as the maintainer's TDD note asks for this case.
+    const data = readState(sb);
+    data.jobs.find(j => j.id === id).finished_at = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    fs.writeFileSync(stateFile(sb), JSON.stringify(data));
+
+    const r = run(sb, ['continue', '--job', id, '--prompt', 'try again']);
+    assert.doesNotMatch(r.stderr, /agy-staff warning: job/);
+  });
+
+  test('no warning when --model differs from the job\'s model', async () => {
+    const sb = sandbox('quota-continue-diff-model');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], quotaEnv);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    const r = run(sb, ['continue', '--job', id, '--model', 'gemini-3.7-flash-high', '--prompt', 'try again']);
+    assert.doesNotMatch(r.stderr, /agy-staff warning: job/);
+  });
+
+  test('warns without a time claim when resets_in is missing/unparseable', async () => {
+    const sb = sandbox('quota-continue-no-resets');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic'], {
+      ...quotaEnv, FAKE_AGY_QUOTA_RESETS: '',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'quota_exhausted');
+
+    const r = run(sb, ['continue', '--job', id, '--prompt', 'try again']);
+    assert.match(
+      r.stderr,
+      new RegExp(
+        `agy-staff warning: job ${id} ended quota_exhausted on model gemini-3\\.8-flash-high; ` +
+          'continuing on the same model will likely fail again — pass --model <other> or choose another worker \\(see workers\\)\\.'
+      )
+    );
+    assert.doesNotMatch(r.stderr, /resets in/);
+  });
+
+  test('a job that did not end quota_exhausted never warns on continue', async () => {
+    const sb = sandbox('quota-continue-not-quota');
+    const started = run(sb, ['research', '--model', 'gemini-3.8-flash-high', '--prompt', 'a topic']);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const r = run(sb, ['continue', '--job', id, '--prompt', 'follow up']);
+    assert.doesNotMatch(r.stderr, /agy-staff warning: job/);
   });
 });
 
@@ -182,14 +397,15 @@ describe('unsupported model error handling without silent fallback', () => {
     assert.doesNotMatch(rAuth.stderr, /Best same-effort compatible recommendation/);
     assert.doesNotMatch(rAuth.stderr, /Available models/);
 
-    // Quota error
+    // Quota error — now its own terminal state (quota_exhausted classification,
+    // covered in detail above), not the old generic-error "exhausted quota" hint.
     const rQuota = run(sb, ['ask', '--prompt', 'hello'], {
       FAKE_AGY_STATUS: 'ERROR',
       FAKE_AGY_RESPONSE: '',
       FAKE_AGY_ERROR: '429 ResourceExhausted: Quota exceeded for project',
     });
-    assert.notEqual(rQuota.code, 0);
-    assert.match(rQuota.stderr, /exhausted quota/);
+    assert.equal(rQuota.code, 6);
+    assert.match(rQuota.stderr, /Quota exhausted:/m);
     assert.doesNotMatch(rQuota.stderr, /Best same-effort compatible recommendation/);
 
     // Unrelated error

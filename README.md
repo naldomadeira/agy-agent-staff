@@ -125,7 +125,7 @@ Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `
 
 `lead` adds task orchestration guidance for your current agent. Within lead, orient enough to frame the assignment, delegate substantive work to `staffer` by default, wait for the result, then assess it and integrate or follow up. Specialists provide dedicated guidance when useful, while `ask` is reserved for testing. The host owns cross-task decisions, acceptance, integration, and delivery, using the existing jobs workflow. Invoke `/agy:lead` in Claude Code, `$agy:lead` in Codex, or `/skill:agy-lead` in Pi.
 
-`ask` answers in the same call. The other personas return a job id and a collection command, such as `wait <id> --timeout 10m`. Your agent waits using the host's available capabilities, with one independent background wait per job where supported.
+`ask` answers in the same call. The other personas return a job id and a collection command: in Claude Code, launch `wait <id> --until-done` as a background command and let the host notify you when it returns; in Codex and other hosts without background notifications, poll with `wait <id> --timeout 10m`, re-arming on exit 2 (never pipe `wait`'s output — a pipe loses its exit code).
 
 The main agent waits for the final result by default. If you explicitly ask about progress, it can use `observe` to read a snapshot of recent tool activity and response text; it does not query progress for routine updates. Once the task finishes, `wait` or `result` delivers the full report. Expiring a wait leaves the worker running.
 
@@ -134,6 +134,8 @@ The timeline below follows a background task from delegation to completion. The 
 [![A background task over time: the host delegates, waits or observes, while the worker continuously saves AGY output and eventually delivers the full report](assets/integration.png)](assets/integration.svg)
 
 Jobs have a separate execution deadline: default 60 minutes, configurable at launch with `--timeout` up to 120 minutes. Use `cancel` to stop execution, or explicitly request `continue` or `restart` after inspecting the existing work. The host harness controls when your agent receives a background result.
+
+Beyond `done`, a job can end `attention` (exit 5 — a resumable timeout, an undelivered no-op/uncommitted change, or a verification the worker itself flagged as still pending), `quota_exhausted` (exit 6 — switch worker/model or wait for the reset, never `continue` on the same model first), `error`/`crashed`, or `canceled`. Every non-`done` report includes a `## Partial work` inventory (HEAD movement, dirty paths, an inspect command) to check before any recovery.
 
 **Full reference →** [docs/REFERENCE.md](docs/REFERENCE.md) (flags, permission model, jobs/state, troubleshooting, upgrading). **Release notes →** [docs/releases/](docs/releases/).
 

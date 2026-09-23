@@ -28,7 +28,7 @@ Read `../agy-jobs/SKILL.md` for result collection, cancellation, continuation, a
 node "<skill-dir>/../../companion/agy-companion.mjs" staffer --prompt-file "<brief-path>"
 ```
 
-For a specialist, replace `staffer` with `research`, `review`, or `implement`. When requesting code review, use the review-brief guidance in `../agy-reviewer/references/code-review.md`. Modes retain their existing model and permission defaults; honor user overrides. Run unsandboxed as described in `../agy-jobs/references/troubleshooting.md` (escalated execution in Codex).
+For a specialist, replace `staffer` with `research`, `review`, or `implement`. When requesting code review, use the review-brief guidance in `../agy-reviewer/references/code-review.md`. Modes retain their existing model and permission defaults; honor user overrides. agy needs a localhost port and its OAuth token file, which some harness sandboxes hide; if the host sandbox blocks them, request escalated permissions as described in `../agy-jobs/references/troubleshooting.md` — if the host already grants that access, just run it.
 
 Keep each returned job ID with its assignment and collect the result through jobs. Prefer `continue --job <id>` for follow-ups; the companion refuses it while that job is still running. Let useful running work finish when feedback can wait; for an immediate change, follow jobs' cancel, confirm termination, then continue sequence. Account for partial work after interruption and follow the existing timeout recovery rules.
 

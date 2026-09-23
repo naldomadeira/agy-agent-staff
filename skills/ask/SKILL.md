@@ -22,7 +22,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" ask [flags] --prompt "quest
 Pass the user's question verbatim via `--prompt`; use `--prompt-file <path>` or `--stdin` for a long question.
 
 > [!IMPORTANT]
-> Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../jobs/references/troubleshooting.md`.
+> agy needs a localhost port and its OAuth token file, which some harness sandboxes hide. If the host sandbox blocks them (in Codex: the command fails with a sandbox/permission/connection error), request escalated permissions for the command; if the host already grants that access, just run it. Details: `../jobs/references/troubleshooting.md`.
 
 ## Flags (all optional)
 

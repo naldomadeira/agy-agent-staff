@@ -103,6 +103,9 @@ test('observe during a pending wait never duplicates its large final report', as
   await waitForCalls(sb, 1);
   const waiter = spawn(process.execPath, [COMPANION, 'wait', id], { cwd: sb.repo, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '', stderr = '';
+  // The body is multibyte (CJK + emoji); decoding each chunk alone splits a
+  // character at a chunk boundary under load and adds a U+FFFD to the text.
+  waiter.stdout.setEncoding('utf8'); waiter.stderr.setEncoding('utf8');
   waiter.stdout.on('data', data => { stdout += data; }); waiter.stderr.on('data', data => { stderr += data; });
   const done = new Promise(resolve => waiter.on('close', resolve));
   const running = run(sb, ['observe', id]);

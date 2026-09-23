@@ -21,19 +21,27 @@ node "<skill-dir>/../../companion/agy-companion.mjs" <command> [args]
 
 Default flow: prepare the prompt → dispatch → wait for the final result → validate as needed. While a job is running, do not proactively call `observe`/`status`, read logs or inspect intermediate artifacts. Do not query progress for routine updates or create sleep/observe loops. Observe only when the user explicitly asks for progress; diagnose after receiving a failure or a result requiring intervention.
 
-1. Keep the returned job id. Start `wait <id> --timeout 10m --follow` in the background, using the same unsandboxed context as launch — `--follow` writes each step to stderr as the job runs, so the background shell does not sit with no output for the whole wait. Use a separate wait for each job; never wait for several jobs serially in one shell.
-2. For **wait**, branch on the exit code:
+1. Keep the returned job id, then collect it:
+   - **Claude Code (background-job notifications)** — launch `wait <id> --until-done` as a background command (`run_in_background`); the host notifies you when it returns, so nothing has to poll or re-arm.
+   - **Codex and other hosts without background notifications** — use `wait <id> --timeout 10m --follow` in the foreground, and re-arm the same call again on exit 2. `--follow` writes each step to stderr as the job runs, so the call does not sit with no output for the whole wait.
 
-| Code | Meaning | Next action |
+   Use a separate wait for each job; never wait for several jobs serially in one shell. **Never pipe `wait`'s output** — a pipe loses the exit code under a shell's default `pipefail`-off behavior, and the plain JSON on stdout then reads as a delivered result even on exit 2; if you must pipe it, `set -o pipefail` and check `${PIPESTATUS[0]}` (bash) or an equivalent, or capture output to a file/variable instead.
+2. Branch on the terminal state/reason:
+
+| State / reason | Exit | Next action |
 | --- | --- | --- |
-| 0 | Invocation ended; response text delivered | Assess whether it satisfies the task. Review attached diagnostics; inspect further only as needed. |
-| 2 | Still running; wait soft-expired | Wait again for the same job. The attached snapshot is not a request to inspect progress or intervene. |
-| 3 | Error or crash | Read the error and recovery information below. |
-| 4 | Canceled | Complete any already-authorized follow-up; otherwise report cancellation. |
-| 5 | Attention: resumable timeout | Inspect partial workspace changes; ask whether to continue with the suggested timeout or stop. Continue only after explicit user confirmation. |
-| 1 | Invalid command or other command error | Quote the error and correct the named problem. |
+| `done` | 0 | Delivered. Assess whether it satisfies the task; inspect attached diagnostics further only as needed. |
+| running (wait soft-expired) | 2 | **Not delivered.** Wait again for the same job — never treat the attached snapshot as the result or as a request to inspect/intervene. |
+| attention — resumable timeout | 5 | Inspect partial workspace changes; ask the user whether to continue with the suggested timeout or stop. Continue only after explicit confirmation. |
+| attention — `implement_no_changes` | 5 | A true no-op. Decide whether to retry, reframe the task, or hand it off differently; there is nothing to inventory or commit. |
+| attention — `implement_uncommitted` | 5 | Changes exist but the requested delivery (commit/push/PR) didn't happen. Commit/deliver yourself or inspect (`git status`, `git diff`) before deciding. |
+| attention — `verification_incomplete` | 5 | The worker itself declared a verification still pending. **Run the pending build/test yourself** before accepting the work as done. |
+| `quota_exhausted` | 6 | Switch to another worker or model with headroom (see the `pool` skill's `workers`) or wait for `resets_in`. **Never `continue` on the same model before the reset.** |
+| error / crashed | 3 | Read the report's `## Partial work` section and inspect the diff (`git status`, `git diff`) before any recovery. |
+| canceled | 4 | Read `## Partial work`, inspect the diff, then complete any already-authorized follow-up or report cancellation. |
+| command error | 1 | Quote the error and correct the named problem. |
 
-`done` describes invocation and response delivery, not task acceptance. Preserve agy-cli response text and diagnostics; a nonempty response may only acknowledge launched background work. Successful calls with warnings include a bounded log tail on stderr and a full-log pointer. The orchestrator assesses the response and artifacts, uses `observe` or diagnostics if the returned result needs investigation, and decides whether to propose continuation. Keep the recovery confirmation rules below; do not infer timeout from response wording or add routine progress polling.
+`done` describes invocation and response delivery, not task acceptance. Preserve agy-cli response text and diagnostics; a nonempty response may only acknowledge launched background work. Successful calls with warnings include a bounded log tail on stderr and a full-log pointer. A terminal job's header also carries a `Usage:` line (in/out/think/cache tokens, duration, turns) when AGY reported telemetry — read it for cost awareness before deciding whether to continue or retry, not as a completion signal. The orchestrator assesses the response and artifacts, uses `observe` or diagnostics if the returned result needs investigation, and decides whether to propose continuation. Keep the recovery confirmation rules below; do not infer timeout from response wording or add routine progress polling.
 
 When the user explicitly asks for progress, use `observe <id>` and answer from that snapshot, keeping any pending wait open. An already returned snapshot may answer the question; do not duplicate it or turn one question into recurring observation.
 
@@ -77,6 +85,8 @@ Include relevant decisions made in the host conversation, what changed, and what
 ## Progress and recovery
 
 Progress contains up to five recent tool calls, input/output excerpts, and the latest response text. Timestamps, incomplete text and truncation are labeled. It is a snapshot, not a judgment of useful progress. Reads do not consume history or reset deadlines. Payload limits and file layout are in `../../docs/REFERENCE.md`.
+
+Exit 5 (`attention`) is not only the resumable timeout below — it is also `implement_no_changes`, `implement_uncommitted`, and `verification_incomplete` (see the action table above). This section covers the hard-timeout path specifically; for the other three, act on their row in the table instead of the recovery flow described here.
 
 The worker has a separate hard limit: default 60m, configurable with launch `--timeout` up to 120m. AGY receives the same response timeout; the worker independently enforces the overall budget, including initialization. At that limit it stops execution. If response text has already arrived, it delivers that text with a warning for the orchestrator to assess; otherwise it reports `hard_timeout`, the last snapshot, logs, known conversation ID and original configuration. Before recovery, inspect `git status` and `git diff` so partial changes are accounted for. Prefer `continue --job` when a conversation exists; otherwise use `restart`. Each creates a fresh 60m budget unless `--timeout` is specified, and preserves the old terminal record. Restart refreshes workspace context; older specifications explicitly label historical snapshots and append current context. An empty response at either the AGY response deadline or worker hard limit becomes `attention` (exit 5) when a conversation ID is known, otherwise `error`. The response-timeout classifier accepts explicit TIMEOUT statuses and AGY's exact `ERROR` / `timeout waiting for response` payload; unrelated tool/network/auth/quota errors keep their own failure path. The report includes pre-run/current workspace status, original configuration and an exact continuation command with a doubled timeout capped at 120m for background jobs. At that ceiling, offer a narrower task. Ask the user whether to continue or stop and inspect; do not automatically retry, restart or continue after a timeout. Run the proposed recovery only after explicit user confirmation. A wait soft expiry is still exit 2 and requires no new execution.
 
