@@ -6,12 +6,20 @@
  * job kept running — call it again), 3 = error/crashed, 4 = canceled, 1 =
  * generic companion error (unknown id). The point of the contract is that a
  * caller can loop on "exit code 2" with zero output parsing.
+ *
+ * wait's exit-2 expiry also prints one line to STDERR ONLY ("STILL RUNNING —
+ * job <id>, <n>s elapsed. Exit 2: not delivered; call wait again."). stdout
+ * stays byte-identical JSON either way — existing callers do
+ * `JSON.parse(stdout)` and must never see that line. It exists because a
+ * production orchestrator piped `wait ... | tail`, lost the exit code, and
+ * read the plain JSON as a delivered result.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { sandbox, run, jobIdOf, jobLog, waitForJob } from './helpers.mjs';
+import { spawn } from 'node:child_process';
+import { sandbox, run, runShell, jobIdOf, jobLog, waitForJob, waitForCalls, COMPANION, FAKE_AGY } from './helpers.mjs';
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,6 +81,8 @@ describe('wait', () => {
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, new RegExp(`# Job ${id} \\(research, done\\)`));
     assert.match(r.stdout, /fake answer/);
+    // A finished job's wait never carries the running-expiry notice.
+    assert.doesNotMatch(r.stderr, /STILL RUNNING/);
   });
 
   test('the delivered result is the body only; telemetry stays in the job log', async () => {
@@ -91,6 +101,60 @@ describe('wait', () => {
     assert.match(log, /^conversation: conv-1 \(follow up with --continue\)$/m);
   });
 
+  // Fase 1, item 6: the header's Usage line is opt-in on whatever telemetry
+  // the run actually carried — fake-agy emits none of it by default (see
+  // tests/fake-agy.mjs), so a plain job renders no line at all.
+  test('a terminal job with no known telemetry renders no Usage line', async () => {
+    const sb = sandbox('wait-usage-none');
+    const started = run(sb, ['research', '--prompt', 'a topic']);
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /Usage:/);
+    assert.equal(r.stdout, `# Job ${id} (research, done) — AGY worker: default (${FAKE_AGY})\n\nfake answer\n`);
+  });
+
+  test('a terminal job with full telemetry renders one compact Usage line under the header, and persists it onto the job record', async () => {
+    const sb = sandbox('wait-usage-full');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_USAGE: JSON.stringify({ input_tokens: 1728044, output_tokens: 12301, thinking_tokens: 40112, cache_read_tokens: 1200000 }),
+      FAKE_AGY_DURATION_SECONDS: '1177', // 19m37s
+      FAKE_AGY_NUM_TURNS: '42',
+    });
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(
+      r.stdout,
+      `# Job ${id} (research, done) — AGY worker: default (${FAKE_AGY})\n` +
+        'Usage: in 1,728,044 · out 12,301 · think 40,112 · cache 1,200,000 · 19m37s · 42 turns\n' +
+        '\nfake answer\n'
+    );
+
+    const status = JSON.parse(run(sb, ['status', id]).stdout);
+    assert.deepEqual(status.usage, { input_tokens: 1728044, output_tokens: 12301, thinking_tokens: 40112, cache_read_tokens: 1200000 });
+    assert.equal(status.duration_seconds, 1177);
+    assert.equal(status.num_turns, 42);
+
+    const observed = JSON.parse(run(sb, ['observe', id]).stdout);
+    assert.deepEqual(observed.usage, status.usage);
+    assert.equal(observed.duration_seconds, 1177);
+    assert.equal(observed.num_turns, 42);
+  });
+
+  test('the Usage line omits missing parts instead of guessing', async () => {
+    const sb = sandbox('wait-usage-partial');
+    const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_DURATION_SECONDS: '65' });
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^Usage: 1m5s$/m);
+    assert.doesNotMatch(r.stdout, /in \d|out \d|turns/);
+  });
+
   test('own timeout while the job runs → exit 2, then a second wait succeeds', async () => {
     const sb = sandbox('wait-timeout');
     const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_SLEEP_MS: '5000' });
@@ -100,20 +164,54 @@ describe('wait', () => {
     assert.equal(first.code, 2, `${first.stdout}${first.stderr}`);
     assert.equal(JSON.parse(first.stdout).status, 'running');
     assert.doesNotMatch(first.stdout, /fake answer/, 'a timed-out wait must not print a result');
+    assert.match(
+      first.stderr,
+      new RegExp(`^STILL RUNNING — job ${id}, \\d+s elapsed\\. Exit 2: not delivered; call wait again\\.\\n$`)
+    );
 
     const second = run(sb, ['wait', id]);
     assert.equal(second.code, 0, second.stderr);
     assert.match(second.stdout, /fake answer/);
+    assert.doesNotMatch(second.stderr, /STILL RUNNING/);
   });
 
-  test('wait stays silent past the former 15s heartbeat and still delivers progress/result', () => {
+  test('the expiry notice is stderr-only; stdout is unaffected (still parses as JSON)', async () => {
+    const sb = sandbox('wait-expiry-notice-stdout-clean');
+    const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_SLEEP_MS: '5000' });
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id, '--timeout', '1s']);
+    assert.equal(r.code, 2, `${r.stdout}${r.stderr}`);
+    const parsed = JSON.parse(r.stdout); // throws if the notice ever leaks into stdout
+    assert.equal(parsed.status, 'running');
+    assert.doesNotMatch(r.stdout, /STILL RUNNING/);
+  });
+
+  test('2>&1 carries the notice: a caller piping wait without pipefail still sees it', async () => {
+    const sb = sandbox('wait-expiry-notice-2and1');
+    const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_SLEEP_MS: '5000' });
+    const id = jobIdOf(started.stdout);
+
+    const merged = runShell(sb, ['wait', id, '--timeout', '1s']);
+    assert.equal(merged.code, 2, merged.output);
+    assert.match(merged.output, /"status":"running"/);
+    assert.match(merged.output, new RegExp(`STILL RUNNING — job ${id}, \\d+s elapsed\\.`));
+  });
+
+  test('wait stays silent past the former 15s heartbeat (no periodic heartbeat) and still delivers progress/result', () => {
     const sb = sandbox('wait-silent');
     const started = run(sb, ['staffer', '--prompt', 'a quiet task'], { FAKE_AGY_SLEEP_MS: '21000' });
     const id = jobIdOf(started.stdout);
 
     const first = run(sb, ['wait', id, '--timeout', '16s']);
     assert.equal(first.code, 2, first.stdout + first.stderr);
-    assert.equal(first.stderr, '', 'soft waiting must not emit liveness heartbeats');
+    // No periodic heartbeat (the old behavior this test guards against): stderr
+    // carries exactly the one expiry notice, not one line per poll tick.
+    const elapsed = JSON.parse(first.stdout).elapsed_seconds;
+    assert.equal(
+      first.stderr,
+      `STILL RUNNING — job ${id}, ${elapsed}s elapsed. Exit 2: not delivered; call wait again.\n`
+    );
     assert.equal(JSON.parse(first.stdout).status, 'running', 'stdout contains only the expiry snapshot');
 
     const final = run(sb, ['wait', id]);
@@ -186,6 +284,7 @@ describe('wait --follow', () => {
     assert.match(r.stderr, /▶ run_command pnpm typecheck/);
     assert.match(r.stderr, /✓ run_command pnpm typecheck \(5\.5s\)/);
     assert.doesNotMatch(r.stderr, /Looking good so far\./, 'agent_response text is prose, not a step, and must not print');
+    assert.match(r.stderr, new RegExp(`STILL RUNNING — job ${id}, \\d+s elapsed\\.`), '--follow does not suppress the expiry notice');
 
     fs.writeFileSync(release, 'finish');
     const done = run(sb, ['wait', id]);
@@ -202,7 +301,13 @@ describe('wait --follow', () => {
 
     const r = run(sb, ['wait', id, '--timeout', '150ms']);
     assert.equal(r.code, 2, `${r.stdout}${r.stderr}`);
-    assert.equal(r.stderr, '', 'no --follow means no progress lines at all');
+    assert.doesNotMatch(r.stderr, /[▶✓✗]/, 'no --follow means no progress lines at all');
+    const elapsed = JSON.parse(r.stdout).elapsed_seconds;
+    assert.equal(
+      r.stderr,
+      `STILL RUNNING — job ${id}, ${elapsed}s elapsed. Exit 2: not delivered; call wait again.\n`,
+      'the expiry notice still prints even without --follow'
+    );
 
     fs.writeFileSync(release, 'finish');
     assert.equal(run(sb, ['wait', id]).code, 0);
@@ -231,5 +336,113 @@ describe('wait --follow', () => {
     const r = run(sb, ['wait', id, '--follow']);
     assert.equal(r.code, 0, `${r.stdout}${r.stderr}`);
     assert.match(r.stdout, /fake answer/);
+  });
+});
+
+describe('wait --until-done', () => {
+  test('mutually exclusive with --timeout: usage error, exit 1', () => {
+    const sb = sandbox('until-done-mutex');
+    const started = run(sb, ['research', '--prompt', 'a topic']);
+    const id = jobIdOf(started.stdout);
+
+    const r = run(sb, ['wait', id, '--until-done', '--timeout', '5s']);
+    assert.equal(r.code, 1, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /--until-done/);
+    assert.match(r.stderr, /--timeout/);
+  });
+
+  test('blocks past the default 100s ceiling and returns the terminal result once the job finishes', async (t) => {
+    const sb = sandbox('until-done-blocks');
+    const release = path.join(sb.root, 'release');
+    t.after(() => fs.writeFileSync(release, 'finish')); // never leave the fake agy blocked past the test
+    const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_RELEASE_FILE: release });
+    const id = jobIdOf(started.stdout);
+    // Confirms the worker actually launched and is parked on the release file
+    // before the until-done waiter starts polling, same ordering streaming.test.mjs uses.
+    await waitForCalls(sb, 1);
+
+    const waiter = spawn(process.execPath, [COMPANION, 'wait', id, '--until-done'], {
+      cwd: sb.repo,
+      env: { ...process.env, HOME: sb.home, USERPROFILE: sb.home, AGY_BIN: FAKE_AGY, AGY_POOL_BINS: '', FAKE_AGY_ARGV_FILE: sb.argvFile },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    waiter.stdout.setEncoding('utf8'); waiter.stderr.setEncoding('utf8');
+    waiter.stdout.on('data', (d) => { stdout += d; });
+    waiter.stderr.on('data', (d) => { stderr += d; });
+    const closed = new Promise((resolve) => waiter.on('close', resolve));
+
+    fs.writeFileSync(release, 'finish');
+    const code = await closed;
+    assert.equal(code, 0, stdout + stderr);
+    assert.match(stdout, new RegExp(`# Job ${id} \\(research, done\\)`));
+    assert.match(stdout, /fake answer/);
+    assert.doesNotMatch(stderr, /STILL RUNNING/, 'a job that reached done never gets the running-expiry notice');
+  });
+
+  test('compatible with --follow: streams steps to stderr and still returns the terminal result', async (t) => {
+    const events = [
+      { event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 1, step_type: 'tool', state: 'ACTIVE', tool_name: 'run_command', tool_info: { parameters: { CommandLine: 'pnpm test' } } } },
+      { event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 1, step_type: 'tool', state: 'DONE', tool_name: 'run_command', duration_seconds: 2.1, tool_info: { parameters: { CommandLine: 'pnpm test' } } } },
+    ];
+    const sb = sandbox('until-done-follow');
+    const release = path.join(sb.root, 'release');
+    t.after(() => fs.writeFileSync(release, 'finish'));
+    const started = run(sb, ['research', '--prompt', 'follow me too'], {
+      FAKE_AGY_EVENTS: JSON.stringify(events), FAKE_AGY_EVENTS_DELAY_MS: '200', FAKE_AGY_RELEASE_FILE: release,
+    });
+    const id = jobIdOf(started.stdout);
+    await waitForCalls(sb, 1);
+
+    const waiter = spawn(process.execPath, [COMPANION, 'wait', id, '--until-done', '--follow'], {
+      cwd: sb.repo,
+      env: { ...process.env, HOME: sb.home, USERPROFILE: sb.home, AGY_BIN: FAKE_AGY, AGY_POOL_BINS: '', FAKE_AGY_ARGV_FILE: sb.argvFile },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    waiter.stdout.setEncoding('utf8'); waiter.stderr.setEncoding('utf8');
+    waiter.stdout.on('data', (d) => { stdout += d; });
+    waiter.stderr.on('data', (d) => { stderr += d; });
+    const closed = new Promise((resolve) => waiter.on('close', resolve));
+
+    await new Promise((r) => setTimeout(r, 400)); // let the step events land before releasing
+    fs.writeFileSync(release, 'finish');
+    const code = await closed;
+    assert.equal(code, 0, stdout + stderr);
+    assert.match(stderr, /▶ run_command pnpm test/);
+    assert.match(stdout, /fake answer/);
+  });
+
+  test('a dead worker with no result ends as crashed instead of hanging forever', () => {
+    const sb = sandbox('until-done-crashed');
+    const id = 'research-simulated-crash-until-done';
+    const stateDir = path.join(sb.repo, '.agy-staff');
+    fs.mkdirSync(stateDir);
+    const stateFile = path.join(stateDir, 'state.json');
+    // Same fake-crash shape jobs.test.mjs uses: a running job record with an
+    // unreachable pid and no result file. liveJobStatus() reclassifies it as
+    // crashed on the very next read — the same refresh logic wait already
+    // uses on every poll tick — so --until-done's uncapped loop still ends.
+    fs.writeFileSync(stateFile, JSON.stringify({ jobs: [{
+      id, mode: 'research', status: 'running', pid: 99999999,
+      cwd: sb.repo, started_at: new Date().toISOString(),
+      spec_file: path.join(stateDir, `${id}.spec.json`),
+      result_file: path.join(stateDir, `${id}.result.md`),
+      log_file: path.join(stateDir, `${id}.log`),
+    }] }));
+
+    const r = run(sb, ['wait', id, '--until-done']);
+    assert.equal(r.code, 3, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /finished with status crashed and no stored result/);
+  });
+
+  test('rejected on every subcommand but wait, coherent with FLAG_SCOPE', () => {
+    for (const cmd of ['status', 'result', 'cancel', 'observe', 'setup', 'workers']) {
+      const sb = sandbox(`until-done-scope-${cmd}`);
+      const r = run(sb, [cmd, '--until-done']);
+      assert.equal(r.code, 1, `${cmd} --until-done must use the usage-error exit code`);
+      assert.match(r.stderr, new RegExp(`--until-done has no effect on ${cmd}`));
+      assert.match(r.stderr, /\(valid on: wait\)/);
+    }
   });
 });

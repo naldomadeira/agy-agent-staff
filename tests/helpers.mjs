@@ -48,6 +48,35 @@ export function sandbox(label = 'case', { git = true } = {}) {
   return { root, repo, home, git, argvFile: path.join(root, 'agy-argv.jsonl') };
 }
 
+/** The env a companion child process runs with: shared by run() and
+ *  runShell() so both see the same sandbox isolation and defaults. */
+function envFor(sb, extraEnv) {
+  return {
+    ...process.env,
+    HOME: sb.home,
+    USERPROFILE: sb.home, // os.homedir() reads this on Windows, HOME elsewhere
+    AGY_BIN: FAKE_AGY,
+    // The companion reads these straight from its own process.env, so the
+    // maintainer's shell leaks in through the `...process.env` spread above
+    // exactly like any other inherited var. Blank them by default so a test
+    // that doesn't care about the pool gets the CLI's built-in defaults
+    // regardless of what's set outside; `...extraEnv` below still lets a
+    // test that DOES care override any of them.
+    AGY_POOL_BINS: '',
+    AGY_QUOTA_CACHE_DIR: '',
+    AGY_PROBE_TIMEOUT_MS: '',
+    AGY_PROBE_RETRY_TIMEOUT_MS: '',
+    FAKE_AGY_ARGV_FILE: sb.argvFile,
+    // The fake agy answers in microseconds; a real one takes seconds. Keep a
+    // realistic minimum latency so these suites measure the interface, not
+    // concurrent read-modify-writes of state.json (a residual lost-update
+    // window exists without file locking; see tests/README.md). The
+    // zero-latency paths are pinned separately in state.test.mjs.
+    FAKE_AGY_SLEEP_MS: '300',
+    ...extraEnv,
+  };
+}
+
 /** Run the companion CLI in a sandbox. Returns {code, stdout, stderr}.
  *  `input` feeds the child's stdin (for --stdin). */
 export function run(sb, args, extraEnv = {}, { input } = {}) {
@@ -55,33 +84,24 @@ export function run(sb, args, extraEnv = {}, { input } = {}) {
     cwd: sb.repo,
     input,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      HOME: sb.home,
-      USERPROFILE: sb.home, // os.homedir() reads this on Windows, HOME elsewhere
-      AGY_BIN: FAKE_AGY,
-      // The companion reads these straight from its own process.env, so the
-      // maintainer's shell leaks in through the `...process.env` spread above
-      // exactly like any other inherited var. Blank them by default so a test
-      // that doesn't care about the pool gets the CLI's built-in defaults
-      // regardless of what's set outside; `...extraEnv` below still lets a
-      // test that DOES care override any of them.
-      AGY_POOL_BINS: '',
-      AGY_QUOTA_CACHE_DIR: '',
-      AGY_PROBE_TIMEOUT_MS: '',
-      AGY_PROBE_RETRY_TIMEOUT_MS: '',
-      FAKE_AGY_ARGV_FILE: sb.argvFile,
-      // The fake agy answers in microseconds; a real one takes seconds. Keep a
-      // realistic minimum latency so these suites measure the interface, not
-      // concurrent read-modify-writes of state.json (a residual lost-update
-      // window exists without file locking; see tests/README.md). The
-      // zero-latency paths are pinned separately in state.test.mjs.
-      FAKE_AGY_SLEEP_MS: '300',
-      ...extraEnv,
-    },
+    env: envFor(sb, extraEnv),
   });
   if (r.error) throw r.error;
   return { code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
+}
+
+/** Same call as run(), but through a shell with stderr merged into stdout
+ *  (`2>&1`) — for asserting on the exact bytes a caller piping
+ *  `wait ... 2>&1` would see. Two separately-captured pipes (what run()
+ *  gives you) can't stand in for that: a real `2>&1` interleaves both
+ *  streams into the one fd the receiving end reads. POSIX only (`/bin/sh`).
+ *  Returns {code, output} — one merged stream, no stdout/stderr split. */
+export function runShell(sb, args, extraEnv = {}) {
+  const quoted = args.map((a) => `'${String(a).replaceAll("'", `'\\''`)}'`).join(' ');
+  const cmd = `${JSON.stringify(process.execPath)} ${JSON.stringify(COMPANION)} ${quoted} 2>&1`;
+  const r = spawnSync('/bin/sh', ['-c', cmd], { cwd: sb.repo, encoding: 'utf8', env: envFor(sb, extraEnv) });
+  if (r.error) throw r.error;
+  return { code: r.status, output: r.stdout || '' };
 }
 
 /** Every argv the fake agy has seen so far, oldest first. */
@@ -158,9 +178,9 @@ export async function waitForJob(sb, jobId, { tries = 40, delayMs = 100 } = {}) 
   let last = 'unknown';
   for (let i = 0; i < tries; i++) {
     const r = run(sb, ['status', jobId]);
-    const m = /"status":\s*"([a-z]+)"/.exec(r.stdout);
+    const m = /"status":\s*"([a-z_]+)"/.exec(r.stdout);
     last = m ? m[1] : `unknown (${r.stdout.trim() || r.stderr.trim()})`;
-    if (last === 'done' || last === 'error' || last === 'crashed' || last === 'canceled' || last === 'attention') return last;
+    if (last === 'done' || last === 'error' || last === 'crashed' || last === 'canceled' || last === 'attention' || last === 'quota_exhausted') return last;
     await sleep(delayMs);
   }
   throw new Error(`job ${jobId} never left "running" (last: ${last})`);
