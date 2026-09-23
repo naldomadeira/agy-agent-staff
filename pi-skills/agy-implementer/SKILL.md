@@ -20,7 +20,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" implement [flags] --prompt 
 Pass the user's task description verbatim via `--prompt`; use `--prompt-file <path>` or `--stdin` for long text.
 
 > [!IMPORTANT]
-> Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../agy-jobs/references/troubleshooting.md`. (The companion passes `--dangerously-skip-permissions` to agy in this mode — that is the unrestricted profile working as designed.)
+> agy needs a localhost port and its OAuth token file, which some harness sandboxes hide. If the host sandbox blocks them (in Codex: the command fails with a sandbox/permission/connection error), request escalated permissions for the command; if the host already grants that access, just run it. Details: `../agy-jobs/references/troubleshooting.md`. (The companion passes `--dangerously-skip-permissions` to agy in this mode — that is the unrestricted profile working as designed.)
 
 ## Workspace and delivery
 

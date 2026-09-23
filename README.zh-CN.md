@@ -107,7 +107,7 @@ install and verify the agy-staff plugin for the harness you are running in. Resp
 
 `lead` 为当前主 agent 增加任务编排指导。在 lead 工作流中，主 agent 了解至足以明确任务后，默认用 `staffer` 承担实质性工作，等待结果返回后再验收、整合或追加任务；专门指导有帮助时再选择 specialist，`ask` 仅用于测试。主 agent 负责跨任务决策、验收、整合和交付，复用现有 jobs 工作流。Claude Code 使用 `/agy:lead`，Codex 使用 `$agy:lead`，Pi 使用 `/skill:agy-lead`。
 
-`ask` 会在同一次调用中返回答案。其他角色启动后会先返回任务 ID，并给出收取结果的命令，例如 `wait <id> --timeout 10m`。主 agent 根据所在环境的能力等待任务；如果支持后台命令，就为每个任务保留一个独立的等待命令。
+`ask` 会在同一次调用中返回答案。其他角色启动后会先返回任务 ID，并给出收取结果的命令：在 Claude Code 中，把 `wait <id> --until-done` 作为后台命令启动，交给宿主在它返回时通知你；在 Codex 等不支持后台通知的环境中，用 `wait <id> --timeout 10m` 轮询，退出码为 2 时重新调用（不要把 `wait` 的输出接进管道——那样会丢失退出码）。
 
 主 agent 默认等待最终结果，不为例行汇报主动查询。你明确询问中间进展时，它才用 `observe` 查看当前快照，其中包含最近的工具活动和回答片段。任务完成后，`wait` 或 `result` 负责返回完整结果。
 
@@ -116,6 +116,8 @@ install and verify the agy-staff plugin for the harness you are running in. Resp
 [![后台任务从委派到完成的过程：主 agent 等待或查看进度时，worker 持续保存 AGY 的输出，最终交付完整报告](assets/integration.png)](assets/integration.svg)
 
 等待到期不会停止后台任务。任务本身有独立的执行时限，默认 60 分钟，可以在启动时用 `--timeout` 调整，最长 120 分钟。需要停止时使用 `cancel`；需要继续或重新开始时，由主 agent 根据你的要求调用 `continue` 或 `restart`。模型何时收到后台结果，仍由你使用的 agent 环境决定。
+
+除了 `done`，任务还可能以 `attention`（退出码 5——可续跑的超时、未交付的空跑/未提交改动，或 worker 自己声明仍在等待的验证）、`quota_exhausted`（退出码 6——切换 worker 或模型，或等待配额重置；重置前不要在同一个模型上 `continue`）、`error`/`crashed` 或 `canceled` 结束。除 `done` 外的每份报告都会附带 `## Partial work` 清单（HEAD 是否移动、脏路径、检查用的命令），恢复前应先看一遍。
 
 关于参数、权限、进度快照和恢复方式，可以查阅[完整参考手册](docs/REFERENCE.zh-CN.md)。各版本的改动记录在[发布说明](docs/releases/)中。
 

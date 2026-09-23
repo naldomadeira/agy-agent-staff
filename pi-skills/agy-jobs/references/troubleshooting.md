@@ -6,7 +6,7 @@
 
 agy cannot run inside a harness command sandbox (e.g. Codex workspace-write): it binds a localhost port for its internal language server and reads its OAuth token file, which sandbox secret-protection hides. No writable_roots/network_access knob fixes the hidden token — the run dies with `operation not permitted` on `~/.gemini/...` or on binding `127.0.0.1`, or with a bogus "authentication failed".
 
-Fix: run the companion command **unsandboxed**. In Codex, request escalated permissions for the command or have the user grant the workspace full access. Do not retry the command as-is; the sandbox will block it the same way every time.
+Fix: agy needs a localhost port and its OAuth token file, which some harness sandboxes hide. If the host sandbox blocks them (in Codex: the command fails with a sandbox/permission/connection error), request escalated permissions for the command or have the user grant the workspace full access; if the host already grants that access, just run it. Do not retry the command as-is under a sandbox that already blocked it — it will block it the same way every time.
 
 ## False crash reports across permission or sandbox contexts
 

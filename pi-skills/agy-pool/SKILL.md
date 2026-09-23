@@ -25,7 +25,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" <staffer|research|review|im
 **Quota slack is a reading off disk, and it carries its age.** It comes from whatever hook writes the quota cache; this command only reads. A worker with no reading shows `-`, which is a real answer and not a failure. Read the age next to the number: `93% (3m)` and `93% (2d)` are not the same claim.
 
 > [!IMPORTANT]
-> Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../agy-jobs/references/troubleshooting.md`.
+> agy needs a localhost port and its OAuth token file, which some harness sandboxes hide. If the host sandbox blocks them (in Codex: the command fails with a sandbox/permission/connection error), request escalated permissions for the command; if the host already grants that access, just run it. Details: `../agy-jobs/references/troubleshooting.md`.
 
 ## Discovery and selection
 

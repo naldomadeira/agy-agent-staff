@@ -25,7 +25,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" review [flags] --prompt "wh
 Pass the review subject verbatim via `--prompt`; use `--prompt-file <path>` or `--stdin` for long text, which a composed task usually needs.
 
 > [!IMPORTANT]
-> Run this command **unsandboxed** — agy needs a localhost port and its OAuth token file, which harness sandboxes hide. In Codex, request escalated permissions for the command. Details: `../agy-jobs/references/troubleshooting.md`.
+> agy needs a localhost port and its OAuth token file, which some harness sandboxes hide. If the host sandbox blocks them (in Codex: the command fails with a sandbox/permission/connection error), request escalated permissions for the command; if the host already grants that access, just run it. Details: `../agy-jobs/references/troubleshooting.md`.
 
 ## The review subject is the prompt
 
