@@ -1,6 +1,6 @@
 {
   "name": "agy",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Delegate work to Google's Antigravity CLI (agy) with fast Gemini access - eight skills: staffer (general), researcher, reviewer (code and plans), implementer, ask, lead (orchestration), pool (worker selection), and jobs (background job management, model-only).",
   "author": {
     "name": "Keli Wen",
