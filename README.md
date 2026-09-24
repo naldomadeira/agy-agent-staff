@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/logo/gemini-agy.svg" width="440" alt="AGY-STAFF"></p>
 
-<p align="center"><a href="README.md">English</a> | <a href="README.zh-CN.md">Simplified Chinese</a></p>
+<p align="center"><a href="README.md">English</a> | <a href="README.pt-BR.md">Português (Brasil)</a></p>
 
 <p align="center"><a href="https://antigravity.google/product/antigravity-cli"><img src="assets/badges/powered-by-antigravity.svg" height="20" alt="powered by: Antigravity"></a> <img src="assets/badges/model-gemini-3-8-flash.svg" height="20" alt="model: Gemini 3.8 Flash"></p>
 
@@ -135,7 +135,9 @@ The timeline below follows a background task from delegation to completion. The 
 
 Jobs have a separate execution deadline: default 60 minutes, configurable at launch with `--timeout` up to 120 minutes. Use `cancel` to stop execution, or explicitly request `continue` or `restart` after inspecting the existing work. The host harness controls when your agent receives a background result.
 
-Beyond `done`, a job can end `attention` (exit 5 — a resumable timeout, an undelivered no-op/uncommitted change, or a verification the worker itself flagged as still pending), `quota_exhausted` (exit 6 — switch worker/model or wait for the reset, never `continue` on the same model first), `error`/`crashed`, or `canceled`. Every non-`done` report includes a `## Partial work` inventory (HEAD movement, dirty paths, an inspect command) to check before any recovery.
+Beyond `done`, a job can end `attention` (exit 5 — a resumable timeout, an undelivered no-op/uncommitted change, a verification the worker itself flagged as still pending, or a failed/timed-out companion-run gate), `quota_exhausted` (exit 6 — switch worker/model or wait for the reset, never `continue` on the same model first), `error`/`crashed`, or `canceled`. Every non-`done` report includes a `## Partial work` inventory (HEAD movement, dirty paths, an inspect command) to check before any recovery.
+
+`implementer` briefings should never order a full build/test/lint baseline — that refuses before dispatch (exit 1) so a worker never burns its whole run on the gate instead of the task. Declare `--gate <names>` (looked up in `.agy-staff/config.json`'s `gates` map) or an ad hoc `--gate-cmd` instead: the companion runs it after the worker reports done, and a failure ends the job `attention`/`gate_failed` while a pass turns even a `verification_incomplete` into `done`.
 
 **Full reference →** [docs/REFERENCE.md](docs/REFERENCE.md) (flags, permission model, jobs/state, troubleshooting, upgrading). **Release notes →** [docs/releases/](docs/releases/).
 
@@ -150,7 +152,7 @@ Contributions are welcome — issues, bug reports and pull requests all help.
 A few things worth knowing before you open a PR:
 
 - **Run the tests**: `npm test`. The standard suite uses temporary repos and HOME directories with fake `agy`, plus focused module tests. Keep regression tests offline and independent of personal settings. Real AGY validation is a separate opt-in suite described in [tests/README.md](tests/README.md).
-- **Docs come in pairs**: `README.md` / `README.zh-CN.md` and `docs/REFERENCE.md` / `docs/REFERENCE.zh-CN.md` are kept in sync. Change one, change its counterpart.
+- **Docs come in pairs**: `README.md` / `README.pt-BR.md` and `docs/REFERENCE.md` / `docs/REFERENCE.pt-BR.md` are kept in sync. Change one, change its counterpart. The pt-BR docs keep code identifiers, flags, commands, and established technical terms in English.
 - **Runtime code lives in `companion/`**: the entrypoint handles modes and job commands; separate modules handle streaming execution, observations and state locking. Skills call the companion, and `templates/` holds the shared prompts.
 - **Canonical skills are the source of truth**: edit personas in `skills/`, never in `pi-skills/`. Run `npm run generate:pi` to generate Pi entrypoints, and `npm run check:pi` to verify consistency.
 

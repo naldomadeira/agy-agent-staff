@@ -112,7 +112,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
-import { atomicJSON, runStreaming, processIdentity } from './stream-worker.mjs';
+import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
 import { discoverWorkers, reserveWorker } from './worker-pool.mjs';
 
@@ -155,6 +155,12 @@ const DEFAULTS = {
   // No flag overrides this; execution style is a property of the mode.
   background: { staffer: true, research: true, review: true, implement: true, ask: false },
 };
+
+// Fase 2 item 1: bump this whenever templates/implement.md's Decision
+// discipline section (or the facts it's rendered with) changes meaning, so a
+// stored spec can be told apart from one written under an earlier policy.
+// Only implement carries a policy at all — every other mode's spec gets null.
+const IMPLEMENT_POLICY_VERSION = 'implement-discipline-1';
 
 // agy only accepts effort-suffixed model ids; bare family names are rejected
 // with status ERROR ("--model gemini-3.8-flash requires --effort").
@@ -327,6 +333,68 @@ function loadProjectConfig() {
   return cfg;
 }
 
+/** Reads and JSON.parses a config file, or null when missing. Corrupt JSON
+ *  dies loudly — same rule as loadProjectConfig: a policy silently ignored
+ *  is worse than an error. */
+function readJsonConfig(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    die(`project config is corrupt: ${file} — fix or delete it, then retry`);
+  }
+}
+
+/** Each declared gate must be a non-empty, single-line command string — it
+ *  runs with `shell: true` (see runGateCommand), so a newline would silently
+ *  become two shell statements. */
+function validateGates(gates, source) {
+  if (typeof gates !== 'object' || gates === null || Array.isArray(gates)) {
+    die(`project config: "gates" in ${source} must be an object mapping a name to a command string`);
+  }
+  for (const [name, cmd] of Object.entries(gates)) {
+    if (typeof cmd !== 'string' || !cmd.trim() || /[\r\n]/.test(cmd)) {
+      die(`project config: gate "${name}" in ${source} must be a non-empty, single-line command string`);
+    }
+  }
+  return gates;
+}
+
+/** Fase 2 item 3: the optional `gates` map in `.agy-staff/config.json`,
+ *  `{ "gates": { "check": "pnpm check", ... } }`. Looked up in the current
+ *  workspace's own config first; a linked git worktree normally has no
+ *  config of its own (`.agy-staff/` is git-ignored, so `git worktree add`
+ *  never copies it), so when the current workspace's config carries no
+ *  `gates`, this falls back to the MAIN worktree's config
+ *  (`git rev-parse --git-common-dir` -> its parent). The fallback is scoped
+ *  to `gates` only — profile policy (loadProjectConfig) is untouched, so a
+ *  worktree's own profile choice is still its own.
+ *  Returns `{ gates: object|null, source: <path used, for error messages> }`. */
+function loadGatesConfig() {
+  const own = configPath();
+  const ownCfg = readJsonConfig(own);
+  if (ownCfg?.gates) return { gates: validateGates(ownCfg.gates, own), source: own };
+
+  const commonDir = sh('git', ['rev-parse', '--git-common-dir']);
+  const gitDir = sh('git', ['rev-parse', '--git-dir']);
+  if (commonDir.code === 0 && commonDir.out && gitDir.code === 0 && gitDir.out) {
+    const common = path.resolve(commonDir.out);
+    const local = path.resolve(gitDir.out);
+    if (common !== local) {
+      // Standard `git worktree` layout: the common dir is <main-root>/.git.
+      const mainConfig = path.join(path.dirname(common), '.agy-staff', 'config.json');
+      const mainCfg = readJsonConfig(mainConfig);
+      if (mainCfg?.gates) return { gates: validateGates(mainCfg.gates, mainConfig), source: mainConfig };
+    }
+  }
+  return { gates: null, source: own };
+}
+
 /** Create .agy-staff/ on first use and keep it out of `git status`.
  *  .git/info/exclude is repo-local and untracked — never the team's
  *  .gitignore. Best-effort: a read-only .git must not block a run. */
@@ -434,8 +502,8 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver']);
-const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout']);
+const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
 // "unknown flag", so a 0.1 caller learns what replaced them.
@@ -597,6 +665,18 @@ const FLAG_SCOPE = {
   // buildPrompt / implementPostcondition); meaningless on every other mode
   // and on continue, since it does not re-inject the prompt authorization.
   deliver: ['implement'],
+  // Fase 2 item 2: pre-dispatch refusal of a briefing that orders agy to run
+  // a long gate itself (checkGateOrder / resolveRun). Scoped to implement and
+  // its two resume paths — continue re-checks new follow-up text, restart
+  // re-checks (and can re-authorize) the original stored task.
+  'allow-gate': ['implement', 'continue', 'restart'],
+  // Fase 2 item 3: companion-run verification gates (resolveGates /
+  // workerMain). Scoped the same way as --allow-gate, for the same reason:
+  // only implement's job spec carries a gate list at all, and continue/
+  // restart are the two ways to resume that job.
+  gate: ['implement', 'continue', 'restart'],
+  'gate-cmd': ['implement', 'continue', 'restart'],
+  'gate-timeout': ['implement', 'continue', 'restart'],
   // wait's own opt-in progress feed (cmdWait); meaningless anywhere else,
   // since only wait polls a job's events file at all
   follow: ['wait'],
@@ -628,6 +708,10 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   restrict: 'it is either the --restricted typo guard on a run, or the per-repo policy flag on setup',
   timeout: 'it sets the run/job time budget',
   deliver: 'it authorizes git-commit delivery for a single implement run (only accepted value: commit)',
+  'allow-gate': 'it authorizes the worker to run a long gate command (build/test/check) the briefing orders, for a single implement run',
+  gate: 'it selects which declared gate(s) (.agy-staff/config.json "gates") the companion runs after the worker finishes',
+  'gate-cmd': 'it adds one ad hoc single-line command the companion runs after the worker finishes, after any named --gate commands',
+  'gate-timeout': "it sets each gate's own time budget (default 15m), separate from the agent's --timeout",
   follow: "it streams a running job's steps to stderr while wait polls for completion",
   'until-done': 'it blocks wait until the job reaches a terminal state, with no timeout ceiling',
   json: '(review) it asks for schema-enforced findings instead of free-form markdown',
@@ -1277,8 +1361,12 @@ function resolveRun(mode, opts, priorJob = null) {
     if (!opts.restricted && !opts.unrestricted && prior.profile) { profile = prior.profile; profileSource = 'inherited'; }
   }
   if (profileSource === 'project') process.stderr.write(`agy-staff: profile=${profile} set by project policy (${configPath()})\n`);
+  // Fase 2 item 3: `prior` here is the same job/config lookup model/profile
+  // inheritance already uses above, so a continue's --gate/--gate-cmd omission
+  // inherits the resumed job's gates exactly the way it inherits its model.
+  const { gates, gate_timeout } = resolveGates(opts, prior);
   return { mode, model, profile, profileSource, background, timeout, conversation, parentJobId: prior?.id || null, originalCwd: prior?.cwd || null,
-    worker: prior?.worker || null, deliver: opts.deliver === 'commit' };
+    worker: prior?.worker || null, deliver: opts.deliver === 'commit', allowGate: !!opts['allow-gate'], gates, gate_timeout };
 }
 
 /** Marker id of the pre-pool executable. It is never probed and never enters
@@ -1351,6 +1439,289 @@ function taskText(opts) {
   return '';
 }
 
+// ---------------------------------------------------------------------------
+// pre-dispatch gate detection (Fase 2, item 2)
+//
+// A briefing that orders agy to run a long gate itself (build/test/check)
+// burns the whole run on the gate instead of the task — the production
+// incident this guards against ran on exactly this text: "Run `pnpm check`
+// and `pnpm build` to confirm the state of the project." detectGateOrder is
+// pure and conservative: it only flags a POSITIVE order (fenced code block,
+// list item, or an imperative sentence), never a negation or descriptive
+// prose that merely mentions the command.
+// ---------------------------------------------------------------------------
+
+// pnpm/npm/yarn/bun + a gate verb, with or without "run" (`npm test`, `npm run
+// build`, `pnpm check`); pytest; cargo test/build; go test; next build. `tsc`
+// is handled separately below because "full, no file args" needs a look-ahead
+// rather than a single regex.
+//
+// `kind: 'always'` verbs (build/check/lint/typecheck, cargo build, next
+// build) are whole-project by nature — a gate no matter what follows them.
+// `kind: 'test'` verbs (pm test, pytest, cargo test, go test) are only a gate
+// when nothing after them narrows the run to specific tests; see
+// isTargetedTestArgs below for what counts as narrowing.
+const GATE_COMMAND_PATTERNS = [
+  { re: /\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?(?:build|check|lint|typecheck)\b/, kind: 'always' },
+  { re: /\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?test\b/, kind: 'test' },
+  { re: /\bpytest\b/, kind: 'test' },
+  { re: /\bcargo\s+test\b/, kind: 'test' },
+  { re: /\bcargo\s+build\b/, kind: 'always' },
+  { re: /\bgo\s+test\b/, kind: 'test' },
+  { re: /\bnext\s+build\b/, kind: 'always' },
+];
+
+// Negation beats everything else — "don't run"/"não rode" contain the same
+// imperative verb the positive case looks for, so this must be checked first
+// and short-circuit the line, not merely fail to add a positive signal.
+const GATE_NEGATION_RE =
+  /\bdon'?t\s+run\b|\bdo\s+not\s+run\b|\bnever\s+run\b|\bavoid\s+running\b|\bn[aã]o\s+rode\b|\bn[aã]o\s+corra\b|\bn[aã]o\s+execute\b|\bsem\s+rodar\b/i;
+
+// Imperative cue: an order, not a description. "runs"/"correu" etc. don't
+// match \b...\b, which is what keeps "the CI runs pnpm build" out of this.
+const GATE_IMPERATIVE_RE = /\b(?:run|execute|rode|corra|roda)\b|\bconfirm with\b|\bverify with\b|\bthen run\b/i;
+
+const GATE_LIST_ITEM_RE = /^\s*(?:[-*+]|\d+[.)])\s+/;
+
+// Flags that scope a test run to specific tests, across pnpm/npm/yarn/bun
+// test, pytest, cargo test and go test: pytest's -k, jest/vitest's -t or
+// --testNamePattern, pnpm workspace --filter/-F, cargo's -p <crate>, and
+// go's -run <pattern>.
+const TEST_TARGET_FLAGS = new Set(['-k', '-t', '-F', '-p', '-run']);
+
+/** True when the text following a `test`-kind verb narrows it to specific
+ *  tests rather than running the whole suite — a path or file extension
+ *  (`src/foo.test.ts`, `tests/test_x.py`), a pytest/rust node id (`::`), a
+ *  targeting flag (see TEST_TARGET_FLAGS / --testNamePattern / --filter), a
+ *  bare test-name identifier after `cargo test` (`cargo test some_test`),
+ *  or a specific package path after `go test` — but NOT `go test ./...`,
+ *  which is Go's own spelling of "the whole module" and stays a gate. */
+function isTargetedTestArgs(matchedText, after) {
+  const trimmed = after.trim();
+  if (!trimmed) return false; // bare command, e.g. plain `pytest` or `npm test`
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.some((t) => TEST_TARGET_FLAGS.has(t) || t.startsWith('--testNamePattern') || t.startsWith('--filter'))) {
+    return true;
+  }
+  if (after.includes('::')) return true;
+  if (/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs)\b/.test(after)) return true;
+
+  if (/\bgo\s+test\b/.test(matchedText)) {
+    const first = tokens[0];
+    return first !== './...' && first !== '...' && first.includes('/');
+  }
+  if (/[\w.-]+\/[\w./-]*/.test(after)) return true; // generic path-like token
+
+  if (/\bcargo\s+test\b/.test(matchedText)) {
+    return tokens.length === 1 && /^[A-Za-z0-9_]+$/.test(tokens[0]);
+  }
+  return false;
+}
+
+/** Earliest gate-command match on one line, or null. `tsc` only counts when
+ *  it isn't immediately followed by what looks like a file argument (a
+ *  `.ts`/`.tsx` path or a path separator) before the next command separator
+ *  — that's the "full, no file args" distinction from a targeted `tsc foo.ts`.
+ *  A `test`-kind verb (see GATE_COMMAND_PATTERNS) is skipped the same way
+ *  when isTargetedTestArgs says it was narrowed to specific tests, so a
+ *  later real gate on the same line (rare, but possible) is still found. */
+function findGateCommand(line) {
+  const candidates = [];
+  for (const { re, kind } of GATE_COMMAND_PATTERNS) {
+    const m = re.exec(line);
+    if (m) candidates.push({ index: m.index, end: m.index + m[0].length, text: m[0], kind });
+  }
+  const tm = /\btsc\b/.exec(line);
+  if (tm) candidates.push({ index: tm.index, end: tm.index + tm[0].length, text: tm[0], kind: 'tsc' });
+  candidates.sort((a, b) => a.index - b.index);
+
+  for (const c of candidates) {
+    if (c.kind === 'always') return { index: c.index, text: c.text };
+    const after = line.slice(c.end).split(/`|&&|;|\|/)[0];
+    if (c.kind === 'tsc') {
+      if (!/\.tsx?\b|[/\\]/.test(after)) return { index: c.index, text: c.text };
+      continue; // targeted `tsc foo.ts` — not a whole-project gate
+    }
+    if (!isTargetedTestArgs(c.text, after)) return { index: c.index, text: c.text };
+  }
+  return null;
+}
+
+/** Pure. Scans `text` line by line for a POSITIVE order to run a long gate
+ *  command, returning the first one found. `{ found: false }` covers no
+ *  mention, a negated mention, and descriptive prose that merely names the
+ *  command — none of those are an order. */
+function detectGateOrder(text) {
+  const lines = String(text || '').split('\n');
+  let inFence = false;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    const match = findGateCommand(raw);
+    if (!match) continue;
+    if (GATE_NEGATION_RE.test(raw)) continue;
+    if (inFence) {
+      // A fence can be introduced by a negated sentence a couple of lines
+      // above it ("Don't run this:\n```\npnpm build\n```") — the negation
+      // itself never reaches this line, so look back for it explicitly.
+      const back = lines.slice(Math.max(0, i - 3), i).join(' ');
+      if (GATE_NEGATION_RE.test(back)) continue;
+      return { found: true, command: match.text, line: trimmed };
+    }
+    if (GATE_LIST_ITEM_RE.test(raw)) return { found: true, command: match.text, line: trimmed };
+    if (GATE_IMPERATIVE_RE.test(raw)) return { found: true, command: match.text, line: trimmed };
+  }
+  return { found: false };
+}
+
+/** Refuses BEFORE dispatch when the briefing orders agy to run a long gate
+ *  itself and the caller has not authorized it. No-op outside implement (the
+ *  only mode a "gate" applies to) and when --allow-gate was passed. */
+function checkGateOrder(mode, text, allowGate) {
+  if (mode !== 'implement' || allowGate || !text) return;
+  const hit = detectGateOrder(text);
+  if (!hit.found) return;
+  die(
+    `the briefing orders a long gate before the run even starts: "${hit.line}"\n` +
+      `A full ${hit.command} burns the whole run when the worker executes it instead of the actual task — ` +
+      `this is the exact failure mode that put this guard here.\n` +
+      `Remove the order and let the orchestrator run it after collecting the result, or re-run with ` +
+      `--allow-gate to authorize the worker to run it itself.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// declared gates: companion-run verification after the worker finishes
+// (Fase 2, item 3)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_GATE_TIMEOUT = '15m';
+
+/** `--gate a,b,c` -> trimmed, de-duplicated (order preserved) names; stray
+ *  empty entries from a trailing/doubled comma are dropped. The existing
+ *  flag parser (parseFlags/VALUE_FLAGS) stores one value per flag name and
+ *  would silently drop all but the last on a repeated `--gate`, so a comma
+ *  list is what actually works with it — see docs/REFERENCE.md. */
+function parseGateNames(raw) {
+  return [...new Set(String(raw || '').split(',').map((s) => s.trim()).filter(Boolean))];
+}
+
+/** This call's own --gate/--gate-cmd, resolved to an ordered
+ *  `[{name, command}]` list, or `null` when neither flag was passed —
+ *  meaning "say nothing about gates for this call", which callers tell apart
+ *  from "explicitly no gates" (not reachable here: an empty --gate value is
+ *  already rejected by checkValue before this runs). Named gates are looked
+ *  up in the project's gates config (see loadGatesConfig, including its
+ *  worktree fallback); an unknown name, or no gates configured to look up at
+ *  all, dies before any job is created. --gate-cmd needs no config lookup
+ *  and is appended last, after any named gates. */
+function resolveGateList(opts) {
+  const names = opts.gate !== undefined ? parseGateNames(opts.gate) : [];
+  const adhoc = opts['gate-cmd'];
+  if (adhoc !== undefined) {
+    if (/[\r\n]/.test(adhoc)) die('--gate-cmd must be a single-line command (no newlines)');
+    if (!adhoc.trim()) die('--gate-cmd needs a non-empty command');
+  }
+  if (!names.length && adhoc === undefined) return null;
+
+  const gates = [];
+  if (names.length) {
+    const { gates: configured, source } = loadGatesConfig();
+    const available = configured ? Object.keys(configured) : [];
+    if (!available.length) {
+      die(
+        `--gate was given but no gates are configured. Add a "gates" object to .agy-staff/config.json ` +
+          `(looked up at ${source}), e.g. {"gates": {"check": "pnpm check"}}.`
+      );
+    }
+    for (const name of names) {
+      if (!Object.prototype.hasOwnProperty.call(configured, name)) {
+        die(`unknown gate "${name}" (available: ${available.join(', ')}; configured in ${source})`);
+      }
+      gates.push({ name, command: configured[name] });
+    }
+  }
+  if (adhoc !== undefined) gates.push({ name: 'gate-cmd', command: adhoc });
+  return gates;
+}
+
+/** Validates and returns --gate-timeout, or the default when the flag was
+ *  not given. Always validated when given, even on a call that ends up with
+ *  no gates at all — a typo should surface immediately, not be silently
+ *  discarded because it happened to apply to nothing. */
+function resolveGateTimeout(opts) {
+  const raw = opts['gate-timeout'] || DEFAULT_GATE_TIMEOUT;
+  const ms = durationToMs(raw);
+  if (!Number.isFinite(ms) || ms <= 0) die(`invalid --gate-timeout "${raw}": use a positive duration, e.g. 15m`);
+  return raw;
+}
+
+/** Combines this call's own --gate/--gate-cmd/--gate-timeout with whatever
+ *  `inherited` (a prior job record, or a restart's own spec.resolved) already
+ *  carries: explicit flags on THIS call replace the inherited gates outright
+ *  (a fresh config lookup, so a renamed/removed gate still validates);
+ *  without them, continue/restart inherit the original gates untouched —
+ *  including "no gates" when the original run had none. Used by both
+ *  resolveRun (direct dispatch + continue, via its `prior`) and cmdRestart
+ *  (via its own `resolved`, already spread from spec.resolved). */
+function resolveGates(opts, inherited) {
+  const explicit = resolveGateList(opts);
+  const gates = explicit !== null ? explicit : (inherited?.gates || null);
+  if (!gates) {
+    if (opts['gate-timeout'] !== undefined) resolveGateTimeout(opts);
+    return { gates: null, gate_timeout: null };
+  }
+  const gate_timeout = opts['gate-timeout'] !== undefined
+    ? resolveGateTimeout(opts)
+    : (explicit === null && inherited?.gate_timeout) || DEFAULT_GATE_TIMEOUT;
+  return { gates, gate_timeout };
+}
+
+/** Fase 2 item 3: one line telling the worker the companion itself runs the
+ *  declared gate(s) after the run finishes, so the worker should not spend
+ *  its own time budget on them. Same placeholder mechanism as
+ *  gateAuthorizationPrompt/{{GATE_AUTHORIZATION}} below — empty when no
+ *  gates are declared, so an ordinary run renders byte-identical to before
+ *  this existed. */
+function companionGatesPrompt(gates) {
+  if (!gates?.length) return '';
+  const commands = gates.map((g) => `\`${g.command}\``).join(', ');
+  const pronoun = gates.length > 1 ? 'them' : 'it';
+  return ` After you finish, the companion runs ${commands} and reports the result — do not run ${pronoun} yourself.`;
+}
+
+/** "60m" -> "60 minutes", "2h" -> "2 hours", "45s" -> "45 seconds" — mirrors
+ *  durationToMs's own (\d+(\.\d+)?)(ms|s|m|h) shape so the words in the
+ *  prompt always agree with the timeout actually enforced. Falls back to the
+ *  raw string rather than guessing when it doesn't parse. */
+function humanTimeBudget(duration) {
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(duration || '');
+  if (!m) return duration || 'a limited amount of time';
+  const n = parseFloat(m[1]);
+  const units = {
+    ms: ['millisecond', 'milliseconds'],
+    s: ['second', 'seconds'],
+    m: ['minute', 'minutes'],
+    h: ['hour', 'hours'],
+  }[m[2]];
+  return `${m[1]} ${n === 1 ? units[0] : units[1]}`;
+}
+
+/** The Decision discipline section's one-line acknowledgment when the caller
+ *  passed --allow-gate for a task that actually orders one — silent
+ *  otherwise, so a run without the flag (or without a detected order) leaves
+ *  the section byte-identical to before this existed. */
+function gateAuthorizationPrompt(task, allowGate) {
+  if (!allowGate) return '';
+  const hit = detectGateOrder(task);
+  if (!hit.found) return '';
+  return ` The caller authorized running: ${hit.command}.`;
+}
+
 function buildPrompt(mode, opts) {
   const task = taskText(opts);
   const context = gatherContext();
@@ -1374,6 +1745,9 @@ function buildPrompt(mode, opts) {
     CONTEXT: context,
     WORKSPACE: mode === 'implement' ? dirtyWorkspacePrompt() : '',
     DELIVERY: mode === 'implement' ? deliveryAuthorizationPrompt(opts) : '',
+    TIME_BUDGET: mode === 'implement' ? humanTimeBudget(opts.timeout) : '',
+    GATE_AUTHORIZATION: mode === 'implement' ? gateAuthorizationPrompt(task, opts.allowGate) : '',
+    COMPANION_GATES: mode === 'implement' ? companionGatesPrompt(opts.gates) : '',
   });
 }
 
@@ -1825,6 +2199,12 @@ async function executeRun(resolved, prompt, opts, execution = null) {
   const runHeadBefore = resolved.mode === 'ask' ? null : headSnapshot();
   const implementBefore = implementGuardApplies(resolved) ? workspaceBefore : null;
   const treeBefore = treeReportApplies(resolved) ? workspaceBefore : null;
+  // Fase 2 item 3: same side channel as opts.telemetry/opts.warnings below —
+  // workerMain needs these before/after readings again if a companion gate
+  // fails after the agent's own run already completed successfully, and this
+  // is the one place they exist without a second git call.
+  opts.runWorkspaceBefore = workspaceBefore;
+  opts.runHeadBefore = runHeadBefore;
 
   const invoke = {
     prompt,
@@ -1949,6 +2329,9 @@ async function executeRun(resolved, prompt, opts, execution = null) {
 async function cmdRun(mode, opts) {
   const task = taskText(opts); // Resolve prompt-file/stdin in the caller's cwd.
   const resolved = resolveRun(mode, opts);
+  // Fase 2 item 2: refuse before any worker discovery/dispatch happens — no
+  // job registered, no agy call, nothing to undo.
+  checkGateOrder(mode, task, resolved.allowGate);
   // A direct mode continuation (`research --continue`) reaches this path too.
   // Feed its resolved conversation affinity back into the selector; otherwise
   // it would silently fall back to AGY_BIN instead of its original worker.
@@ -1959,7 +2342,7 @@ async function cmdRun(mode, opts) {
     enterOriginalWorkspace(prior.cwd);
     if (prior.spec_file) { try { opts.json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
   }
-  const prompt = buildPrompt(mode, { prompt: task, deliver: opts.deliver });
+  const prompt = buildPrompt(mode, { prompt: task, deliver: opts.deliver, timeout: resolved.timeout, allowGate: resolved.allowGate, gates: resolved.gates });
   return dispatch(resolved, prompt, { ...opts, workerPlan, promptSource: { kind: 'template', task } });
 }
 
@@ -1991,6 +2374,10 @@ async function dispatch(resolved, prompt, opts) {
     model: resolved.model, profile: resolved.profile, profileSource: resolved.profileSource,
     timeout: resolved.timeout, conversation_id: resolved.conversation || null,
     worker: null,
+    // Fase 2 item 3: persisted on the job record (not just the spec file) so
+    // a later continue/restart can inherit them the same way it inherits
+    // model/profile — see resolveGates.
+    gates: resolved.gates || null, gate_timeout: resolved.gate_timeout || null,
     parent_job_id: opts.parentJobId || resolved.parentJobId || null,
     started_at: new Date().toISOString(), log_file: logFile, result_file: resultFile,
     spec_file: specFile,
@@ -2003,7 +2390,15 @@ async function dispatch(resolved, prompt, opts) {
     // registration lock, before accepting the job or writing its prompt file.
     refuseRunningFollowUp(state, resolved.conversation);
     resolved.worker = takeWorker(opts.workerPlan, state, record);
-    fs.writeFileSync(specFile, JSON.stringify({ resolved, prompt, prompt_source: opts.promptSource || null, opts: { json: !!opts.json }, cwd: process.cwd() }, null, 2));
+    fs.writeFileSync(specFile, JSON.stringify({
+      resolved, prompt, prompt_source: opts.promptSource || null, opts: { json: !!opts.json },
+      // Fase 2 item 1: which Decision discipline wording (if any) this prompt
+      // was rendered under, so a future migration can tell a pre-policy spec
+      // apart from one already on the current template. null on every mode
+      // but implement — nothing to version elsewhere.
+      policy_version: mode === 'implement' ? IMPLEMENT_POLICY_VERSION : null,
+      cwd: process.cwd(),
+    }, null, 2));
   });
   fs.appendFileSync(logFile, `[agy-staff] dispatch registered ${jobId} at ${record.started_at}\n`);
 
@@ -2038,6 +2433,140 @@ async function dispatch(resolved, prompt, opts) {
       `(one background wait per job; exit 0 = result printed, 2 = still running — wait again for the same job, without extra progress checks).\n` +
       `Progress only if the user asks: \`observe ${jobId}\`   Stop: \`cancel ${jobId}\`\n`
   );
+}
+
+// ---------------------------------------------------------------------------
+// gate execution (Fase 2, item 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs one companion gate command to completion, or until `timeoutMs`
+ * elapses, or `signal` aborts (job cancel) — whichever comes first — and
+ * kills the whole process tree either way. Mirrors runStreaming()'s own
+ * lifecycle in stream-worker.mjs: `shell: true` so a config command like
+ * `pnpm check` needs no argv splitting, `detached` so the command (and
+ * whatever it forks — a shell test runner, a bundler) lands in its own
+ * process group/session, and the same processTable/tree/stopExecution
+ * helpers agy's own process uses for cross-platform tree cleanup (POSIX
+ * process groups; Windows via PowerShell's CIM process table and
+ * `taskkill /PID <pid> /F`, never `/T` — see stream-worker.mjs). Always
+ * reaps descendants on the way out, not only on timeout/cancel: a gate
+ * command can leave background children running after its own shell exits.
+ */
+async function runGateCommand({ name, command, cwd, timeoutMs, signal }) {
+  const startedAt = Date.now();
+  let root, trackingTimer, timeoutTimer, stopping = null, timedOut = false, canceled = false, output = '';
+  const tracked = new Map();
+  const child = spawn(command, {
+    cwd, shell: true, detached: process.platform !== 'win32', windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const append = (chunk) => { output = excerpt(output + chunk.toString('utf8'), 8192, true).text; };
+  child.stdout.on('data', append);
+  child.stderr.on('data', append);
+  const track = () => {
+    const rows = processTable();
+    if (!rows) return; // unavailable inspection is not evidence of exit
+    if (!root) root = rows.find((row) => row.pid === child.pid);
+    if (root) for (const row of tree(root.pid, rows)) tracked.set(row.pid, row);
+  };
+  track();
+  trackingTimer = setInterval(track, 1000);
+  const cleanup = async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    await stopExecution(root, [...tracked.values()]);
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  };
+  const stop = (why) => {
+    if (why === 'timeout') timedOut = true;
+    if (why === 'canceled') canceled = true;
+    if (stopping) return stopping;
+    clearInterval(trackingTimer);
+    track();
+    stopping = cleanup();
+    return stopping;
+  };
+  const onAbort = () => stop('canceled');
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) stop('canceled');
+  timeoutTimer = setTimeout(() => stop('timeout'), Math.max(0, timeoutMs));
+
+  let exitCode = null, spawnError = null;
+  await new Promise((resolve) => {
+    child.once('error', (error) => { spawnError = error; resolve(); });
+    child.once('exit', (code) => { exitCode = code; resolve(); });
+  });
+  clearTimeout(timeoutTimer);
+  // Reap remaining members even on a normal exit — the gate's own shell can
+  // have exited while a child it forked is still running.
+  if (stopping) await stopping;
+  else { track(); stopping = cleanup(); await stopping; }
+  clearInterval(trackingTimer);
+  signal?.removeEventListener('abort', onAbort);
+  if (spawnError) output = `${output}\n[gate spawn error: ${spawnError.message}]`.trim();
+  return { name, command, exit: exitCode, timed_out: timedOut, canceled, duration_ms: Date.now() - startedAt, output };
+}
+
+/** Runs every declared gate in order, stopping at the first failure/timeout
+ *  (a later gate never starts). Publishes `verifying_gate` on the job record
+ *  before each one starts, so status/observe/wait --follow can show which
+ *  gate is currently running while the job's own `status` field stays
+ *  'running' throughout (see the `phase: 'verifying'` set by the caller). */
+async function runDeclaredGates(gates, gateTimeout, cwd, jobId, signal) {
+  const timeoutMs = durationToMs(gateTimeout) || durationToMs(DEFAULT_GATE_TIMEOUT);
+  const results = [];
+  let allPassed = true;
+  for (const gate of gates) {
+    if (signal.aborted) break;
+    updateJob(jobId, { verifying_gate: gate.name });
+    const result = await runGateCommand({ name: gate.name, command: gate.command, cwd, timeoutMs, signal });
+    results.push(result);
+    if (signal.aborted || result.exit !== 0 || result.timed_out) { allPassed = false; break; }
+  }
+  return { results, allPassed };
+}
+
+function gateResultLine(r) {
+  if (r.canceled) return 'canceled';
+  if (r.timed_out) return `timed out after ${fmtDuration(r.duration_ms / 1000)}`;
+  if (r.exit === 0) return 'passed (exit 0)';
+  if (r.exit === null) return 'failed (process error — see output)';
+  return `failed (exit ${r.exit})`;
+}
+
+/** `## Companion verification` — per gate: name, command, exit/timeout
+ *  verdict, duration, and a bounded output tail (stdout+stderr merged,
+ *  capped at 8 KiB by runGateCommand as it streams). Placed before
+ *  `## Partial work`/diagnostics by the caller. */
+function companionVerificationSection(results) {
+  const lines = ['## Companion verification'];
+  for (const r of results) {
+    lines.push(
+      '', `### ${r.name}`, `- Command: \`${r.command}\``,
+      `- Result: ${gateResultLine(r)}`, `- Duration: ${fmtDuration(r.duration_ms / 1000)}`,
+      '- Output (tail):', '```text', (r.output || '').trim() || '(no output)', '```'
+    );
+  }
+  return lines.join('\n') + '\n';
+}
+
+/** Slim, durable shape for the job record/report: {name, command, exit,
+ *  timed_out, duration_ms} — the full output tail lives only in the
+ *  `## Companion verification` report text, not in state.json. */
+function gateResultSummary(results) {
+  return results.map(({ name, command, exit, timed_out, duration_ms }) => ({ name, command, exit, timed_out, duration_ms }));
+}
+
+/** Same recovery shape as timeoutRecovery/quotaRecovery/
+ *  pendingVerificationRecovery, for a job that ended gate_failed. */
+function gateFailedRecovery(job) {
+  return {
+    inspect: 'git status --short; git diff; git diff --cached', spec_file: job.spec_file || null,
+    gate_results: job.gate_results || null,
+    continue: job.conversation_id ? `continue --job ${job.id} --prompt "Continue after inspecting the gate failure output"` : null,
+    restart: `restart ${job.id}`,
+    note: 'Fix and re-run the gate yourself, or continue --job with the failure output.',
+  };
 }
 
 async function workerMain(jobId) {
@@ -2094,13 +2623,51 @@ async function workerMain(jobId) {
     // verificationGuardApplies): the worker's own report admits a
     // verification — a build, a test suite — is still in flight.
     const telemetry = opts.telemetry || {};
-    job = finishJob(jobId, output + '\n', opts.implementNoop
+    let outcome = opts.implementNoop
       ? { status: 'attention', reason: 'implement_no_changes', warnings: opts.warnings, ...telemetry }
       : opts.implementUncommitted
         ? { status: 'attention', reason: 'implement_uncommitted', warnings: opts.warnings, ...telemetry }
         : opts.pendingVerification?.incomplete
           ? { status: 'attention', reason: 'verification_incomplete', warnings: opts.warnings, pending_evidence: opts.pendingVerification.evidence, ...telemetry }
-          : { status: 'done', warnings: opts.warnings, ...telemetry });
+          : { status: 'done', warnings: opts.warnings, ...telemetry };
+    let finalOutput = output;
+
+    // Fase 2 item 3: companion-run gates, only for the two outcomes above
+    // that mean the worker actually finished its work — a true no-op
+    // (implement_no_changes) or an undelivered commit (implement_uncommitted)
+    // has nothing to verify yet, so gates never run for those. Every other
+    // terminal state (quota_exhausted, error, timeout, hard_timeout,
+    // canceled) is reached through the catch block below instead — this
+    // whole branch is unreachable for them, so no separate exclusion check
+    // is needed here.
+    const gates = spec.resolved.gates;
+    if (gates?.length && (outcome.status === 'done' || outcome.reason === 'verification_incomplete')) {
+      updateJob(jobId, { phase: 'verifying' });
+      const { results, allPassed } = await runDeclaredGates(gates, spec.resolved.gate_timeout, job.cwd, jobId, controller.signal);
+      if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
+      const section = companionVerificationSection(results);
+      const summary = gateResultSummary(results);
+      if (allPassed) {
+        // A passing declared gate is stronger evidence than the worker's own
+        // "still pending" sentence — verification_incomplete becomes done too.
+        const supersedeNote = outcome.reason === 'verification_incomplete'
+          ? 'Note: the worker reported a verification still pending, but the declared gate(s) below passed — ' +
+            'that pending claim is superseded, and this job is delivered as done.\n\n'
+          : '';
+        outcome = { status: 'done', warnings: opts.warnings, ...telemetry, gate_results: summary };
+        finalOutput = `${supersedeNote}${output}\n${section}`;
+      } else {
+        outcome = { status: 'attention', reason: 'gate_failed', warnings: true, ...telemetry, gate_results: summary };
+        const partial = partialWorkReport({
+          status: 'attention', reason: 'gate_failed',
+          beforeLines: opts.runWorkspaceBefore ?? null, afterLines: porcelainSnapshot(),
+          headBefore: opts.runHeadBefore ?? null, headAfter: headSnapshot(), finished: true,
+        });
+        finalOutput = `Job needs attention: a companion verification gate failed.\n\n${output}\n${section}\n${partial}`;
+      }
+    }
+
+    job = finishJob(jobId, finalOutput + '\n', outcome);
     if (job.status === 'done' && !job.warnings) {
       for (const file of [job.events_file, job.progress_file]) {
         try { fs.unlinkSync(file); } catch (error) { process.stderr.write(`cleanup: ${error.message}\n`); }
@@ -2392,12 +2959,22 @@ async function cmdWait(opts) {
   // already terminal is collected exactly as it was pre-follow (see the
   // follower's own comment on why no history is replayed either way).
   const pump = opts.follow && status === 'running' ? createEventsFollower(job.events_file) : null;
+  // Fase 2 item 3: tracks the last (phase, gate) pair --follow already
+  // announced, so a companion gate's own progress gets the same one-line-
+  // per-transition treatment as followRenderLine's tool steps, instead of
+  // being invisible on stderr while a gate runs (the job's own events file
+  // has nothing about it — that stream is agy's, not the companion's).
+  let followedGate;
   while (status === 'running' && Date.now() - start < budget) {
     await sleepMs(Math.min(POLL_MS, budget - (Date.now() - start)));
     job = findJob();
     if (!job) die(`job record disappeared from state.json`);
     status = liveJobStatus(job);
     if (pump) pump();
+    if (opts.follow && job.phase === 'verifying' && job.verifying_gate !== followedGate) {
+      followedGate = job.verifying_gate;
+      process.stderr.write(`   ▶ verifying: running gate ${followedGate}\n`);
+    }
   }
 
   return renderJobResponse(job, { waitNotice: true });
@@ -2413,7 +2990,13 @@ function findJob(id) {
 function readObservation(job) {
   let snapshot = { recent_activities: [], latest_text: null, last_event_at: null, warnings: ['No activity record is available for this job.'] };
   try { snapshot = JSON.parse(fs.readFileSync(job.progress_file, 'utf8')); } catch {}
-  return boundSnapshot({ ...snapshot, job_id: job.id, mode: job.mode, status: liveJobStatus(job), worker: job.worker || null,
+  return boundSnapshot({ ...snapshot, job_id: job.id, mode: job.mode, status: liveJobStatus(job),
+    // Fase 2 item 3: while a job's own `status` stays 'running' throughout
+    // gate execution, `phase`/`verifying_gate` say a companion gate is
+    // running now, and which one — see workerMain's `updateJob(jobId,
+    // {phase: 'verifying'})` and per-gate `verifying_gate` update.
+    phase: job.phase || null, verifying_gate: job.verifying_gate || null,
+    worker: job.worker || null,
     started_at: job.started_at, observed_at: new Date().toISOString(),
     elapsed_seconds: Math.max(0, Math.round((Date.now() - Date.parse(job.started_at)) / 1000)),
     details: { raw_output: job.events_file || null, diagnostics: job.log_file, result: job.result_file },
@@ -2484,6 +3067,7 @@ function diagnosticPacket(job) {
     resets_in: job.resets_in || null,
     recovery: job.reason === 'quota_exhausted' ? quotaRecovery(job)
       : job.reason === 'verification_incomplete' ? pendingVerificationRecovery(job)
+      : job.reason === 'gate_failed' ? gateFailedRecovery(job)
       : isTimeoutReason(job.reason) ? timeoutRecovery(job) : { inspect: 'git status --short; git diff', spec_file: job.spec_file || null,
       continue: job.conversation_id ? `continue --job ${job.id} --prompt "Continue after inspecting partial workspace changes"` : null,
       restart: `restart ${job.id}`, note: 'Inspect partial workspace changes first. Recovery creates a linked new job with a fresh budget; nothing is retried automatically.' },
@@ -2527,6 +3111,7 @@ function readTerminalObservation(job, status) {
       summary: status === 'quota_exhausted'
         ? `Quota exhausted${resetsIn ? ` — resets in ${resetsIn}` : ' (reset time not reported)'}; switch to another worker/model with headroom or wait for the reset.`
         : reason === 'verification_incomplete' ? 'The worker\'s own report admits a pending verification; run it yourself before accepting this work.'
+        : reason === 'gate_failed' ? 'A companion verification gate failed or timed out; inspect the gate output before accepting this work.'
         : status === 'attention' ? 'Timeout with a resumable conversation; ask the user whether to continue.'
         : reason === 'hard_timeout' ? 'Execution stopped at its hard limit.' : `Job ${status}; inspect the retained report and diagnostics.`,
       conversation_id: job.conversation_id || null, model: job.model || null, profile: job.profile || null,
@@ -2698,10 +3283,19 @@ async function cmdContinue(opts) {
   if (!task) die('continue needs follow-up text');
   enterOriginalWorkspace(prior?.cwd);
   const resolved = resolveRun(mode, { ...opts, conversation }, prior);
+  // Fase 2 item 2: a follow-up can order a gate just as easily as the
+  // original task, and it gets its own fresh authorization — allowGate here
+  // reflects this call's own --allow-gate, not whatever the original run had.
+  checkGateOrder(mode, task, resolved.allowGate);
   warnIfContinuingIntoQuota(prior, resolved.model);
   const workerPlan = await planWorker(opts, prior);
   const workspace = mode === 'implement' ? dirtyWorkspacePrompt() : '';
-  const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}`;
+  // Fase 2 item 3: this follow-up's own template-free prompt gets the same
+  // one-line note buildPrompt's {{COMPANION_GATES}} injects for a fresh
+  // implement dispatch — resolved.gates already carries this call's
+  // resolution (explicit or inherited; see resolveGates via resolveRun above).
+  const gatesNote = resolved.gates?.length ? `\n\n${companionGatesPrompt(resolved.gates).trim()}` : '';
+  const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}${gatesNote}`;
   let json = opts.json;
   if (prior?.spec_file) { try { json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
   return dispatch(resolved, prompt, { ...opts, json, workerPlan, parentJobId: prior?.id, promptSource: { kind: 'followup', task } });
@@ -2715,6 +3309,25 @@ async function cmdRestart(opts) {
   const spec = JSON.parse(fs.readFileSync(job.spec_file, 'utf8'));
   enterOriginalWorkspace(spec.cwd);
   const resolved = { ...spec.resolved, conversation: null, timeout: DEFAULTS.timeout[job.mode] };
+  // Rebuild saved task sources with fresh context. For legacy prompts, label
+  // historical snapshots and append current facts without parsing task text.
+  // Computed early (before any worker discovery) so the gate check below can
+  // run before anything that might touch agy.
+  const source = spec.prompt_source || { kind: 'legacy', text: spec.prompt };
+  // Fase 2 item 2: restart replays the ORIGINAL task, so it needs the same
+  // check — a spec written before this guard existed has no `allowGate`
+  // field (undefined -> false) and must still be checked, not grandfathered
+  // in. --allow-gate on the restart call itself can (re-)authorize it.
+  resolved.allowGate = !!(resolved.allowGate || opts['allow-gate']);
+  // Fase 2 item 3: same inherit-unless-overridden shape as allowGate above —
+  // resolved.gates/.gate_timeout already carry the original job's gates via
+  // the `...spec.resolved` spread; explicit --gate/--gate-cmd/--gate-timeout
+  // on this restart call replace them, looked up fresh against the current
+  // gates config.
+  const gateResolution = resolveGates(opts, resolved);
+  resolved.gates = gateResolution.gates;
+  resolved.gate_timeout = gateResolution.gate_timeout;
+  checkGateOrder(job.mode, source.task ?? source.text ?? '', resolved.allowGate);
   // restart has no --model of its own (see FLAG_SCOPE: `model` does not list
   // `restart`), so it always reuses the original job's model — the warning
   // only needs to check the job's own status/window (Fase 1, item 7).
@@ -2723,15 +3336,13 @@ async function cmdRestart(opts) {
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;
   }
-  // Rebuild saved task sources with fresh context. For legacy prompts, label
-  // historical snapshots and append current facts without parsing task text.
-  const source = spec.prompt_source || { kind: 'legacy', text: spec.prompt };
+  const gatesNote = resolved.gates?.length ? companionGatesPrompt(resolved.gates).trim() : '';
   let prompt;
-  if (source.kind === 'template') prompt = buildPrompt(job.mode, { prompt: source.task });
-  else if (source.kind === 'followup') prompt = `${job.mode === 'implement' ? dirtyWorkspacePrompt() + '\n\n' : ''}Follow-up task in a fresh conversation:\n\n${source.task}`;
+  if (source.kind === 'template') prompt = buildPrompt(job.mode, { prompt: source.task, timeout: resolved.timeout, allowGate: resolved.allowGate, gates: resolved.gates });
+  else if (source.kind === 'followup') prompt = `${job.mode === 'implement' ? dirtyWorkspacePrompt() + '\n\n' : ''}Follow-up task in a fresh conversation:\n\n${source.task}${gatesNote ? `\n\n${gatesNote}` : ''}`;
   else {
     const current = `${gatherContext()}\n\n${job.mode === 'implement' ? dirtyWorkspacePrompt() || 'Working tree is currently clean.' : ''}`;
-    prompt = `Restart the original task below. Its embedded workspace/environment snapshots are historical. Use the current workspace section at the end for this execution; preserve existing partial work.\n\n${source.text}\n\n## Current workspace for this restart\n\n${current}`;
+    prompt = `Restart the original task below. Its embedded workspace/environment snapshots are historical. Use the current workspace section at the end for this execution; preserve existing partial work.\n\n${source.text}\n\n## Current workspace for this restart\n\n${current}${gatesNote ? `\n\n${gatesNote}` : ''}`;
   }
   return dispatch(resolved, prompt, { ...spec.opts, workerPlan, parentJobId: job.id, promptSource: source });
 }

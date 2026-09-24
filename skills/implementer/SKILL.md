@@ -40,6 +40,21 @@ The command returns a job id. Read `../jobs/SKILL.md` for result collection and 
 - `--restricted` / `--unrestricted` — permission profile. implement defaults to unrestricted, so it works out of the box with no setup. `--restricted` is the opt-in hardening path: agy may then only use allowlisted tools, so it can usually only propose rather than edit, and it needs the setup flow's evidence-gathering allowlist to be useful.
 - `--continue` (or `--conversation <id>`), `--model <id>` / `--effort low|medium|high` (default `gemini-3.8-flash-high`; when to override: `../jobs/references/model-routing.md`), `--timeout <dur>` (default 60m, maximum 120m hard execution limit).
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the task, from exactly one of these three sources. Use file/stdin for long prompts.
+- `--gate <names>` / `--gate-cmd <cmd>` / `--gate-timeout <dur>` / `--allow-gate` — see "Don't brief agy to run its own gate" below.
+
+## Don't brief agy to run its own gate
+
+Never order a full build/test/lint/typecheck baseline in the briefing (e.g. "run `pnpm check` and `pnpm build` to confirm the state of the project") — a briefing like that refuses **before dispatch** (exit 1, no job, no agy call), because the worker has burned entire runs on the gate instead of the task. Targeted tests for what you changed are fine in the briefing (`pnpm test src/x.test.ts`, `pytest tests/x.py -k foo`, `go test ./pkg/...`).
+
+To prove the result instead, declare a gate for the COMPANION to run after the worker reports done — it doesn't eat into the agent's own time budget:
+
+```json
+{"gates": {"check": "pnpm check", "build": "pnpm build"}}
+```
+
+in `.agy-staff/config.json`, then dispatch with `--gate check,build`. A failing or timed-out gate ends the job `attention`/`gate_failed`; a passing gate turns even a worker's own `verification_incomplete` into `done`. Use `--gate-cmd "<cmd>"` for a one-off command with no config entry.
+
+Only pass `--allow-gate` when the user explicitly wants agy itself to run the gate inside its own run (it authorizes a detected order instead of refusing it) — prefer `--gate` so the companion verifies the result independently.
 
 ## Rules
 

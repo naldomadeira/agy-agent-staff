@@ -53,3 +53,5 @@ variable) rather than the setup gap it actually is. Copy it in when creating the
 example `cp <repo>/.env <worktree>/.env`, before dispatching a job into it.
 
 Completion means the companion reports the selected worker, affinity, and each job's result; the lead still reviews and integrates all outputs.
+
+An `implement` worker's `--gate <names>` still resolves: a pool worktree normally has no `.agy-staff/config.json` of its own (also git-ignored), so the lookup falls back to the main worktree's config when the current one has no `gates`.

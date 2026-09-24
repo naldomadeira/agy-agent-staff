@@ -377,3 +377,38 @@ describe('canonical skills document the Fase 1 result-truthing surface', () => {
     assert.match(troubleshooting, /sandbox blocks them/);
   });
 });
+
+describe('canonical skills document the Fase 2 gate surface', () => {
+  test('jobs documents gate_failed and the verifying phase', () => {
+    const jobs = skillText('jobs');
+    assert.match(jobs, /gate_failed/);
+    assert.match(jobs, /--gate\b/);
+    assert.match(jobs, /--allow-gate/);
+    assert.match(jobs, /verifying/);
+  });
+
+  test('implementer tells the briefer to declare --gate instead of ordering a full gate', () => {
+    const implementer = skillText('implementer');
+    assert.match(implementer, /--gate\b/);
+    assert.match(implementer, /--allow-gate/);
+    assert.match(implementer, /\.agy-staff\/config\.json/);
+  });
+});
+
+describe('docs come in pairs: README/REFERENCE have a pt-BR counterpart', () => {
+  test('README.pt-BR.md and docs/REFERENCE.pt-BR.md exist', () => {
+    assert.ok(
+      fs.existsSync(path.join(ROOT, 'README.pt-BR.md')),
+      'README.pt-BR.md must exist'
+    );
+    assert.ok(
+      fs.existsSync(path.join(ROOT, 'docs', 'REFERENCE.pt-BR.md')),
+      'docs/REFERENCE.pt-BR.md must exist'
+    );
+  });
+
+  test('README.md links README.pt-BR.md', () => {
+    const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+    assert.match(readme, /README\.pt-BR\.md/);
+  });
+});
