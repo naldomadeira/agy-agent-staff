@@ -36,10 +36,15 @@ Default flow: prepare the prompt → dispatch → wait for the final result → 
 | attention — `implement_no_changes` | 5 | A true no-op. Decide whether to retry, reframe the task, or hand it off differently; there is nothing to inventory or commit. |
 | attention — `implement_uncommitted` | 5 | Changes exist but the requested delivery (commit/push/PR) didn't happen. Commit/deliver yourself or inspect (`git status`, `git diff`) before deciding. |
 | attention — `verification_incomplete` | 5 | The worker itself declared a verification still pending. **Run the pending build/test yourself** before accepting the work as done. |
+| attention — `gate_failed` | 5 | A companion-run `--gate`/`--gate-cmd` failed or timed out after the worker finished. Read `## Companion verification` in the report for the command, exit code, and output tail; fix the failure and `continue --job <id>` with the gate output, or inspect and fix it yourself. **Don't accept the work as done.** |
 | `quota_exhausted` | 6 | Switch to another worker or model with headroom (see the `pool` skill's `workers`) or wait for `resets_in`. **Never `continue` on the same model before the reset.** |
 | error / crashed | 3 | Read the report's `## Partial work` section and inspect the diff (`git status`, `git diff`) before any recovery. |
 | canceled | 4 | Read `## Partial work`, inspect the diff, then complete any already-authorized follow-up or report cancellation. |
 | command error | 1 | Quote the error and correct the named problem. |
+
+A job with a declared gate (`--gate`/`--gate-cmd`) that reaches `phase: "verifying"` (visible in `status`/`observe`, and announced on `wait --follow`'s stderr) means the agent itself already finished and the companion is now running the gate command(s) — the job's own `status` is still `running`, still exit 2: keep waiting, the same as any other still-running job.
+
+A `implement`/`continue`/`restart` call can also refuse **before dispatch** with exit 1 (no job created, agy never invoked) when the briefing text orders a full gate itself (an untargeted `pnpm test`, `pnpm build`, `pytest`, etc.) instead of declaring one. The error quotes the offending line; fix it by removing the gate order from the briefing, or by declaring `--gate <name>` (companion runs it after the worker finishes) or `--allow-gate` (authorizes the worker to run it itself).
 
 `done` describes invocation and response delivery, not task acceptance. Preserve agy-cli response text and diagnostics; a nonempty response may only acknowledge launched background work. Successful calls with warnings include a bounded log tail on stderr and a full-log pointer. A terminal job's header also carries a `Usage:` line (in/out/think/cache tokens, duration, turns) when AGY reported telemetry — read it for cost awareness before deciding whether to continue or retry, not as a completion signal. The orchestrator assesses the response and artifacts, uses `observe` or diagnostics if the returned result needs investigation, and decides whether to propose continuation. Keep the recovery confirmation rules below; do not infer timeout from response wording or add routine progress polling.
 

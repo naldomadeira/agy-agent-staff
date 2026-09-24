@@ -54,6 +54,8 @@ example `cp <repo>/.env <worktree>/.env`, before dispatching a job into it.
 
 Completion means the companion reports the selected worker, affinity, and each job's result; the lead still reviews and integrates all outputs.
 
+An `implement` worker's `--gate <names>` still resolves: a pool worktree normally has no `.agy-staff/config.json` of its own (also git-ignored), so the lookup falls back to the main worktree's config when the current one has no `gates`.
+
 ## Host compatibility
 
 When this skill or its referenced instructions require a tool that the current environment does not provide, use available capabilities to achieve an equivalent result. Adapt only the tool-specific execution method; preserve the task goal, authorization requirements, explicit confirmation steps, result delivery, and stopping conditions.
