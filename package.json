@@ -30,7 +30,7 @@
     "scripts/generate-pi-skills.mjs",
     "docs/INSTALL_FOR_AGENTS.md",
     "docs/REFERENCE*.md",
-    "README.zh-CN.md"
+    "README.pt-BR.md"
   ],
   "scripts": {
     "generate:pi": "node scripts/generate-pi-skills.mjs",
