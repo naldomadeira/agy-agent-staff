@@ -4,6 +4,7 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { sandbox, run, agyCalls, jobIdOf, waitForJob, waitForCalls, promptOf } from './helpers.mjs';
 
 describe('removed review flags (--diff-file / --pr / --target)', () => {
@@ -144,7 +145,7 @@ describe('flag scope (generalized)', () => {
   //     is review, so it silently did nothing for staffer/research/
   //     implement/ask.
   //   - --dry-run anywhere but setup: never read by any command at all.
-  const NEEDS_VALUE = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file']);
+  const NEEDS_VALUE = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'gate', 'gate-cmd', 'gate-timeout']);
   const rejectedPairs = [
     ['model', 'status', []],
     ['model', 'restart', ['fake-job']],
@@ -174,6 +175,14 @@ describe('flag scope (generalized)', () => {
     ['apply', 'wait', []],
     ['dry-run', 'staffer', []],
     ['dry-run', 'review', []],
+    ['allow-gate', 'staffer', []],
+    ['allow-gate', 'status', []],
+    ['gate', 'staffer', []],
+    ['gate', 'status', []],
+    ['gate-cmd', 'research', []],
+    ['gate-cmd', 'wait', []],
+    ['gate-timeout', 'review', []],
+    ['gate-timeout', 'cancel', []],
   ];
 
   for (const [flag, cmd, extraArgs] of rejectedPairs) {
@@ -241,6 +250,26 @@ describe('flag scope (generalized)', () => {
     // The restarted run used the original stored task, not the ignored override.
     assert.equal(promptOf(restartArgv), promptOf(originalArgv));
     assert.doesNotMatch(promptOf(restartArgv), /this value is ignored/);
+  });
+
+  test('implement/continue/restart still accept --allow-gate (reach their own logic, not rejected for scope)', async () => {
+    const sb = sandbox('flagscope-accept-allow-gate');
+    // implement's own postcondition flags a run "attention" when agy reports
+    // success but touched nothing, unrelated to what this test checks (flag
+    // scope) — give it a real delta so the job reaches "done".
+    const started = run(sb, ['implement', '--allow-gate', '--prompt', 'a task'], {
+      FAKE_AGY_TOUCH_FILE: path.join(sb.repo, 'agy-wrote.txt'),
+    });
+    assert.equal(started.code, 0, started.stderr);
+    assert.doesNotMatch(started.stderr, /has no effect on implement/);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+
+    const continued = run(sb, ['continue', '--allow-gate', '--prompt', 'next']);
+    assert.doesNotMatch(continued.stderr, /has no effect on continue/);
+
+    const restarted = run(sb, ['restart', id, '--allow-gate']);
+    assert.doesNotMatch(restarted.stderr, /has no effect on restart/);
   });
 
   test('wait still accepts --timeout (reaches cmdWait, not rejected for scope)', () => {
