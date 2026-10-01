@@ -20,7 +20,14 @@ import { ROOT } from '../scripts/generate-pi-skills.mjs';
 const skillText = name => fs.readFileSync(path.join(ROOT, 'skills', name, 'SKILL.md'), 'utf8');
 
 describe('staffer: the general-purpose mode', () => {
-  test('prompt is minimal: task + environment + guardrails, no role or output framing', async () => {
+  test('template executes directly by default and reports completed and pending artifacts', () => {
+    const template = fs.readFileSync(path.join(ROOT, 'templates', 'staffer.md'), 'utf8');
+    assert.match(template, /Execute the task directly.*by default/s);
+    assert.match(template, /unless the task text above explicitly authorizes subagents/);
+    assert.match(template, /report.*artifacts.*completed.*pending/is);
+  });
+
+  test('prompt is minimal: task, environment, execution guidance and guardrails without a rigid output format', async () => {
     const sb = sandbox('staffer-prompt');
     const r = run(sb, ['staffer', '--prompt', 'do the thing']);
     assert.equal(r.code, 0, r.stderr);
@@ -30,7 +37,7 @@ describe('staffer: the general-purpose mode', () => {
     assert.match(prompt, /## Task\n\ndo the thing/);
     assert.match(prompt, /## Environment/);
     assert.match(prompt, /## Guardrails/);
-    // the whole point of staffer: no template context beyond the guardrails
+    // Staffer stays general-purpose, without a specialist role or rigid report schema.
     assert.doesNotMatch(prompt, /## Rules/);
     assert.doesNotMatch(prompt, /## Output format/);
     assert.doesNotMatch(prompt, /You are/);

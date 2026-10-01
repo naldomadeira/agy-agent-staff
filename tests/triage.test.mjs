@@ -58,6 +58,119 @@ describe('done_with_warnings: non-SUCCESS status with a complete response', () =
   });
 });
 
+describe('authentication failure after a response', () => {
+  test('background job fails and retains the response as unverified partial work', async () => {
+    const sb = sandbox('auth-partial-bg');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'draft saved before authentication expired',
+      FAKE_AGY_ERROR: 'UNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /UNAUTHENTICATED \(code 401\)/);
+    assert.match(result.stdout, /draft saved before authentication expired/);
+    assert.match(result.stdout, /unverified partial response/i);
+    assert.match(result.stdout, /check the current session/i);
+    assert.match(result.stdout, /## Partial work/);
+    assert.doesNotMatch(result.stdout, /agy-staff warning: agy reported status ERROR/);
+  });
+
+  test('a successful answer mentioning a 401 remains successful', () => {
+    const sb = sandbox('auth-mentioned-in-answer');
+    const result = run(sb, ['ask', '--prompt', 'summarize an incident'], {
+      FAKE_AGY_RESPONSE: 'The incident included a 401 Unauthorized error.',
+    });
+    assert.equal(result.code, 0, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /401 Unauthorized/);
+  });
+
+  test('a nonzero exit with an authentication error on stderr cannot deliver a response as success', async () => {
+    const sb = sandbox('auth-stderr-bg');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'SUCCESS',
+      FAKE_AGY_RESPONSE: 'draft produced before the CLI failed',
+      FAKE_AGY_STDERR: 'UNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /draft produced before the CLI failed/);
+  });
+
+  test('a recovered 401 in stderr does not override a different final failure', async () => {
+    const sb = sandbox('auth-stderr-historical');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'partial answer for caller assessment',
+      FAKE_AGY_ERROR: 'final network failure',
+      FAKE_AGY_STDERR: 'tool attempt: UNAUTHENTICATED (code 401), recovered\nfinal network failure',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 0, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /partial answer for caller assessment/);
+  });
+
+  test('a terminal stderr 401 preserves both its evidence and a generic payload error', async () => {
+    const sb = sandbox('auth-stderr-evidence');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'unverified draft',
+      FAKE_AGY_ERROR: 'request failed',
+      FAKE_AGY_STDERR: 'UNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /request failed/);
+    assert.match(result.stdout, /UNAUTHENTICATED \(code 401\)/);
+  });
+
+  test('a terminal 401 remains visible before a cleanup line', async () => {
+    const sb = sandbox('auth-stderr-cleanup');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'unverified draft',
+      FAKE_AGY_ERROR: 'request failed',
+      FAKE_AGY_STDERR: 'UNAUTHENTICATED (code 401): OAuth token expired\ncleanup complete',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /UNAUTHENTICATED \(code 401\)/);
+  });
+
+  test('a prior quota error does not hide the final authentication failure', async () => {
+    const sb = sandbox('auth-after-quota');
+    const started = run(sb, ['research', '--prompt', 'a topic'], {
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'unverified draft',
+      FAKE_AGY_ERROR: 'UNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_STDERR: 'RESOURCE_EXHAUSTED (code 429), recovered\nUNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_EXIT: '1',
+    });
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /"reason": "auth_failed"/);
+    assert.doesNotMatch(result.stdout, /Quota exhausted:/);
+  });
+});
+
 describe('cause hints are conditional on the error text', () => {
   test('an unrelated error (tool timeout) gets no model/auth/quota hint', () => {
     const sb = sandbox('triage-hint-none');

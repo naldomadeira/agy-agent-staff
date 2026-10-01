@@ -250,6 +250,21 @@ describe('wait', () => {
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, new RegExp(`# Job ${id} `));
   });
+
+  test('a job dispatched in another repository is unknown here and remains collectible there', async () => {
+    const source = sandbox('wait-source-repo');
+    const other = sandbox('wait-other-repo');
+    const started = run(source, ['research', '--prompt', 'a topic']);
+    const id = jobIdOf(started.stdout);
+
+    const misplaced = run(other, ['wait', id]);
+    assert.equal(misplaced.code, 1, `${misplaced.stdout}${misplaced.stderr}`);
+    assert.match(misplaced.stderr, new RegExp(`no job ${id} in this repository`));
+
+    const collected = run(source, ['wait', id]);
+    assert.equal(collected.code, 0, `${collected.stdout}${collected.stderr}`);
+    assert.match(collected.stdout, new RegExp(`# Job ${id} `));
+  });
 });
 
 describe('wait --follow', () => {

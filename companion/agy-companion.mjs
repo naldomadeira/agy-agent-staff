@@ -1163,11 +1163,19 @@ function quotaExhaustedMessage({ model, resetsIn, response }) {
   return msg;
 }
 
+/** Ignore cleanup/stack lines after the final diagnostic, and earlier errors
+ * that AGY recovered from before reporting a different terminal failure. */
+function terminalDiagnosticLine(stderr) {
+  const lines = String(stderr || '').trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.findLast((line) => /UNAUTHENTICATED|401 Unauthorized|code 401|OAuth token expired|RESOURCE_EXHAUSTED|code 429|quota exceeded|rate.?limit|\berror\b|fail|timeout|closed unexpectedly|network/i.test(line) && !/\brecovered\b/i.test(line)) || lines.at(-1) || '';
+}
+
 /** Triage the agy result into distinct classes with distinct guidance
  *  (never cross-suggested), or return the response text on success.
  *  1. status ERROR / nonzero exit, but response text came back
- *     → return the text (exit 0) and put diagnostics on stderr.
- *       The orchestrator judges task completion; nonempty text is not proof.
+ *     → classify terminal auth/quota errors first; otherwise return the text
+ *       (exit 0) and put diagnostics on stderr. The orchestrator judges task
+ *       completion; nonempty text is not proof.
  *  2. status ERROR / nonzero exit, no response
  *     → agy's own error verbatim; NEVER suggest --unrestricted. Cause
  *       hints are appended only when the error text actually matches them.
@@ -1192,10 +1200,18 @@ function triageResult({ payload, stderr, exit }, mode, profile, profileSource, r
   }
 
   if ((status && status !== 'SUCCESS') || exit !== 0) {
+    const terminalStderr = terminalDiagnosticLine(stderr);
+    const authFailure = /(?:UNAUTHENTICATED|\b401\b|\b403\b|OAuth token expired|invalid credentials)/i.test(String(payload.error || '')) ||
+      /(?:UNAUTHENTICATED|401 Unauthorized|code 401|OAuth token expired)/i.test(terminalStderr);
+    if (authFailure) {
+      const partial = response ? `\n\nUnverified partial response received before the authentication error:\n\n${response}` : '';
+      const evidence = [payload.error, terminalStderr].filter(Boolean).join('\nagy stderr: ');
+      throw Object.assign(new Error(`agy authentication failed: ${evidence}\nLikely cause: expired auth during this run; check the current session with \`agy\` and re-login only if it remains invalid.${partial}`), { reason: 'auth_failed' });
+    }
     // Checked before the response-preserving branch below: a quota error with
     // partial response text must still become quota_exhausted, not
     // done_with_warnings — see classifyTerminalFailure's own comment.
-    const quota = classifyTerminalFailure({ status: payload.status, error: payload.error, stderr });
+    const quota = classifyTerminalFailure({ status: payload.status, error: payload.error, stderr: terminalStderr });
     if (quota) {
       throw Object.assign(
         new Error(quotaExhaustedMessage({ model: requestedModel || DEFAULTS.model[mode], resetsIn: quota.resets_in, response })),
@@ -1230,7 +1246,7 @@ function triageResult({ payload, stderr, exit }, mode, profile, profileSource, r
       hints.push('invalid model id (agy needs effort-suffixed ids, e.g. gemini-3.8-flash-low — run `agy models`)');
     }
     if (/auth|login|credential|unauthorized|401|403/i.test(errText)) {
-      hints.push('expired auth (run `agy` interactively once to re-login)');
+      hints.push('expired auth during this run (check the current session with `agy`; re-login only if it remains invalid)');
     }
     if (/quota|rate.?limit|resource.?exhausted|429/i.test(errText)) {
       hints.push('exhausted quota');
