@@ -2,13 +2,14 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { sandbox, run, jobIdOf, waitForJob, agyCalls, FAKE_AGY } from './helpers.mjs';
 
 function workersFor(sb, count = 2) {
   const bins = [];
   for (let i = 2; i <= count + 1; i++) {
     const bin = path.join(sb.root, `agy${i}`);
-    fs.symlinkSync(path.join(path.dirname(new URL(import.meta.url).pathname), 'fake-agy.mjs'), bin);
+    fs.symlinkSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'fake-agy.mjs'), bin);
     bins.push(bin);
   }
   return bins;
@@ -19,6 +20,18 @@ function state(sb) {
 }
 
 describe('companion worker pool integration', () => {
+  test('a symlink to a Node worker probes and runs without executable permission', async () => {
+    const sb = sandbox('node-worker-link');
+    const script = path.join(sb.root, 'fake-not-executable.mjs');
+    fs.copyFileSync(FAKE_AGY, script);
+    fs.chmodSync(script, 0o644);
+    const bin = path.join(sb.root, 'agy2');
+    fs.symlinkSync(script, bin);
+    const started = run(sb, ['research', '--worker', 'agy2', '--prompt', 'a topic'], { AGY_POOL_BINS: bin });
+    assert.equal(started.code, 0, started.stderr);
+    assert.equal(await waitForJob(sb, jobIdOf(started.stdout)), 'done');
+  });
+
   test('workers command reports configured and discovered workers', () => {
     const sb = sandbox('workers-command');
     const bins = workersFor(sb, 2);

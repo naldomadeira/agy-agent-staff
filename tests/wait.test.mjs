@@ -187,7 +187,7 @@ describe('wait', () => {
     assert.doesNotMatch(r.stdout, /STILL RUNNING/);
   });
 
-  test('2>&1 carries the notice: a caller piping wait without pipefail still sees it', async () => {
+  test('2>&1 carries the notice: a caller piping wait without pipefail still sees it', { skip: process.platform === 'win32' }, async () => {
     const sb = sandbox('wait-expiry-notice-2and1');
     const started = run(sb, ['research', '--prompt', 'a topic'], { FAKE_AGY_SLEEP_MS: '5000' });
     const id = jobIdOf(started.stdout);

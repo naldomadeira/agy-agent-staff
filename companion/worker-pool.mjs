@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import pathModule from 'node:path';
 import os from 'node:os';
+import { agyLaunch } from './agy-launch.mjs';
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_CAPACITY = 1;
@@ -57,6 +58,11 @@ export async function discoverWorkers(options = {}) {
   if (env.AGY_BIN?.trim()) add(env.AGY_BIN.trim());
   for (const bin of splitBins(env.AGY_POOL_BINS)) add(bin);
   for (const bin of DEFAULT_CANDIDATES) add(bin);
+  // Additional local profiles are optional; show them only when present.
+  for (let number = 4; number <= 7; number++) {
+    const name = `agy${number}`;
+    if (lookupOnPath(name, env)) add(name);
+  }
   for (const worker of configured) {
     const key = canonicalBin(worker?.bin, env);
     const existing = key === null ? undefined : bins.find((entry) => entry.key === key);
@@ -291,7 +297,7 @@ async function loadConfig(config) {
  * propósito, para não segurar `discoverWorkers` por um worker parado. Um
  * ENOENT/ENOTDIR/EACCES/EPERM é final: o binário não existe ou não é
  * executável, e mais tempo não muda isso. Um timeout é outra coisa — o
- * wrapper `agy2`..`agy5` arranca Python e provisiona keychain na primeira
+ * wrapper `agy2`..`agy7` arranca Python e provisiona keychain na primeira
  * corrida, e 1500ms passam com facilidade sem que o binário esteja avariado
  * — por isso ganha uma segunda tentativa, mais folgada (`retryTimeoutMs`,
  * 5000ms por omissão). Só se essa segunda tentativa TAMBÉM expirar é que o
@@ -322,7 +328,8 @@ async function probeOnce(bin, { env, timeoutMs, probe }) {
 
 async function execProbeOnce(bin, { env, timeoutMs }) {
   try {
-    const result = await execFileAsync(bin, ['--version'], { env, timeout: timeoutMs, windowsHide: true });
+    const agy = agyLaunch(bin, ['--version']);
+    const result = await execFileAsync(agy.cmd, agy.args, { env, timeout: timeoutMs, windowsHide: true });
     const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
     return { status: 'available', version: output.split(/\r?\n/)[0] || null };
   } catch (error) {
@@ -414,7 +421,7 @@ function slackFrom(data, now) {
   return Math.max(0, Math.min(100, 100 - Math.max(...live)));
 }
 
-/** `agy` is `principal`; `agy2`..`agy5` are `profile2`..`profile5`. Derived
+/** `agy` is `principal`; `agy2`..`agy7` are `profile2`..`profile7`. Derived
  *  from the executable's basename so a worker at a custom path or with a
  *  configured id still resolves, and a name that does not fit the pattern
  *  (e.g. `/opt/agy-primary`) correctly has no quota file to find. */

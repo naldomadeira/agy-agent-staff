@@ -320,10 +320,12 @@ O Windows é suportado em regime de melhor esforço e exercitado pelo job de CI 
 
 ## Atualizando
 
-O Claude Code e o Codex fazem cache do plugin sob um diretório por **versão** (ex.: `cache/agy-staff/agy/0.4.0`) e decidem "está atualizado?" com base nessa string de versão, não no commit. Suba a versão nos manifestos deles e no `package.json` juntos ao preparar um release. A fonte Git do Pi, em vez disso, segue a ref configurada; fontes locais leem o checkout diretamente.
+Um merge no `master` inicia a publicação da próxima versão patch somente após os três jobs de CI passarem. O workflow sincroniza os quatro manifests, cria tag e GitHub Release; um CI vermelho impede a publicação. O merge não atualiza automaticamente caches locais nem reinicia sessões abertas.
+
+O Claude Code e o Codex fazem cache do plugin sob um diretório por **versão** (ex.: `cache/agy-staff/agy/0.4.0`) e decidem "está atualizado?" com base nessa string de versão, não no commit. O workflow sobe a versão nos manifestos deles e no `package.json` juntos. A fonte Git do Pi, em vez disso, segue a ref configurada; fontes locais leem o checkout diretamente.
 
 - **Claude Code** — `claude plugin marketplace update agy-staff` atualiza o clone do marketplace, depois `claude plugin update agy@agy-staff` o recopia para o cache. `install` **não é** o comando de atualização: em um plugin já instalado, ele responde "already installed" e não faz nada, qualquer que seja a versão. E `update` só se move se a string de versão mudou — em uma versão inalterada, ele responde "already at the latest version" e deixa o commit antigo no lugar. Force a entrada do commit atual com `claude plugin uninstall agy@agy-staff && claude plugin install agy@agy-staff`. De qualquer forma, reinicie o Claude Code depois — as skills são registradas no início da sessão.
-- **Codex** — suba a versão, rode `codex plugin marketplace upgrade` (ou remova e adicione de novo a entrada do marketplace), depois reinicie o app.
+- **Codex** — depois da publicação, rode `codex plugin marketplace upgrade` e `codex plugin add agy@agy-staff`, depois reinicie o app.
 - **Pi** — para uma instalação Git sem pin, rode `pi update --extension git:github.com/naldomadeira/agy-agent-staff`, depois `/reload`. Para desenvolvimento local, regenere as skills do Pi (`npm run generate:pi`) e rode `/reload`; nenhum push é necessário.
 
 Você pode conferir qual commit está de fato instalado: o `gitCommitSha` em `~/.claude/plugins/installed_plugins.json`, contra `git -C ~/.claude/plugins/marketplaces/agy-staff log -1` para o que o clone do marketplace buscou.
