@@ -29,7 +29,7 @@ node "<skill-dir>/../../companion/agy-companion.mjs" <staffer|research|review|im
 
 ## Discovery and selection
 
-Workers are discovered by the companion in this order: `AGY_BIN`, entries in `AGY_POOL_BINS`, executable candidates `agy`, `agy2`, `agy3` on `PATH`, then optional `.agy-staff/config.json`. A config may name explicit executables:
+Workers are discovered by the companion in this order: `AGY_BIN`, entries in `AGY_POOL_BINS`, executable candidates `agy`, `agy2`, `agy3` and any installed `agy4` through `agy7` on `PATH`, then optional `.agy-staff/config.json`. `AGY_POOL_BINS` is only needed for extra names or paths outside `PATH`. A config may name explicit executables:
 
 ```json
 {"workers":[

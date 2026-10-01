@@ -83,6 +83,8 @@ Respond in the user's language.
 
 #### Upgrade
 
+Every merge into `master` publishes the next patch version after the consistency, Ubuntu and Windows jobs pass. The workflow creates a version commit, tag and GitHub Release. A failing job prevents publication.
+
 Claude Code and Codex install a *copy*, so a new version only reaches you when you pull it in yourself:
 
 ```bash
@@ -121,7 +123,7 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 
 ### Optional worker pool
 
-Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `$agy:pool workers` (or `/agy:pool workers`) to inspect workers and `--worker <id>` to select one. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, executables `agy`, `agy2`, `agy3` on `PATH`, then optional `.agy-staff/config.json`. Shell aliases and functions are not visible to Node; use executable wrappers or explicit paths. Jobs retain worker affinity across `continue` and `restart`. Every dispatch, status entry, and observation identifies its external AGY worker, which gives Codex and Claude Code the same visible context even though host-native subagent panels cannot represent external processes. Parallel work is for independent tasks; writes require separate worktrees or explicit authorization.
+Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `$agy:pool workers` (or `/agy:pool workers`) to inspect workers and `--worker <id>` to select one. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, executables `agy`, `agy2`, `agy3` and installed `agy4` through `agy7` on `PATH`, then optional `.agy-staff/config.json`. `AGY_POOL_BINS` remains available for extra names or paths outside `PATH`. Shell aliases and functions are not visible to Node; use executable wrappers or explicit paths. Jobs retain worker affinity across `continue` and `restart`. Every dispatch, status entry, and observation identifies its external AGY worker, which gives Codex and Claude Code the same visible context even though host-native subagent panels cannot represent external processes. Parallel work is for independent tasks; writes require separate worktrees or explicit authorization.
 
 `lead` adds task orchestration guidance for your current agent. Within lead, orient enough to frame the assignment, delegate substantive work to `staffer` by default, wait for the result, then assess it and integrate or follow up. Specialists provide dedicated guidance when useful, while `ask` is reserved for testing. The host owns cross-task decisions, acceptance, integration, and delivery, using the existing jobs workflow. Invoke `/agy:lead` in Claude Code, `$agy:lead` in Codex, or `/skill:agy-lead` in Pi.
 

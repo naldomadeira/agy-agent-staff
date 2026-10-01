@@ -320,10 +320,12 @@ Windows is supported on a best-effort basis and exercised by the `Tests (Windows
 
 ## Upgrading
 
-Claude Code and Codex cache the plugin under a per-**version** directory (e.g. `cache/agy-staff/agy/0.4.0`) and key "is it current?" on that version string, not on the commit. Bump their manifests and `package.json` together when preparing a release. Pi's Git source instead follows the configured ref; local sources read the checkout directly.
+After a merge into `master`, the workflow publishes the next patch version only when all three CI jobs pass. It synchronizes the four manifests, creates a tag and publishes a GitHub Release. A failed CI run prevents publication. The merge does not update local plugin caches or restart open sessions.
+
+Claude Code and Codex cache the plugin under a per-**version** directory (e.g. `cache/agy-staff/agy/0.4.0`) and key "is it current?" on that version string, not on the commit. The workflow bumps their manifests and `package.json` together. Pi's Git source instead follows the configured ref; local sources read the checkout directly.
 
 - **Claude Code** — `claude plugin marketplace update agy-staff` refreshes the marketplace clone, then `claude plugin update agy@agy-staff` re-copies it into the cache. `install` is **not** the upgrade command: on an already-installed plugin it answers "already installed" and does nothing, whatever the version. And `update` only moves if the version string changed — on an unchanged version it answers "already at the latest version" and leaves the old commit in place. Force the current commit in with `claude plugin uninstall agy@agy-staff && claude plugin install agy@agy-staff`. Restart Claude Code afterwards either way — skills are registered at session start.
-- **Codex** — bump the version, run `codex plugin marketplace upgrade` (or remove and re-add the marketplace entry), then restart the app.
+- **Codex** — after publication, run `codex plugin marketplace upgrade` and `codex plugin add agy@agy-staff`, then restart the app.
 - **Pi** — for an unpinned Git install, run `pi update --extension git:github.com/naldomadeira/agy-agent-staff`, then `/reload`. For local development, regenerate Pi skills (`npm run generate:pi`) and run `/reload`; no push is needed.
 
 You can check which commit is actually installed: the `gitCommitSha` in `~/.claude/plugins/installed_plugins.json`, versus `git -C ~/.claude/plugins/marketplaces/agy-staff log -1` for what the marketplace clone has fetched.

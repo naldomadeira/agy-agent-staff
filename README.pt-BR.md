@@ -83,6 +83,8 @@ Respond in the user's language.
 
 #### Atualização
 
+Cada merge no `master` publica automaticamente a próxima versão patch depois de passar pelos jobs de consistência, Ubuntu e Windows. A publicação cria um commit de versão, tag e GitHub Release. Se algum job falhar, nenhuma versão nova é publicada.
+
 O Claude Code e o Codex instalam uma *cópia*, então uma nova versão só chega até você quando você mesmo a busca:
 
 ```bash
@@ -121,7 +123,7 @@ O `staffer` também cobre as ferramentas nativas do agy sem um persona especiali
 
 ### Pool de workers opcional
 
-A instalação normal usa um worker: `AGY_BIN || agy`. O pool é opt-in; use `$agy:pool workers` (ou `/agy:pool workers`) para inspecionar os workers e `--worker <id>` para selecionar um. A descoberta verifica `AGY_BIN`, `AGY_POOL_BINS`, os executáveis `agy`, `agy2`, `agy3` no `PATH`, e por fim o `.agy-staff/config.json` opcional. Aliases e funções de shell não são visíveis para o Node; use wrappers executáveis ou caminhos explícitos. Os jobs mantêm afinidade de worker entre `continue` e `restart`. Todo dispatch, entrada de status e observação identifica seu worker AGY externo, o que dá ao Codex e ao Claude Code o mesmo contexto visível mesmo que os painéis de subagente nativos do host não consigam representar processos externos. Trabalho em paralelo é para tarefas independentes; escritas exigem worktrees separadas ou autorização explícita.
+A instalação normal usa um worker: `AGY_BIN || agy`. O pool é opt-in; use `$agy:pool workers` (ou `/agy:pool workers`) para inspecionar os workers e `--worker <id>` para selecionar um. A descoberta verifica `AGY_BIN`, `AGY_POOL_BINS`, os executáveis `agy`, `agy2`, `agy3` e qualquer `agy4` até `agy7` instalado no `PATH`, e por fim o `.agy-staff/config.json` opcional. `AGY_POOL_BINS` continua disponível para nomes extras ou caminhos fora do `PATH`. Aliases e funções de shell não são visíveis para o Node; use wrappers executáveis ou caminhos explícitos. Os jobs mantêm afinidade de worker entre `continue` e `restart`. Todo dispatch, entrada de status e observação identifica seu worker AGY externo, o que dá ao Codex e ao Claude Code o mesmo contexto visível mesmo que os painéis de subagente nativos do host não consigam representar processos externos. Trabalho em paralelo é para tarefas independentes; escritas exigem worktrees separadas ou autorização explícita.
 
 O `lead` adiciona orientação de orquestração de tarefas para o seu agente atual. Dentro do lead, oriente-se o suficiente para enquadrar a atribuição, delegue o trabalho substantivo para o `staffer` por padrão, espere o resultado, depois avalie e integre ou faça o follow-up. Os especialistas fornecem orientação dedicada quando útil, enquanto o `ask` fica reservado para testes. O host é dono das decisões entre tarefas, da aceitação, da integração e da entrega, usando o fluxo de jobs já existente. Invoque `/agy:lead` no Claude Code, `$agy:lead` no Codex, ou `/skill:agy-lead` no Pi.
 

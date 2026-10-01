@@ -56,6 +56,20 @@ test('descobre agy, agy2 e agy3 preservando a ordem', async () => {
   ]);
 });
 
+test('descobre agy4 até agy7 no PATH sem exigir AGY_POOL_BINS', async () => {
+  const dir = fakeBinDir('agy4');
+  for (const name of ['agy5', 'agy6', 'agy7']) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(file, 0o755);
+  }
+  const workers = await discoverWorkers({
+    env: {}, path: dir, probe: available('agy4', 'agy5', 'agy6', 'agy7'),
+  });
+  assert.deepEqual(workers.filter((worker) => worker.available).map((worker) => worker.id),
+    ['agy4', 'agy5', 'agy6', 'agy7']);
+});
+
 test('reporta nenhum worker disponível sem falhar', async () => {
   const workers = await discoverWorkers({ env: {}, path: '/fake', probe: async () => { throw new Error('no'); } });
   assert.equal(workers.every((worker) => !worker.available), true);

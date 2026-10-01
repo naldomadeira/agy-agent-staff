@@ -115,6 +115,7 @@ import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
 import { discoverWorkers, reserveWorker } from './worker-pool.mjs';
+import { agyLaunch } from './agy-launch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TEMPLATES_DIR = path.join(path.dirname(SELF), '..', 'templates');
@@ -124,8 +125,7 @@ const AGY_BIN = process.env.AGY_BIN || 'agy';
  *  Node script (the test fake), run it through the current Node binary so the
  *  launch does not depend on shebang support (Windows has none: EFTYPE). */
 function agyCommand(args, bin = AGY_BIN) {
-  if (/\.(mjs|cjs|js)$/i.test(bin)) return { cmd: process.execPath, args: [bin, ...args] };
-  return { cmd: bin, args };
+  return agyLaunch(bin, args);
 }
 const AGY_SETTINGS = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json');
 

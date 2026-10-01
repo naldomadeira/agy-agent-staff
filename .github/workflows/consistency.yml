@@ -43,3 +43,33 @@ jobs:
       # Per-test timeout so a hung test surfaces as one failure instead of
       # stalling the whole job until timeout-minutes cancels it.
       - run: node --test --test-timeout=60000 tests/*.test.mjs
+
+  release:
+    name: Release plugin patch
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.actor != 'github-actions[bot]'
+    needs: [consistency, test-ubuntu, test-windows]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: agy-staff-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Bump, tag and publish the verified merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node scripts/bump-plugin-version.mjs)
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json .agents/plugins/marketplace.json .claude-plugin/plugin.json .codex-plugin/plugin.json
+          git commit -m "chore: release v${version}"
+          git tag "v${version}"
+          git push --atomic origin HEAD:master "refs/tags/v${version}"
+          gh release create "v${version}" --generate-notes --verify-tag
