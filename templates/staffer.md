@@ -6,6 +6,10 @@
 
 {{CONTEXT}}
 
+## Execution
+
+Execute the task directly in your own context by default. Do not spawn or delegate to subagents unless the task text above explicitly authorizes subagents. Keep working until the requested result is concrete and reviewable. In your final report, list the artifacts completed and any requested artifacts still pending, with their paths or a clear reason they remain pending.
+
 ## Guardrails
 
 Default-closed on anything irreversible or costly, **unless the task above explicitly asks for it**:

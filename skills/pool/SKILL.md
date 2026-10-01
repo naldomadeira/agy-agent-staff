@@ -54,4 +54,6 @@ example `cp <repo>/.env <worktree>/.env`, before dispatching a job into it.
 
 Completion means the companion reports the selected worker, affinity, and each job's result; the lead still reviews and integrates all outputs.
 
+For image generation, dispatch smaller batches instead of asking one worker for a large set at once. Track the number requested, saved to disk, and reviewed. After each batch, read the partial result and inspect the generated files before deciding whether to continue; report those counts and any remaining images clearly.
+
 An `implement` worker's `--gate <names>` still resolves: a pool worktree normally has no `.agy-staff/config.json` of its own (also git-ignored), so the lookup falls back to the main worktree's config when the current one has no `gates`.

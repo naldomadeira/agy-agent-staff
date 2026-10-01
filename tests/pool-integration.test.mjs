@@ -62,6 +62,38 @@ describe('companion worker pool integration', () => {
     for (const id of ids) assert.equal(await waitForJob(sb, id), 'done');
   });
 
+  test('an authentication failure retains the selected worker for later audit', async () => {
+    const sb = sandbox('auth-worker-audit');
+    const [bin] = workersFor(sb, 1);
+    const started = run(sb, ['research', '--worker', 'agy2', '--prompt', 'a topic'], {
+      AGY_POOL_BINS: bin,
+      FAKE_AGY_STATUS: 'ERROR',
+      FAKE_AGY_RESPONSE: 'partial draft',
+      FAKE_AGY_ERROR: 'UNAUTHENTICATED (code 401): OAuth token expired',
+      FAKE_AGY_EXIT: '1',
+    });
+    assert.equal(started.code, 0, started.stderr);
+    const id = jobIdOf(started.stdout);
+    assert.equal(await waitForJob(sb, id), 'error');
+
+    const job = state(sb).jobs.find((entry) => entry.id === id);
+    assert.equal(job.reason, 'auth_failed');
+    assert.equal(job.worker.id, 'agy2');
+    assert.equal(job.worker.bin, bin);
+    assert.ok(job.started_at);
+    assert.ok(job.finished_at);
+
+    const status = run(sb, ['status', id]);
+    assert.equal(status.code, 3, status.stderr);
+    assert.match(status.stdout, /"reason": "auth_failed"/);
+    assert.match(status.stdout, /"id": "agy2"/);
+
+    const result = run(sb, ['wait', id]);
+    assert.equal(result.code, 3, result.stderr);
+    assert.match(result.stdout, /AGY worker: agy2 \(/);
+    assert.match(result.stdout, /auth_failed/);
+  });
+
   test('continue and restart preserve affinity and reject migration', async () => {
     const sb = sandbox('affinity');
     const bins = workersFor(sb, 2);
