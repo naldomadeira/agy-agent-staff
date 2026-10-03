@@ -12,6 +12,12 @@ const DEFAULT_CANDIDATES = ['agy', 'agy2', 'agy3'];
 const DEFAULT_TIMEOUT_MS = 1500;
 const DEFAULT_RETRY_TIMEOUT_MS = 5000;
 const DEFAULT_QUOTA_CACHE_DIR = pathModule.join(os.homedir(), '.codex-profiles', 'cache');
+const MAX_QUOTA_AGE_MS = 6 * 60 * 60 * 1000;
+
+function quotaPoolForModel(model) {
+  if (!model) return null;
+  return model.startsWith('gemini-') ? 'gemini' : '3p';
+}
 
 /** A positive millisecond count from the environment, or null. Anything else
  *  — empty, zero, negative, not a number — is ignored rather than obeyed: a
@@ -30,7 +36,7 @@ function envTimeout(value) {
  * (`null`) sem que isso seja um erro: um worker sem ficheiro de quota
  * correspondente simplesmente não participa do desempate por folga.
  *
- * @param {{env?: NodeJS.ProcessEnv, path?: string, probe?: Function, config?: object|string, timeoutMs?: number, retryTimeoutMs?: number, now?: number}} options
+ * @param {{env?: NodeJS.ProcessEnv, path?: string, probe?: Function, config?: object|string, timeoutMs?: number, retryTimeoutMs?: number, now?: number, model?: string}} options
  * @returns {Promise<Array<{id:string, bin:string, version:string|null, available:boolean, status:'available'|'unavailable'|'unknown', capacity:number, quotaSlack:number|null, quotaAgeMs:number|null}>>}
  */
 export async function discoverWorkers(options = {}) {
@@ -85,7 +91,7 @@ export async function discoverWorkers(options = {}) {
         options.retryTimeoutMs ?? envTimeout(env.AGY_PROBE_RETRY_TIMEOUT_MS) ?? DEFAULT_RETRY_TIMEOUT_MS,
       probe: options.probe,
     });
-    const quota = await readQuota(quotaCacheDir, entry.bin, now);
+    const quota = await readQuota(quotaCacheDir, entry.bin, now, options.model);
     return {
       id: entry.id,
       bin: entry.bin,
@@ -95,6 +101,8 @@ export async function discoverWorkers(options = {}) {
       capacity: entry.capacity,
       quotaSlack: quota ? quota.slack : null,
       quotaAgeMs: quota ? quota.ageMs : null,
+      quotaGemini: quota ? quota.gemini : null,
+      quotaThirdParty: quota ? quota.thirdParty : null,
     };
   }));
 }
@@ -361,7 +369,7 @@ function classifyProbeError(error) {
  *
  * @returns {Promise<{slack:number, ageMs:number}|null>}
  */
-async function readQuota(cacheDir, bin, now) {
+async function readQuota(cacheDir, bin, now, model) {
   const profile = quotaProfileForBin(bin);
   if (!profile) return null;
   const file = pathModule.join(cacheDir, `agy-quota-${profile}.json`);
@@ -379,9 +387,15 @@ async function readQuota(cacheDir, bin, now) {
   }
   const capturedAt = Number(data?.captured_at);
   if (!Number.isFinite(capturedAt)) return null;
-  const slack = slackFrom(data, now);
-  if (slack === null) return null;
-  return { slack, ageMs: Math.max(0, now - capturedAt * 1000) };
+  const ageMs = Math.max(0, now - capturedAt * 1000);
+  const fresh = ageMs < MAX_QUOTA_AGE_MS;
+  const pool = quotaPoolForModel(model);
+  return {
+    slack: fresh ? slackFrom(data, now, pool) : null,
+    gemini: fresh ? slackFrom(data, now, 'gemini') : null,
+    thirdParty: fresh ? slackFrom(data, now, '3p') : null,
+    ageMs,
+  };
 }
 
 /**
@@ -403,20 +417,30 @@ async function readQuota(cacheDir, bin, now) {
  * livre" não é "livre", e devolver 100% punha um worker sobre o qual não se
  * sabe nada à frente de outro com leitura fresca e folga real.
  */
-function slackFrom(data, now) {
+function slackFrom(data, now, pool = null) {
   const buckets = data?.buckets && typeof data.buckets === 'object'
-    ? Object.values(data.buckets)
+    ? Object.entries(data.buckets)
+      .filter(([name]) => !pool || name.startsWith(`${pool} `) || name.startsWith(`${pool}-`))
+      .map(([, bucket]) => bucket)
+    : pool ? []
     : [{ used_percent: data?.used_percent, resets_at: data?.resets_at }];
+  // A model family is usable only when both its short and weekly windows
+  // still have measurements. A reset bucket cannot be inferred from its
+  // sibling: reporting 100% from the 5h bucket while 7d is unknown is false.
+  if (pool && buckets.length !== 2) return null;
   const live = buckets
     .filter((bucket) => {
-      const resetsAt = Number(bucket?.resets_at);
+      const resetValue = bucket?.resets_at;
       // Sem `resets_at` não há como saber se a janela virou; conta na mesma,
       // porque descartar uma leitura por lhe faltar um campo opcional seria
       // trocar um número conservador por nenhum.
+      if (resetValue === null || resetValue === undefined || resetValue === '') return true;
+      const resetsAt = Number(resetValue);
       return !Number.isFinite(resetsAt) || resetsAt * 1000 > now;
     })
-    .map((bucket) => Number(bucket?.used_percent))
+    .map((bucket) => bucket?.used_percent == null ? NaN : Number(bucket.used_percent))
     .filter((used) => Number.isFinite(used));
+  if (pool && live.length !== buckets.length) return null;
   if (!live.length) return null;
   return Math.max(0, Math.min(100, 100 - Math.max(...live)));
 }

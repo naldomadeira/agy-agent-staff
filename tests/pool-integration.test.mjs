@@ -204,19 +204,23 @@ describe('workers table reports what discovery found', () => {
     return dir;
   }
 
-  test('quota slack is printed with its age, and absence prints as a dash', () => {
+  test('Gemini and Anthropic slack are printed separately with age', () => {
     const sb = sandbox('workers-quota-column');
     const bins = workersFor(sb, 2);
     const dir = quotaCache(sb, {
-      // 21% used, captured two hours ago → 79% slack, age 2h.
-      profile2: { used_percent: 21, captured_at: (Date.now() - 2 * 3600_000) / 1000 },
+      profile2: { captured_at: (Date.now() - 2 * 3600_000) / 1000, buckets: {
+        'gemini 5h': { used_percent: 21, resets_at: Date.now() / 1000 + 3600 },
+        'gemini 7d': { used_percent: 15, resets_at: Date.now() / 1000 + 86400 },
+        '3p 5h': { used_percent: 90, resets_at: Date.now() / 1000 + 3600 },
+        '3p 7d': { used_percent: 10, resets_at: Date.now() / 1000 + 86400 },
+      } },
       // profile3 deliberately absent: no reading is a real answer.
     });
     const result = run(sb, ['workers'], { AGY_POOL_BINS: bins.join(','), AGY_QUOTA_CACHE_DIR: dir });
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /id \| executable \| status \| version \| capacity \| active jobs \| quota slack/);
-    assert.match(result.stdout, /agy2.*\| 79% \(2h\)/);
-    assert.match(result.stdout, /agy3.*\| -$/m);
+    assert.match(result.stdout, /id \| executable \| status \| version \| capacity \| active jobs \| Gemini slack \| Anthropic\/3p slack/);
+    assert.match(result.stdout, /agy2.*\| 79% \(2h\) \| 10% \(2h\)/);
+    assert.match(result.stdout, /agy3.*\| - \| -$/m);
   });
 
   test('a worker that never answers the probe prints unknown, not unavailable', () => {

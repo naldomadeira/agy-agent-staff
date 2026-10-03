@@ -1398,7 +1398,7 @@ const legacyWorker = () => ({ id: LEGACY_WORKER_ID, bin: AGY_BIN, version: null,
  * past; the choice itself is made by takeWorker, inside the lock that writes
  * the job record.
  * @returns {Promise<null|{pinned:object}|{workers:Array, requested?:string, affinity:object|null}>} */
-async function planWorker(opts, prior = null) {
+async function planWorker(opts, prior = null, model = null) {
   const requested = opts.worker;
   const affinity = prior?.worker || null;
   if (affinity && requested && requested !== 'auto' && requested !== affinity.id && requested !== affinity.bin) {
@@ -1408,7 +1408,7 @@ async function planWorker(opts, prior = null) {
   // Historical/default jobs retain the legacy executable without probing or
   // entering the pool. This is an affinity marker, not an auto-pool request.
   if (!requested && affinity?.id === LEGACY_WORKER_ID) return { pinned: affinity };
-  return { workers: await discoverWorkers({ config: configPath() }), requested, affinity };
+  return { workers: await discoverWorkers({ config: configPath(), model }), requested, affinity };
 }
 
 /** Second half of planWorker: pick the worker and register `record`, both
@@ -2351,7 +2351,7 @@ async function cmdRun(mode, opts) {
   // A direct mode continuation (`research --continue`) reaches this path too.
   // Feed its resolved conversation affinity back into the selector; otherwise
   // it would silently fall back to AGY_BIN instead of its original worker.
-  const workerPlan = await planWorker(opts, resolved.worker ? { worker: resolved.worker } : null);
+  const workerPlan = await planWorker(opts, resolved.worker ? { worker: resolved.worker } : null, resolved.model);
   enterOriginalWorkspace(resolved.originalCwd);
   if (resolved.parentJobId) {
     const prior = findJob(resolved.parentJobId);
@@ -2831,17 +2831,18 @@ function quotaAgeLabel(ms) {
 /** The quota cell: slack with its age, or `-` when no reading exists. Absent
  *  is a real answer here — a worker outside the profile scheme, or one whose
  *  hook has never run, has no quota, and that is not a failure. */
-function quotaCell(worker) {
-  if (typeof worker.quotaSlack !== 'number') return '-';
+function quotaCell(worker, field) {
   const age = typeof worker.quotaAgeMs === 'number' ? ` (${quotaAgeLabel(worker.quotaAgeMs)})` : '';
-  return `${Math.round(worker.quotaSlack)}%${age}`;
+  if (typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs >= 6 * 60 * 60 * 1000) return `stale${age}`;
+  if (typeof worker[field] !== 'number') return '-';
+  return `${Math.round(worker[field])}%${age}`;
 }
 
 async function cmdWorkers() {
   const workers = await discoverWorkers({ config: configPath() });
   const jobs = loadState().jobs || [];
   const active = jobs.filter((j) => liveJobStatus(j) === 'running');
-  process.stdout.write('id | executable | status | version | capacity | active jobs | quota slack\n');
+  process.stdout.write('id | executable | status | version | capacity | active jobs | Gemini slack | Anthropic/3p slack\n');
   for (const worker of workers) {
     const count = active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
     // `status` carries the three-way verdict; `available` is the older boolean
@@ -2849,7 +2850,7 @@ async function cmdWorkers() {
     // collapse `unknown` back into `unavailable` — the exact false negative
     // the three-way probe exists to remove.
     const status = worker.status || (worker.available ? 'available' : 'unavailable');
-    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker)}\n`);
+    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker, 'quotaGemini')} | ${quotaCell(worker, 'quotaThirdParty')}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
 }
@@ -3304,7 +3305,7 @@ async function cmdContinue(opts) {
   // reflects this call's own --allow-gate, not whatever the original run had.
   checkGateOrder(mode, task, resolved.allowGate);
   warnIfContinuingIntoQuota(prior, resolved.model);
-  const workerPlan = await planWorker(opts, prior);
+  const workerPlan = await planWorker(opts, prior, resolved.model);
   const workspace = mode === 'implement' ? dirtyWorkspacePrompt() : '';
   // Fase 2 item 3: this follow-up's own template-free prompt gets the same
   // one-line note buildPrompt's {{COMPANION_GATES}} injects for a fresh
@@ -3348,7 +3349,7 @@ async function cmdRestart(opts) {
   // `restart`), so it always reuses the original job's model — the warning
   // only needs to check the job's own status/window (Fase 1, item 7).
   warnIfContinuingIntoQuota(job, resolved.model);
-  const workerPlan = await planWorker(opts, job);
+  const workerPlan = await planWorker(opts, job, resolved.model);
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;
   }
