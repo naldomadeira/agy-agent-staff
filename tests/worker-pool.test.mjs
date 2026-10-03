@@ -133,7 +133,7 @@ test('deduplica e aplica id/capacidade da configuração ao bin já descoberto',
   assert.equal(workers.filter((worker) => worker.bin === 'agy').length, 1);
   assert.deepEqual(workers.find((worker) => worker.bin === 'agy'), {
     id: 'primary', bin: 'agy', available: true, status: 'available', version: 'agy-1.0.0', capacity: 4,
-    quotaSlack: null, quotaAgeMs: null,
+    quotaSlack: null, quotaAgeMs: null, quotaGemini: null, quotaThirdParty: null,
   });
 });
 
@@ -376,6 +376,62 @@ test('entre dois unknown, a folga de quota continua a desempatar', () => {
   assert.equal(selectWorker({ workers, activeJobs: {} }).id, 'agy5');
 });
 
+test('auto usa a cota da familia do modelo pedido, sem misturar Gemini e Anthropic', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'profile2', { capturedAtMs: now, buckets: {
+    'gemini 5h': { usedPercent: 10, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 20, resetsAtMs: now + 24 * 3600_000 },
+    '3p 5h': { usedPercent: 100, resetsAtMs: now + 3600_000 },
+    '3p 7d': { usedPercent: 100, resetsAtMs: now + 24 * 3600_000 },
+  } });
+  writeQuotaBuckets(dir, 'profile3', { capturedAtMs: now, buckets: {
+    'gemini 5h': { usedPercent: 80, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 80, resetsAtMs: now + 24 * 3600_000 },
+    '3p 5h': { usedPercent: 10, resetsAtMs: now + 3600_000 },
+    '3p 7d': { usedPercent: 10, resetsAtMs: now + 24 * 3600_000 },
+  } });
+  const options = { env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy2,agy3' }, path: '/fake', now, probe: available('agy2', 'agy3') };
+  const gemini = await discoverWorkers({ ...options, model: 'gemini-3.8-flash-medium' });
+  const anthropic = await discoverWorkers({ ...options, model: 'claude-sonnet-4-6' });
+  assert.equal(selectWorker({ workers: gemini }).id, 'agy2');
+  assert.equal(selectWorker({ workers: anthropic }).id, 'agy3');
+  assert.equal(gemini.find((worker) => worker.id === 'agy2').quotaGemini, 80);
+  assert.equal(gemini.find((worker) => worker.id === 'agy2').quotaThirdParty, 0);
+});
+
+test('uma leitura de quota com mais de seis horas nao decide o auto', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'profile2', { capturedAtMs: now - 24 * 3600_000, buckets: {
+    'gemini 5h': { usedPercent: 0, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 0, resetsAtMs: now + 24 * 3600_000 },
+  } });
+  writeQuotaBuckets(dir, 'profile3', { capturedAtMs: now, buckets: {
+    'gemini 5h': { usedPercent: 40, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 40, resetsAtMs: now + 24 * 3600_000 },
+  } });
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy2,agy3' }, path: '/fake', now, model: 'gemini-3.8-flash-low', probe: available('agy2', 'agy3') });
+  assert.equal(workers.find((worker) => worker.id === 'agy2').quotaSlack, null);
+  assert.equal(selectWorker({ workers }).id, 'agy3');
+});
+
+test('familia com janela reiniciada e sem nova medicao tem folga desconhecida', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'profile2', { capturedAtMs: now - 2 * 3600_000, buckets: {
+    'gemini 5h': { usedPercent: 0, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 30, resetsAtMs: now - 3600_000 },
+    '3p 5h': { usedPercent: 0, resetsAtMs: now + 3600_000 },
+    '3p 7d': { usedPercent: 0, resetsAtMs: now + 24 * 3600_000 },
+  } });
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy2' }, path: '/fake', now, model: 'gemini-3.8-flash-low', probe: available('agy2') });
+  const worker = workers.find((entry) => entry.id === 'agy2');
+  assert.equal(worker.quotaSlack, null);
+  assert.equal(worker.quotaGemini, null);
+  assert.equal(worker.quotaThirdParty, 100);
+});
+
 // --- Quota: folga vinda do disco -------------------------------------------
 
 function quotaDir() {
@@ -470,12 +526,12 @@ function writeQuotaBuckets(dir, profile, { capturedAtMs, buckets }) {
 test('uma janela que já reiniciou não conta para a folga', async () => {
   const dir = quotaDir();
   const now = Date.now();
-  // Os números reais que expuseram o defeito: uma captura de 11h atrás com a
+  // Os números reais que expuseram o defeito: uma captura recente com a
   // janela de 5h a 83%, já reiniciada desde então, e a de 7 dias a 23% ainda
   // a correr. A leitura ingénua anunciava 17% de folga; a conta estava a 77%,
   // como a captura seguinte confirmou.
   writeQuotaBuckets(dir, 'principal', {
-    capturedAtMs: now - 11 * 3600_000,
+    capturedAtMs: now - 2 * 3600_000,
     buckets: {
       '5h': { usedPercent: 83, resetsAtMs: now - 3600_000 },
       '7d': { usedPercent: 23, resetsAtMs: now + 5 * 24 * 3600_000 },
@@ -494,7 +550,7 @@ test('a janela mais apertada ainda a correr é a que manda', async () => {
   // 100% por mais dias. Tratar a reiniciada como livre daria folga total a
   // uma conta esgotada.
   writeQuotaBuckets(dir, 'principal', {
-    capturedAtMs: now - 2 * 24 * 3600_000,
+    capturedAtMs: now - 2 * 3600_000,
     buckets: {
       '5h': { usedPercent: 38, resetsAtMs: now - 2 * 24 * 3600_000 },
       '7d': { usedPercent: 100, resetsAtMs: now + 3 * 24 * 3600_000 },
