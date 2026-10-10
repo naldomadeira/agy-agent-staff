@@ -557,6 +557,26 @@ async function readQuota(cacheDir, bin, now, model) {
 }
 
 /**
+ * Synchronous slack of `model`'s pool on the worker at `bin`, straight from
+ * the cache, for bookkeeping that runs inside the state lock (usage history:
+ * slack when a job started and when it finished). Same rules as discovery:
+ * a reading older than six hours, or a reset window, gives null.
+ */
+export function quotaNow(bin, model, { env = process.env, now = Date.now() } = {}) {
+  const profile = quotaProfileForBin(bin);
+  if (!profile || !model) return null;
+  const dir = env.AGY_QUOTA_CACHE_DIR?.trim() || DEFAULT_QUOTA_CACHE_DIR;
+  try {
+    const data = JSON.parse(fs.readFileSync(pathModule.join(dir, `agy-quota-${profile}.json`), 'utf8'));
+    const ageMs = now - Number(data?.captured_at) * 1000;
+    if (!(ageMs >= 0 && ageMs < MAX_QUOTA_AGE_MS)) return null;
+    return slackFrom(data, now, quotaPoolForModel(model));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * When a closed pool reopens, in epoch ms, or null when it is not closed.
  *
  * The tightest live window sets the pool's slack, so its reset is when the

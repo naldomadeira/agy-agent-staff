@@ -95,6 +95,17 @@ Antes do dispatch, o companion também varre o texto da tarefa em busca de uma *
 - **Espera e bloqueio.** Uma task roteada sem conta aberta fica `waiting_quota` e é tentada de novo a cada 5 min. Uma task que falha bloqueia as dependentes.
 - **Comandos.** `run-status`, `run-wait <run> [--follow]` (exit 0 se tudo terminou, 5 caso contrário) e `run-cancel`. Nada é mesclado na branch do host; o relatório traz os comandos de merge em ordem de dependência.
 
+**Histórico de uso e visualizações.**
+- **Histórico.** Todo job terminal acrescenta uma linha em `$XDG_CONFIG_HOME/agy-staff/usage.jsonl`, com worker, modelo, pool, duração, tokens, tentativas e a folga do pool naquela conta no registro do job (`slack_start`) e no fim (`slack_end`).
+- **`top`.** Uma visão viva no terminal:
+  - as contas, com barras Gemini e 3p, reabertura e idade da leitura;
+  - os jobs rodando no repositório, com o último passo;
+  - os runs, o inbox recente e 14 dias de resultados por modelo.
+
+  Teclas: `q` sai, `p` sonda as leituras velhas.
+- **`dashboard [--port 7377]`.** A mesma visão como página local em 127.0.0.1, ao vivo via SSE (`/`, `/api/snapshot`, `/events`).
+- Nenhum dos dois inicia o agy.
+
 **Inbox e hooks.** Todo job terminal, e todo run que termina, acrescenta uma linha em `$XDG_CONFIG_HOME/agy-staff/inbox.jsonl`, com a chave do checkout principal. O hook do plugin no Claude Code (`hooks/agy-hook.mjs`, em `UserPromptSubmit` e `SessionStart`) mostra:
 - as linhas não lidas do repositório atual (até 5, cooldown de 10 s);
 - num modo diferente de `off`, o modo e um resumo da pool, no máximo a cada 10 min;

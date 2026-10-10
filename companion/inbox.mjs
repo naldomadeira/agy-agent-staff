@@ -55,14 +55,40 @@ export function appendInbox(entry, env = process.env) {
 }
 
 /** Keep the newest half when the file outgrows its budget. */
-function trimInbox(file) {
+function trimInbox(file, budget = MAX_INBOX_BYTES) {
   const size = fs.statSync(file).size;
-  if (size <= MAX_INBOX_BYTES) return;
+  if (size <= budget) return;
   const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
   const kept = lines.slice(Math.floor(lines.length / 2));
   const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, kept.join('\n') + '\n');
   fs.renameSync(tmp, file);
+}
+
+export function usageFile(env = process.env) {
+  return path.join(configDir(env), 'usage.jsonl');
+}
+
+/** One line per finished job: who ran what, for how long, at what cost, and
+ *  how much of the account's pool it took. The dashboard's history. */
+export function appendUsage(entry, env = process.env) {
+  try {
+    const file = usageFile(env);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n');
+    trimInbox(file, 4 * MAX_INBOX_BYTES);
+  } catch { /* fail-open */ }
+}
+
+export function readUsage(env = process.env, sinceMs = 14 * 24 * 3600 * 1000) {
+  const since = new Date(Date.now() - sinceMs).toISOString();
+  try {
+    return fs.readFileSync(usageFile(env), 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+      try { const entry = JSON.parse(line); return entry.ts >= since ? [entry] : []; } catch { return []; }
+    });
+  } catch {
+    return [];
+  }
 }
 
 export function readInbox(env = process.env) {
