@@ -13,6 +13,12 @@ const DEFAULT_TIMEOUT_MS = 1500;
 const DEFAULT_RETRY_TIMEOUT_MS = 5000;
 const DEFAULT_QUOTA_CACHE_DIR = pathModule.join(os.homedir(), '.codex-profiles', 'cache');
 const MAX_QUOTA_AGE_MS = 6 * 60 * 60 * 1000;
+// Numbered profiles beyond agy3 are looked up on PATH up to this number. A
+// 10-account pool used to lose agy8..agy10 silently, because the scan stopped
+// at agy7 and `--worker agy9` then failed as if the worker were busy.
+const DEFAULT_MAX_PROFILE = 20;
+// A window this full leaves less than a job's worth of quota.
+const BLOCKED_PERCENT = 95;
 
 function quotaPoolForModel(model) {
   if (!model) return null;
@@ -65,7 +71,9 @@ export async function discoverWorkers(options = {}) {
   for (const bin of splitBins(env.AGY_POOL_BINS)) add(bin);
   for (const bin of DEFAULT_CANDIDATES) add(bin);
   // Additional local profiles are optional; show them only when present.
-  for (let number = 4; number <= 7; number++) {
+  const maxProfile = Number.parseInt(env.AGY_POOL_MAX_PROFILE, 10) > 3
+    ? Number.parseInt(env.AGY_POOL_MAX_PROFILE, 10) : DEFAULT_MAX_PROFILE;
+  for (let number = 4; number <= maxProfile; number++) {
     const name = `agy${number}`;
     if (lookupOnPath(name, env)) add(name);
   }
@@ -103,8 +111,60 @@ export async function discoverWorkers(options = {}) {
       quotaAgeMs: quota ? quota.ageMs : null,
       quotaGemini: quota ? quota.gemini : null,
       quotaThirdParty: quota ? quota.thirdParty : null,
+      quotaResetGemini: quota ? quota.resetGemini : null,
+      quotaResetThirdParty: quota ? quota.resetThirdParty : null,
     };
   }));
+}
+
+export const PROBE_MODEL = 'gemini-3.8-flash-low';
+export const DEFAULT_PROBE_MAX_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Refresca a leitura de quota dos workers cuja leitura está velha.
+ *
+ * Não há forma de perguntar a quota a uma conta sem a pôr a correr: o
+ * endpoint vive dentro do language server que o próprio agy arranca, e o
+ * hook de status line só escreve o cache enquanto o agy corre. Por isso a
+ * sonda é um turno mínimo (`gemini-3.8-flash-low`, sem ferramentas, uns
+ * 9 s) que gasta um resto do pool gemini e faz o hook regravar o cache com as
+ * janelas e o `disabled` atuais. Só corre nas contas com leitura ausente ou
+ * mais velha do que `maxAgeMs`, todas em paralelo, numa pasta temporária.
+ *
+ * @returns {Promise<Array<{id:string, ok:boolean, ms:number, error?:string}>>}
+ */
+export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFAULT_PROBE_MAX_AGE_MS, timeoutMs = 60000, ping } = {}) {
+  const stale = workers.filter((worker) =>
+    worker.status !== 'unavailable' && (typeof worker.quotaAgeMs !== 'number' || worker.quotaAgeMs >= maxAgeMs));
+  const run = ping ?? pingWorker;
+  return Promise.all(stale.map(async (worker) => {
+    const started = Date.now();
+    try {
+      await run(worker.bin, { env, timeoutMs });
+      return { id: worker.id, ok: true, ms: Date.now() - started };
+    } catch (error) {
+      const text = `${error?.stdout ?? ''}${error?.stderr ?? ''}${error?.message ?? ''}`;
+      // An exhausted gemini pool still answers with its quota, and the hook
+      // has recorded it by the time the error surfaces: that is a reading.
+      const exhausted = /RESOURCE_EXHAUSTED|quota/i.test(text);
+      return { id: worker.id, ok: exhausted, ms: Date.now() - started, error: exhausted ? 'quota_exhausted' : firstLine(text) };
+    }
+  }));
+}
+
+async function pingWorker(bin, { env, timeoutMs }) {
+  const cwd = fs.mkdtempSync(pathModule.join(os.tmpdir(), 'agy-probe-'));
+  try {
+    const agy = agyLaunch(bin, ['-p', 'Reply with the single word: ok', '--model', PROBE_MODEL,
+      '--output-format', 'json', '--print-timeout', `${Math.ceil(timeoutMs / 1000)}s`]);
+    await execFileAsync(agy.cmd, agy.args, { env, cwd, timeout: timeoutMs + 5000, windowsHide: true });
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function firstLine(text) {
+  return String(text).trim().split(/\r?\n/)[0]?.slice(0, 200) || 'probe failed';
 }
 
 /**
@@ -220,7 +280,25 @@ function poolUnavailable({ workers, activeJobs, requestedWorkerId, affinity }) {
     return tagged(`worker ${label} for this job is unavailable; refusing automatic migration`, 'worker_unavailable');
   }
   if (requestedWorkerId !== undefined) {
-    return tagged(`worker "${requestedWorkerId}" is unavailable or at capacity`, 'worker_unavailable');
+    const worker = matchWorker(workers, affinityTarget(requestedWorkerId));
+    if (!worker) {
+      const known = workers.map((entry) => entry.id).join(', ') || 'none';
+      return tagged(
+        `worker "${requestedWorkerId}" was not discovered (known: ${known}). ` +
+          'Put its executable on PATH, list it in AGY_POOL_BINS (separate entries with commas, spaces' +
+          `${process.platform === 'win32' ? ' or ;' : ' or :'}), or add it to .agy-staff/config.json "workers"`,
+        'worker_not_found'
+      );
+    }
+    if (worker.available !== true && worker.status !== 'unknown') {
+      return tagged(`worker "${requestedWorkerId}" (${worker.bin}) did not answer \`--version\`; check the executable`, 'worker_unavailable');
+    }
+    const capacity = normalizeCapacity(worker.capacity);
+    return tagged(
+      `worker "${requestedWorkerId}" is busy (${loadFor(worker, activeJobs)}/${capacity} active jobs); ` +
+        'pick another worker, use --worker auto, or raise its capacity in .agy-staff/config.json',
+      'worker_busy'
+    );
   }
   return tagged('no available AGY worker found', 'no_worker');
 }
@@ -314,6 +392,11 @@ async function loadConfig(config) {
  * @returns {Promise<{status:'available'|'unavailable'|'unknown', version:string|null}>}
  */
 async function probeWorker(bin, { env, timeoutMs = DEFAULT_TIMEOUT_MS, retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS, probe }) {
+  // `probe: false` skips the `--version` round trip: a status line redraws
+  // every few seconds and only needs the quota cache, not ten wrapper starts.
+  // Existence is still checked — it is a stat, not a process — so a default
+  // candidate that is not installed stays out of the counts.
+  if (probe === false) return { status: executableExists(bin, env) ? 'unknown' : 'unavailable', version: null };
   const attempt = (ms) => (probe ? probeOnce(bin, { env, timeoutMs: ms, probe }) : execProbeOnce(bin, { env, timeoutMs: ms }));
 
   const first = await attempt(timeoutMs);
@@ -322,6 +405,13 @@ async function probeWorker(bin, { env, timeoutMs = DEFAULT_TIMEOUT_MS, retryTime
   const second = await attempt(retryTimeoutMs);
   if (second.status === 'retry') return { status: 'unknown', version: null };
   return second;
+}
+
+function executableExists(bin, env) {
+  if (bin.includes('/') || bin.includes(pathModule.sep)) {
+    try { return fs.statSync(pathModule.resolve(bin)).isFile(); } catch { return false; }
+  }
+  return lookupOnPath(bin, env) !== null;
 }
 
 async function probeOnce(bin, { env, timeoutMs, probe }) {
@@ -394,8 +484,56 @@ async function readQuota(cacheDir, bin, now, model) {
     slack: fresh ? slackFrom(data, now, pool) : null,
     gemini: fresh ? slackFrom(data, now, 'gemini') : null,
     thirdParty: fresh ? slackFrom(data, now, '3p') : null,
+    // Reset times are reported even for an old reading: "3p is blocked
+    // until 18:46" stays true however long ago it was captured.
+    resetGemini: blockingResetFrom(data, now, 'gemini'),
+    resetThirdParty: blockingResetFrom(data, now, '3p'),
     ageMs,
   };
+}
+
+/**
+ * When a closed pool reopens, in epoch ms, or null when it is not closed.
+ *
+ * The tightest live window sets the pool's slack, so its reset is when the
+ * slack can next go up. A weekly window at 100% therefore wins over an empty
+ * 5h one: the 5h window does not free the pool while the weekly one is full.
+ */
+function blockingResetFrom(data, now, pool) {
+  if (!data?.buckets || typeof data.buckets !== 'object') return null;
+  let tightest = null;
+  for (const [name, bucket] of Object.entries(data.buckets)) {
+    if (!name.startsWith(`${pool} `) && !name.startsWith(`${pool}-`)) continue;
+    const resetsAt = Number(bucket?.resets_at) * 1000;
+    const used = Number(bucket?.used_percent);
+    if (!Number.isFinite(resetsAt) || resetsAt <= now || !Number.isFinite(used)) continue;
+    const effective = disabledWindow(data, pool, name) ? 100 : used;
+    if (!tightest || effective > tightest.used || (effective === tightest.used && resetsAt > tightest.resetsAt)) {
+      tightest = { used: effective, resetsAt };
+    }
+  }
+  // Only a window that actually closes the pool has a reset worth reporting;
+  // the weekly reset of a pool at 2% used is not "when it reopens".
+  return tightest && tightest.used >= BLOCKED_PERCENT ? tightest.resetsAt : null;
+}
+
+/**
+ * agy marks a window `disabled` in its raw status-line payload when the pool
+ * is closed for a reason the percentages do not show — a 5h window reading 0%
+ * used while the weekly one is exhausted. The summarized `buckets` drop that
+ * flag, so it is read back from `raw.quota` (`3p-5h`, `3p-weekly`, …).
+ */
+function disabledWindow(data, pool, bucketName) {
+  const quota = data?.raw?.quota;
+  if (!quota || typeof quota !== 'object') return false;
+  const span = /7d|week/i.test(bucketName) ? 'weekly' : '5h';
+  return quota[`${pool}-${span}`]?.disabled === true;
+}
+
+function poolDisabled(data, pool) {
+  const quota = data?.raw?.quota;
+  if (!quota || typeof quota !== 'object') return false;
+  return Object.entries(quota).some(([name, window]) => name.startsWith(`${pool}-`) && window?.disabled === true);
 }
 
 /**
@@ -442,6 +580,8 @@ function slackFrom(data, now, pool = null) {
     .filter((used) => Number.isFinite(used));
   if (pool && live.length !== buckets.length) return null;
   if (!live.length) return null;
+  // A disabled window closes the pool whatever its percentage says.
+  if (pool && poolDisabled(data, pool)) return 0;
   return Math.max(0, Math.min(100, 100 - Math.max(...live)));
 }
 
@@ -457,8 +597,13 @@ function quotaProfileForBin(bin) {
   return match[1] === '' ? 'principal' : `profile${match[1]}`;
 }
 
+/** Commas and whitespace always separate entries; on POSIX so does `:`, the
+ *  PATH-style list people reach for first. A `:`-joined value used to arrive
+ *  as one bogus executable and leave every named worker undiscovered. */
 function splitBins(value) {
-  return typeof value === 'string' ? value.split(/[\s,]+/).map((bin) => bin.trim()).filter(Boolean) : [];
+  if (typeof value !== 'string') return [];
+  const separator = process.platform === 'win32' ? /[\s,;]+/ : /[\s,:]+/;
+  return value.split(separator).map((bin) => bin.trim()).filter(Boolean);
 }
 
 function normalizeCapacity(value) {

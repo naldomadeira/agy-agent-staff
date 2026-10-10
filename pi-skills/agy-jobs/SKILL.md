@@ -42,6 +42,8 @@ Default flow: prepare the prompt → dispatch → wait for the final result → 
 | canceled | 4 | Read `## Partial work`, inspect the diff, then complete any already-authorized follow-up or report cancellation. |
 | command error | 1 | Quote the error and correct the named problem. |
 
+Every non-`done` delivery from `wait` ends with one line on stderr that names the outcome without opening the report: `STATUS: QUOTA_EXHAUSTED worker=agy9 model=claude-sonnet-4-6 reset=4h34m15s partial_files=5`, `STATUS: GATE_FAILED worker=… model=… gate=check partial_files=3`, `STATUS: ATTENTION reason=…`, `STATUS: ERROR reason=…`. `partial_files` counts the paths the run left dirty; treat them as unverified, never as a head start.
+
 A job with a declared gate (`--gate`/`--gate-cmd`) that reaches `phase: "verifying"` (visible in `status`/`observe`, and announced on `wait --follow`'s stderr) means the agent itself already finished and the companion is now running the gate command(s) — the job's own `status` is still `running`, still exit 2: keep waiting, the same as any other still-running job.
 
 A `implement`/`continue`/`restart` call can also refuse **before dispatch** with exit 1 (no job created, agy never invoked) when the briefing text orders a full gate itself (an untargeted `pnpm test`, `pnpm build`, `pytest`, etc.) instead of declaring one. The error quotes the offending line; fix it by removing the gate order from the briefing, or by declaring `--gate <name>` (companion runs it after the worker finishes) or `--allow-gate` (authorizes the worker to run it itself).
