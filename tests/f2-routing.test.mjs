@@ -111,6 +111,9 @@ describe('F2: routing', () => {
   test('a routed job steps down its chain when no account has its model open', posixOnly, async () => {
     const sb = sandbox('f2-fallback-chain');
     const bins = workers(sb, [2, 3]);
+    // the job ends on Gemini; its F3 cross-review is covered elsewhere
+    fs.mkdirSync(path.join(sb.repo, '.agy-staff'), { recursive: true });
+    fs.writeFileSync(path.join(sb.repo, '.agy-staff', 'config.json'), JSON.stringify({ auto_review: 'off' }));
     const dir = quota(sb, { 2: { thirdParty: 10, gemini: 90 }, 3: { thirdParty: 100, gemini: 10 } });
     const r = run(sb, ['implement', '--model', 'auto', '--prompt', 'add a thing'],
       envFor(sb, bins, dir, { FAKE_AGY_QUOTA_FOR: 'agy2/claude-sonnet-4-6', FAKE_AGY_TOUCH_FILE: 'partial.txt' }));

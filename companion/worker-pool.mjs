@@ -675,6 +675,8 @@ function normalizeCapacity(value) {
 }
 
 function loadFor(worker, activeJobs) {
-  if (Array.isArray(activeJobs)) return activeJobs.filter((job) => job?.worker?.id === worker.id || job?.worker?.bin === worker.bin).length;
+  // A job's cross-review runs on a second account and counts there too.
+  const on = (slot) => slot && (slot.id === worker.id || slot.bin === worker.bin);
+  if (Array.isArray(activeJobs)) return activeJobs.filter((job) => on(job?.worker) || on(job?.review_worker)).length;
   return Number(activeJobs?.[worker.id] ?? activeJobs?.[worker.bin] ?? 0) || 0;
 }

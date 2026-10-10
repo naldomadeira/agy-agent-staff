@@ -35,6 +35,8 @@
  *                            being killed by a harness sandbox pre-JSON
  *   FAKE_AGY_ID              worker id, set by a per-worker wrapper script
  *   FAKE_AGY_RUNS_FILE       append {id, model, prompt} per model run (JSONL)
+ *   FAKE_AGY_REVIEW_RESPONSE response for a --json-schema (review) run; such a
+ *                            run never touches FAKE_AGY_TOUCH_FILE
  *   FAKE_AGY_QUOTA_FOR       comma list of `<id>` or `<id>/<model>` that die
  *                            of quota (needs FAKE_AGY_ID)
  *   FAKE_AGY_QUOTA           deterministic quota-exhaustion shortcut: sets
@@ -93,6 +95,12 @@ const modelArg = argv.includes('--model') ? argv[argv.indexOf('--model') + 1] : 
 if (process.env.FAKE_AGY_RUNS_FILE && argv.includes('-p')) {
   fs.appendFileSync(process.env.FAKE_AGY_RUNS_FILE,
     JSON.stringify({ id: process.env.FAKE_AGY_ID || null, model: modelArg, prompt: argv[argv.indexOf('-p') + 1] }) + '\n');
+}
+// FAKE_AGY_REVIEW_RESPONSE: the answer to a schema-constrained (review
+// --json) run, so one test can drive an implement and its cross-review.
+if (process.env.FAKE_AGY_REVIEW_RESPONSE !== undefined && argv.includes('--json-schema')) {
+  process.env.FAKE_AGY_RESPONSE = process.env.FAKE_AGY_REVIEW_RESPONSE;
+  delete process.env.FAKE_AGY_TOUCH_FILE;
 }
 // FAKE_AGY_QUOTA_FOR: comma list of `<id>` or `<id>/<model>` that die of
 // quota, so one account can fail while its siblings answer.

@@ -37,6 +37,8 @@ Default flow: prepare the prompt → dispatch → wait for the final result → 
 | attention — `implement_uncommitted` | 5 | Changes exist but the requested delivery (commit/push/PR) didn't happen. Commit/deliver yourself or inspect (`git status`, `git diff`) before deciding. |
 | attention — `verification_incomplete` | 5 | The worker itself declared a verification still pending. **Run the pending build/test yourself** before accepting the work as done. |
 | attention — `gate_failed` | 5 | A companion-run `--gate`/`--gate-cmd` failed or timed out after the worker finished. Read `## Companion verification` in the report for the command, exit code, and output tail; fix the failure and `continue --job <id>` with the gate output, or inspect and fix it yourself. **Don't accept the work as done.** |
+| attention — `review_unresolved` | 5 | The F3 cross-review still had blocking findings after two fix rounds. Read `## Cross-review`: each finding has file, line and evidence. Decide yourself; don't accept the work as done. |
+| error — `worker_setup_failed` | 3 | The project's `worker_setup` command failed before agy started; the report has its output. Fix the setup (often the worker's database), then `restart <id>`. |
 | `quota_exhausted` | 6 | Switch to another worker or model with headroom (see the `pool` skill's `workers`) or wait for `resets_in`. **Never `continue` on the same model before the reset.** |
 | error / crashed | 3 | Read the report's `## Partial work` section and inspect the diff (`git status`, `git diff`) before any recovery. |
 | canceled | 4 | Read `## Partial work`, inspect the diff, then complete any already-authorized follow-up or report cancellation. |

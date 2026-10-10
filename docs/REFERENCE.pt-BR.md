@@ -75,6 +75,22 @@ O template do `implement` carrega uma seção `## Decision discipline`: reportar
 
 Antes do dispatch, o companion também varre o texto da tarefa em busca de uma **ordem positiva** para o próprio worker rodar um gate longo — `pnpm|npm|yarn|bun build|test|check|lint|typecheck`, `pytest`, `cargo test`/`build`, `go test`, um `tsc` isolado, ou `next build` — dentro de um bloco de código, um item de lista, ou uma frase imperativa ("run", "execute", "rode", "corra", "confirm with", "verify with", "then run"). Uma negação ("don't run", "não rode", "sem rodar") ou uma prosa descritiva que apenas cita o comando ("the CI runs pnpm build") não é uma ordem e é deixada de lado. Ao encontrar uma correspondência, o companion recusa antes de criar qualquer job e antes de o agy sequer ser invocado (exit 1), citando a linha em questão. Duas saídas: remover a ordem do briefing, ou passar `--allow-gate` para autorizar o worker a rodá-la. Essa verificação roda em toda fonte de texto de tarefa (`--prompt`, `--prompt-file`, `--stdin`) e no texto relido por `continue` e `restart`; um `--allow-gate` da execução original fica registrado no spec do job, então um `restart` simples de um job autorizado herda a autorização em vez de perguntar de novo.
 
+### Gates dentro do job, ambiente por worker, fatos e revisão cruzada (F3)
+
+**Gates dentro do job (padrão).** O prompt do implement nomeia os comandos de gate declarados e manda o worker rodá-los ele mesmo, em primeiro plano, até passarem, e colar a saída final em "How I verified it". O limite de gates completos deixa de valer para exatamente esses comandos. O companion ainda os roda depois para confirmar. `"gates_inside": false` no `.agy-staff/config.json` restaura o contrato anterior ("do not run it yourself").
+
+**Ambiente por worker.** `"worker_env"` mapeia nomes de variáveis para strings, com `{worker}` trocado pelo id do worker. Os valores chegam ao processo agy do worker, ao `"worker_setup"` e a todos os gates. `"worker_setup"` é um comando de uma linha que o companion roda antes do agy, uma vez por worker em que o job cai, inclusive depois de um fallback de quota. Uma falha termina o job `error`/`worker_setup_failed`, com a saída do comando e sem rodar o agy. Como `gates`, estas chaves, `facts` e `auto_review` caem para a config do worktree principal.
+
+**Fatos do projeto.** `"facts"` mapeia um nome para um comando. Em despachos de `implement`, `staffer` e `review`, cada comando roda na raiz do repositório (timeout de 20 s). A saída entra na tarefa como `## Project facts`, com até 4 KiB por fato e 16 KiB no total, e fica guardada no spec do job.
+
+**Revisão cruzada.** Depois que os gates confirmam um implement `done` num worker da pool, o companion o revisa em outra conta quando `"auto_review"` (padrão `"gemini"`) se aplica: `"gemini"` revisa jobs em modelo Gemini, `"all"` revisa todos, `"off"` nenhum, e o worker legado nunca é revisado.
+- O revisor é roteado por `claude-sonnet-4-6` → `gemini-3.1-pro-high`, nunca na conta do implementador.
+- Ele confere se cada símbolo usado existe, depois a aderência à tarefa e às regras, o escopo e as sobras de debug.
+- Achados `critical`/`high`/`medium` com `request_changes` voltam à conversa do implementador. Os gates verificam cada correção de novo, por no máximo 2 rodadas. Se ainda restarem achados bloqueantes, o job termina `attention`/`review_unresolved`.
+- O relatório ganha `## Cross-review`.
+
+**`pool-mcp <args do agy mcp…>`** roda `agy mcp <args>` em todos os workers descobertos e imprime uma linha por worker, mascarando valores com cara de credencial.
+
 ### Gates declarados: verificação executada pelo companion (`implement`/`continue`/`restart`)
 
 Enquanto `--allow-gate` autoriza o *worker* a rodar um gate por conta própria (dentro do próprio orçamento de tempo), os gates declarados fazem o *companion* rodar um ou mais comandos **depois** que o worker reporta done — nunca consumindo o orçamento do próprio agente, e nunca algo que o worker precise lembrar de fazer. Duas formas de declarar um gate para uma única execução:

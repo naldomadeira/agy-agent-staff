@@ -115,7 +115,7 @@ describe('job spec persistence', () => {
     assert.equal(spec.prompt_source.task, 'fix the thing');
     assert.match(spec.prompt, /## Decision discipline/);
     assert.match(spec.prompt, /fix the thing/);
-    assert.equal(spec.policy_version, 'implement-discipline-1');
+    assert.equal(spec.policy_version, 'implement-discipline-2');
   });
 
   test('policy_version is null for a non-implement mode', async () => {
@@ -183,6 +183,6 @@ describe('restart re-renders the section with the fresh timeout', () => {
     assert.equal(await waitForJob(sb, restartId), 'done');
     // The new job's own spec still gets a fresh policy_version, even though
     // the job it restarted from had none.
-    assert.equal(specOf(sb, restartId).policy_version, 'implement-discipline-1');
+    assert.equal(specOf(sb, restartId).policy_version, 'implement-discipline-2');
   });
 });

@@ -187,7 +187,7 @@ function routingChain(routeClass) {
 // discipline section (or the facts it's rendered with) changes meaning, so a
 // stored spec can be told apart from one written under an earlier policy.
 // Only implement carries a policy at all — every other mode's spec gets null.
-const IMPLEMENT_POLICY_VERSION = 'implement-discipline-1';
+const IMPLEMENT_POLICY_VERSION = 'implement-discipline-2';
 
 // agy only accepts effort-suffixed model ids; bare family names are rejected
 // with status ERROR ("--model gemini-3.8-flash requires --effort").
@@ -403,9 +403,17 @@ function validateGates(gates, source) {
  *  worktree's own profile choice is still its own.
  *  Returns `{ gates: object|null, source: <path used, for error messages> }`. */
 function loadGatesConfig() {
+  const { value, source } = loadSharedSetting('gates');
+  return { gates: value ? validateGates(value, source) : null, source };
+}
+
+/** One key of `.agy-staff/config.json`, from this workspace's config or,
+ *  when absent there, the main worktree's — the same fallback `gates` has,
+ *  for every setting a pool worktree needs but never has a config for. */
+function loadSharedSetting(key) {
   const own = configPath();
   const ownCfg = readJsonConfig(own);
-  if (ownCfg?.gates) return { gates: validateGates(ownCfg.gates, own), source: own };
+  if (ownCfg && ownCfg[key] !== undefined) return { value: ownCfg[key], source: own };
 
   const commonDir = sh('git', ['rev-parse', '--git-common-dir']);
   const gitDir = sh('git', ['rev-parse', '--git-dir']);
@@ -416,10 +424,16 @@ function loadGatesConfig() {
       // Standard `git worktree` layout: the common dir is <main-root>/.git.
       const mainConfig = path.join(path.dirname(common), '.agy-staff', 'config.json');
       const mainCfg = readJsonConfig(mainConfig);
-      if (mainCfg?.gates) return { gates: validateGates(mainCfg.gates, mainConfig), source: mainConfig };
+      if (mainCfg && mainCfg[key] !== undefined) return { value: mainCfg[key], source: mainConfig };
     }
   }
-  return { gates: null, source: own };
+  return { value: undefined, source: own };
+}
+
+/** `"gates_inside": false` returns to the old contract: the worker never
+ *  runs the gates, only the companion does, after it finishes. */
+function gatesInside() {
+  return loadSharedSetting('gates_inside').value !== false;
 }
 
 /** Create .agy-staff/ on first use and keep it out of `git status`.
@@ -506,7 +520,9 @@ function finishJob(id, output, fields) {
 }
 
 function rememberConversation(resolved, id, jobId) {
-  if (!id) return;
+  // A companion-run cross-review is not a conversation anyone continues;
+  // recording it would make `review --continue` resume it.
+  if (!id || resolved.ephemeral) return;
   updateState((state) => {
     state.conversations ||= {};
     state.conversations[resolved.mode] = id;
@@ -773,6 +789,7 @@ const COMMAND_SUMMARIES = {
   cancel: 'cancel <job-id>: stop a running job',
   workers: 'workers [--probe] [--json] [--suggest [--class <c>]]: list pool workers with Gemini and Anthropic/3p quota, or the best open options for a class',
   mode: 'mode [agy-first|mixed|off]: show or set how much work the host sends to the pool',
+  'pool-mcp': 'pool-mcp <add|remove|list|enable|disable> [agy mcp args…]: run the same `agy mcp` command on every discovered worker',
   setup: 'setup [--restrict <modes|none>] [--apply]: write the restricted-mode allowlist',
 };
 
@@ -1842,11 +1859,85 @@ function resolveGates(opts, inherited) {
  *  gateAuthorizationPrompt/{{GATE_AUTHORIZATION}} below — empty when no
  *  gates are declared, so an ordinary run renders byte-identical to before
  *  this existed. */
-function companionGatesPrompt(gates) {
+/**
+ * `"worker_env"` in .agy-staff/config.json: variables every pool job gets in
+ * its agy process, its setup command and its gates, with `{worker}` replaced
+ * by the worker id. It is how ten parallel workers share one Postgres
+ * without sharing a database: `"DATABASE_URL": "postgres://…/app_test_{worker}"`.
+ */
+function workerEnv(worker) {
+  const { value, source } = loadSharedSetting('worker_env');
+  if (value === undefined) return process.env;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) die(`project config: "worker_env" in ${source} must map names to strings`);
+  const id = String(worker?.id || LEGACY_WORKER_ID).replace(/[^\w]/g, '_');
+  const env = { ...process.env };
+  for (const [name, raw] of Object.entries(value)) {
+    if (typeof raw !== 'string') die(`project config: worker_env.${name} in ${source} must be a string`);
+    env[name] = raw.replaceAll('{worker}', id);
+  }
+  return env;
+}
+
+/** `"worker_setup"`: one command the companion runs, with the worker's env,
+ *  before the agy run on each worker a job lands on (create and migrate that
+ *  worker's database, say). A failure stops the job before agy starts. */
+async function runWorkerSetup(worker, cwd, jobId, signal) {
+  const { value, source } = loadSharedSetting('worker_setup');
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || !value.trim() || /[\r\n]/.test(value)) die(`project config: "worker_setup" in ${source} must be a single-line command`);
+  updateJob(jobId, { phase: 'setup', verifying_gate: null });
+  const result = await runGateCommand({ name: 'worker_setup', command: value, cwd, signal, env: workerEnv(worker),
+    timeoutMs: durationToMs(DEFAULT_GATE_TIMEOUT) });
+  updateJob(jobId, { phase: null });
+  if (result.exit !== 0 || result.timed_out) {
+    throw Object.assign(new Error(
+      `worker_setup failed on ${worker?.id || LEGACY_WORKER_ID} (\`${value}\`, ${gateResultLine(result)}); agy was not started.\n\n` +
+        '```\n' + result.output + '\n```'
+    ), { reason: 'worker_setup_failed' });
+  }
+  return result;
+}
+
+const FACT_BYTES = 4096;
+const FACTS_TOTAL_BYTES = 16384;
+
+/**
+ * `"facts"`: named commands whose output is pasted into the brief, so the
+ * worker chooses from the project's real closed sets (enum members, union
+ * literals, i18n keys, table columns) instead of plausible ones. A worker
+ * that invented `kind: "propose"` and `auditLog.proposalId` had the right
+ * file paths but never saw these lists.
+ */
+function projectFacts() {
+  const { value, source } = loadSharedSetting('facts');
+  if (value === undefined) return '';
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) die(`project config: "facts" in ${source} must map a name to a command`);
+  const blocks = [];
+  let total = 0;
+  for (const [name, command] of Object.entries(value)) {
+    if (typeof command !== 'string' || !command.trim()) die(`project config: facts.${name} in ${source} must be a command string`);
+    const r = spawnSync(command, { shell: true, cwd: repoRoot(), encoding: 'utf8', timeout: 20000, maxBuffer: 1 << 20, windowsHide: true });
+    const out = r.status === 0 ? excerpt(String(r.stdout || '').trim(), FACT_BYTES, false).text : `(command failed: exit ${r.status ?? r.signal ?? r.error?.message})`;
+    if (total + out.length > FACTS_TOTAL_BYTES) { blocks.push(`### ${name}\n(omitted: facts budget of ${FACTS_TOTAL_BYTES} bytes reached)`); continue; }
+    total += out.length;
+    blocks.push(`### ${name}\n\`$ ${command}\`\n\n\`\`\`\n${out || '(no output)'}\n\`\`\``);
+  }
+  return blocks.length
+    ? `\n\n## Project facts (generated by the companion just now)\n\nClosed sets and names from this repository. Use only values that appear here or that you open in the code yourself.\n\n${blocks.join('\n\n')}`
+    : '';
+}
+
+function companionGatesPrompt(gates, inside = true) {
   if (!gates?.length) return '';
   const commands = gates.map((g) => `\`${g.command}\``).join(', ');
   const pronoun = gates.length > 1 ? 'them' : 'it';
-  return ` After you finish, the companion runs ${commands} and reports the result — do not run ${pronoun} yourself.`;
+  if (!inside) return ` After you finish, the companion runs ${commands} and reports the result — do not run ${pronoun} yourself.`;
+  // Gates inside the job (the default): a worker that only learns of a red
+  // gate after it reported success hands over code that does not compile,
+  // and a `continue` with the errors fixed only the ones it was shown.
+  return ` The acceptance gate${gates.length > 1 ? 's are' : ' is'} ${commands}: run ${pronoun} yourself, in the foreground, ` +
+    `after your edits, and fix every failure until ${gates.length > 1 ? 'all pass' : 'it passes'} — this overrides the limit on full gates above. ` +
+    `Paste the final run's output under "How I verified it". After you finish, the companion runs ${pronoun} again to confirm.`;
 }
 
 /** "60m" -> "60 minutes", "2h" -> "2 hours", "45s" -> "45 seconds" — mirrors
@@ -1902,7 +1993,7 @@ function buildPrompt(mode, opts) {
     DELIVERY: mode === 'implement' ? deliveryAuthorizationPrompt(opts) : '',
     TIME_BUDGET: mode === 'implement' ? humanTimeBudget(opts.timeout) : '',
     GATE_AUTHORIZATION: mode === 'implement' ? gateAuthorizationPrompt(task, opts.allowGate) : '',
-    COMPANION_GATES: mode === 'implement' ? companionGatesPrompt(opts.gates) : '',
+    COMPANION_GATES: mode === 'implement' ? companionGatesPrompt(opts.gates, gatesInside()) : '',
   });
 }
 
@@ -2508,7 +2599,10 @@ async function cmdRun(mode, opts) {
     enterOriginalWorkspace(prior.cwd);
     if (prior.spec_file) { try { opts.json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
   }
-  const prompt = buildPrompt(mode, { prompt: task, deliver: opts.deliver, timeout: resolved.timeout, allowGate: resolved.allowGate, gates: resolved.gates });
+  // Facts are generated now, in the caller's workspace, and travel inside the
+  // stored prompt: a restart re-reads them from the spec, not from a newer tree.
+  const facts = ['implement', 'staffer', 'review'].includes(mode) ? projectFacts() : '';
+  const prompt = buildPrompt(mode, { prompt: task + facts, deliver: opts.deliver, timeout: resolved.timeout, allowGate: resolved.allowGate, gates: resolved.gates });
   return dispatch(resolved, prompt, { ...opts, workerPlan, promptSource: { kind: 'template', task } });
 }
 
@@ -2629,12 +2723,12 @@ async function dispatch(resolved, prompt, opts) {
  * reaps descendants on the way out, not only on timeout/cancel: a gate
  * command can leave background children running after its own shell exits.
  */
-async function runGateCommand({ name, command, cwd, timeoutMs, signal }) {
+async function runGateCommand({ name, command, cwd, timeoutMs, signal, env }) {
   const startedAt = Date.now();
   let root, trackingTimer, timeoutTimer, stopping = null, timedOut = false, canceled = false, output = '';
   const tracked = new Map();
   const child = spawn(command, {
-    cwd, shell: true, detached: process.platform !== 'win32', windowsHide: true,
+    cwd, env: env ?? process.env, shell: true, detached: process.platform !== 'win32', windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const append = (chunk) => { output = excerpt(output + chunk.toString('utf8'), 8192, true).text; };
@@ -2688,14 +2782,14 @@ async function runGateCommand({ name, command, cwd, timeoutMs, signal }) {
  *  before each one starts, so status/observe/wait --follow can show which
  *  gate is currently running while the job's own `status` field stays
  *  'running' throughout (see the `phase: 'verifying'` set by the caller). */
-async function runDeclaredGates(gates, gateTimeout, cwd, jobId, signal) {
+async function runDeclaredGates(gates, gateTimeout, cwd, jobId, signal, env) {
   const timeoutMs = durationToMs(gateTimeout) || durationToMs(DEFAULT_GATE_TIMEOUT);
   const results = [];
   let allPassed = true;
   for (const gate of gates) {
     if (signal.aborted) break;
     updateJob(jobId, { verifying_gate: gate.name });
-    const result = await runGateCommand({ name: gate.name, command: gate.command, cwd, timeoutMs, signal });
+    const result = await runGateCommand({ name: gate.name, command: gate.command, cwd, timeoutMs, signal, env });
     results.push(result);
     if (signal.aborted || result.exit !== 0 || result.timed_out) { allPassed = false; break; }
   }
@@ -2774,9 +2868,16 @@ async function workerMain(jobId) {
       if (!current?.available) throw new Error(`worker ${spec.resolved.worker.id} (${spec.resolved.worker.bin}) became unavailable after job creation; no automatic migration was attempted`);
     }
     opts = { ...spec.opts, jobId };
-    const runAttempt = (resolved, prompt) => executeRun(resolved, prompt, opts, (invoke) => {
+    const setUp = new Set();
+    const runAttempt = async (resolved, prompt) => {
+      const key = resolved.worker?.id || LEGACY_WORKER_ID;
+      if (!setUp.has(key)) {
+        await runWorkerSetup(resolved.worker, job.cwd, jobId, controller.signal);
+        setUp.add(key);
+      }
+      return executeRun(resolved, prompt, opts, (invoke) => {
       const agy = agyCommand(agyArgs(invoke, 'stream-json'), invoke.worker?.bin || AGY_BIN);
-      return runStreaming({ binary: agy.cmd, args: agy.args, job,
+      return runStreaming({ binary: agy.cmd, args: agy.args, job, env: workerEnv(invoke.worker),
         budget: durationToMs(spec.resolved.timeout) - (Date.now() - started), signal: controller.signal,
         update: (fields) => updateJob(jobId, fields),
         conversation: (id) => rememberConversation(spec.resolved, id, jobId),
@@ -2786,7 +2887,8 @@ async function workerMain(jobId) {
         }
         throw error;
       });
-    });
+      });
+    };
     let output;
     let current = spec.resolved;
     let prompt = spec.prompt;
@@ -2839,31 +2941,55 @@ async function workerMain(jobId) {
     // whole branch is unreachable for them, so no separate exclusion check
     // is needed here.
     const gates = spec.resolved.gates;
-    if (gates?.length && (outcome.status === 'done' || outcome.reason === 'verification_incomplete')) {
+    const verify = async (body, current0) => {
+      let result = { outcome: current0, finalOutput: body };
+      if (!(gates?.length && (current0.status === 'done' || current0.reason === 'verification_incomplete'))) return result;
       updateJob(jobId, { phase: 'verifying' });
-      const { results, allPassed } = await runDeclaredGates(gates, spec.resolved.gate_timeout, job.cwd, jobId, controller.signal);
+      const { results, allPassed } = await runDeclaredGates(gates, spec.resolved.gate_timeout, job.cwd, jobId, controller.signal, workerEnv(current.worker));
       if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
       const section = companionVerificationSection(results);
       const summary = gateResultSummary(results);
       if (allPassed) {
         // A passing declared gate is stronger evidence than the worker's own
         // "still pending" sentence — verification_incomplete becomes done too.
-        const supersedeNote = outcome.reason === 'verification_incomplete'
+        const supersedeNote = current0.reason === 'verification_incomplete'
           ? 'Note: the worker reported a verification still pending, but the declared gate(s) below passed — ' +
             'that pending claim is superseded, and this job is delivered as done.\n\n'
           : '';
-        outcome = { status: 'done', warnings: opts.warnings, ...telemetry, gate_results: summary };
-        finalOutput = `${supersedeNote}${output}\n${section}`;
+        result = { outcome: { status: 'done', warnings: opts.warnings, ...telemetry, gate_results: summary }, finalOutput: `${supersedeNote}${body}\n${section}` };
       } else {
         const afterLines = porcelainSnapshot();
-        outcome = { status: 'attention', reason: 'gate_failed', warnings: true, ...telemetry, gate_results: summary,
-          partial_files: partialFileCount(opts.runWorkspaceBefore ?? null, afterLines) };
         const partial = partialWorkReport({
           status: 'attention', reason: 'gate_failed',
           beforeLines: opts.runWorkspaceBefore ?? null, afterLines,
           headBefore: opts.runHeadBefore ?? null, headAfter: headSnapshot(), finished: true,
         });
-        finalOutput = `Job needs attention: a companion verification gate failed.\n\n${output}\n${section}\n${partial}`;
+        result = {
+          outcome: { status: 'attention', reason: 'gate_failed', warnings: true, ...telemetry, gate_results: summary,
+            partial_files: partialFileCount(opts.runWorkspaceBefore ?? null, afterLines) },
+          finalOutput: `Job needs attention: a companion verification gate failed.\n\n${body}\n${section}\n${partial}`,
+        };
+      }
+      return result;
+    };
+    ({ outcome, finalOutput } = await verify(output, outcome));
+
+    // F3: an independent review on another account, after green gates, for
+    // the jobs that need it most (Gemini by default). Up to two fix rounds in
+    // the implementer's own conversation, each re-verified by the gates.
+    if (outcome.status === 'done' && spec.resolved.mode === 'implement' && autoReviewApplies(current)) {
+      const reviewed = await crossReview({ jobId, job, task: spec.prompt_source?.task || spec.prompt, current, opts,
+        signal: controller.signal, fix: async (fixPrompt) => {
+          opts.retryBaseline ||= { workspace: opts.runWorkspaceBefore ?? null, head: opts.runHeadBefore ?? null };
+          const conversation = findJob(jobId)?.conversation_id || null;
+          const body = await runAttempt({ ...current, conversation }, fixPrompt);
+          const fixedOutcome = opts.implementNoop ? { status: 'attention', reason: 'implement_no_changes', warnings: true, ...telemetry }
+            : { status: 'done', warnings: opts.warnings, ...telemetry };
+          return verify(body, fixedOutcome);
+        } });
+      if (reviewed) {
+        finalOutput = `${reviewed.finalOutput ?? finalOutput}\n${reviewed.section}`;
+        outcome = { ...(reviewed.outcome ?? outcome), review: reviewed.summary };
       }
     }
 
@@ -2919,6 +3045,149 @@ async function workerMain(jobId) {
     process.removeListener('SIGTERM', onSignal);
     process.removeListener('SIGINT', onSignal);
   }
+}
+
+// ---------------------------------------------------------------------------
+// cross-review (F3)
+// ---------------------------------------------------------------------------
+
+const REVIEW_CHAIN = ['claude-sonnet-4-6', 'gemini-3.1-pro-high'];
+const MAX_REVIEW_FIX_ROUNDS = 2;
+const BLOCKING_SEVERITIES = new Set(['critical', 'high', 'medium']);
+
+/** `"auto_review"`: `"gemini"` (default) reviews pool jobs that ran on a
+ *  Gemini model, `"all"` every pool job, `"off"` none. The legacy single
+ *  worker is never auto-reviewed: there is no second account to do it. */
+function autoReviewApplies(current) {
+  const { value } = loadSharedSetting('auto_review');
+  const setting = value ?? 'gemini';
+  if (setting === 'off' || !current.worker || current.worker.id === LEGACY_WORKER_ID) return false;
+  return setting === 'all' || quotaPoolForModel(current.model) === 'gemini';
+}
+
+function crossReviewPrompt(task) {
+  return [
+    'You are reviewing an uncommitted change that another engineer just made in this workspace for the task below.',
+    'Run `git diff` and `git status --short` (read new untracked files too) and review only that change. Do not edit any file.',
+    '',
+    'Check, in this order:',
+    '1. Symbols that do not exist. For every import, type, function, enum member, union literal, DB column, config key, i18n key or fixture field the change uses, open its definition and confirm it exists with that exact name and shape. An invented one is a `high` finding at least.',
+    '2. Behaviour that contradicts the task or the project rules (AGENTS.md and the conventions of the surrounding code).',
+    '3. Changes outside the task, and leftovers such as debug output.',
+    '4. Claims in code comments or tests that the code does not back.',
+    '',
+    'Every finding needs file, line, and the evidence you checked (the definition, the rule). Use `request_changes` only for findings that must be fixed before this is accepted; otherwise `approve`.',
+    '',
+    '## Task under review',
+    '',
+    task,
+  ].join('\n');
+}
+
+function parseReviewVerdict(text) {
+  const start = text.indexOf('{');
+  for (let end = text.lastIndexOf('}'); start >= 0 && end > start; end = text.lastIndexOf('}', end - 1)) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1));
+      if (parsed && typeof parsed.verdict === 'string') return parsed;
+    } catch { /* keep shrinking */ }
+  }
+  return null;
+}
+
+/** Reserve a reviewer on another account: never the implementer's own. */
+async function pickReviewer(jobId, current) {
+  const workers = await discoverWorkers({ config: configPath() });
+  const exclude = [{ id: current.worker.id, pool: '3p' }, { id: current.worker.id, pool: 'gemini' }];
+  return updateState((state) => {
+    const activeJobs = (state.jobs || []).filter((j) => j.id !== jobId && liveJobStatus(j) === 'running');
+    const route = routeWorker({ workers, chain: REVIEW_CHAIN, activeJobs, exclude });
+    const job = state.jobs?.find((j) => j.id === jobId);
+    if (route && job) job.review_worker = { id: route.worker.id, bin: route.worker.bin };
+    return route;
+  });
+}
+
+async function runCrossReview(jobId, job, task, reviewer, signal) {
+  const resolved = { mode: 'review', model: reviewer.model, profile: 'unrestricted', profileSource: 'default',
+    background: true, timeout: '20m', conversation: null, ephemeral: true,
+    worker: { id: reviewer.worker.id, bin: reviewer.worker.bin, version: reviewer.worker.version ?? null, capacity: reviewer.worker.capacity } };
+  const reviewJob = { ...job, id: `${jobId}-review`,
+    events_file: job.events_file.replace(/\.events\.jsonl$/, '.review.events.jsonl'),
+    progress_file: job.progress_file.replace(/\.progress\.json$/, '.review.progress.json') };
+  const before = porcelainSnapshot();
+  const body = await executeRun(resolved, crossReviewPrompt(task), { json: true, jobId: null }, (invoke) => {
+    const agy = agyCommand(agyArgs(invoke, 'stream-json'), invoke.worker.bin);
+    return runStreaming({ binary: agy.cmd, args: agy.args, job: reviewJob, env: workerEnv(invoke.worker),
+      budget: durationToMs('20m'), signal, update: () => {}, conversation: () => {} });
+  });
+  const after = porcelainSnapshot();
+  const touched = before && after && !snapshotsEqual(before, after);
+  return { verdict: parseReviewVerdict(body), raw: body, touched };
+}
+
+function reviewFindingsText(verdict) {
+  return (verdict.findings || [])
+    .filter((finding) => BLOCKING_SEVERITIES.has(finding.severity))
+    .map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.file || '?'}${finding.line ? `:${finding.line}` : ''} — ${finding.title}\n   ${finding.detail}`)
+    .join('\n');
+}
+
+/**
+ * Review → fix → re-verify, at most MAX_REVIEW_FIX_ROUNDS fixes. Returns the
+ * report section, a summary for the job record and, when a fix round ran,
+ * the new outcome and output; null when no reviewer could be reserved.
+ */
+async function crossReview({ jobId, job, task, current, signal, fix }) {
+  const rounds = [];
+  let latest = null;
+  for (let round = 1; round <= MAX_REVIEW_FIX_ROUNDS + 1; round++) {
+    updateJob(jobId, { phase: 'reviewing' });
+    const reviewer = await pickReviewer(jobId, current);
+    if (!reviewer) {
+      rounds.push({ round, verdict: 'skipped', note: 'no other account had a review model open' });
+      break;
+    }
+    let review;
+    try {
+      review = await runCrossReview(jobId, job, task, reviewer, signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      rounds.push({ round, reviewer: `${reviewer.worker.id}/${reviewer.model}`, verdict: 'failed', note: error.reason || error.message.split('\n')[0] });
+      break;
+    } finally {
+      updateJob(jobId, { review_worker: null });
+    }
+    const verdict = review.verdict;
+    const blocking = verdict ? reviewFindingsText(verdict) : '';
+    rounds.push({ round, reviewer: `${reviewer.worker.id}/${reviewer.model}`, verdict: verdict?.verdict ?? 'unparsed',
+      blocking: blocking ? blocking.split('\n').filter((line) => /^\d+\./.test(line)).length : 0,
+      summary: verdict?.summary ?? null, touched_files: review.touched || false, findings: blocking });
+    if (!verdict || verdict.verdict !== 'request_changes' || !blocking) break;
+    if (round > MAX_REVIEW_FIX_ROUNDS) {
+      latest = { ...(latest || {}), unresolved: true };
+      break;
+    }
+    updateJob(jobId, { phase: 'fixing' });
+    const fixPrompt = 'An independent reviewer on another account checked your change and requires these fixes:\n\n' +
+      `${blocking}\n\nFor each one, open the definition or rule it cites, confirm it, and fix it (or explain with evidence why it is wrong). ` +
+      'Then run the acceptance gates again until they pass and report as before, with real output.';
+    latest = await fix(fixPrompt);
+    if (latest.outcome.status !== 'done') break;
+  }
+  updateJob(jobId, { phase: null });
+  const lines = rounds.map((r) => `- Round ${r.round}${r.reviewer ? ` (${r.reviewer})` : ''}: ${r.verdict}` +
+    `${r.blocking ? `, ${r.blocking} blocking finding(s)` : ''}${r.note ? ` — ${r.note}` : ''}${r.touched_files ? ' — WARNING: the reviewer changed files' : ''}` +
+    `${r.summary ? `\n  ${r.summary}` : ''}${r.findings ? `\n${r.findings.split('\n').map((line) => `  ${line}`).join('\n')}` : ''}`);
+  const unresolved = latest?.unresolved === true;
+  if (unresolved) lines.push('', `Needs human: blocking findings remain after ${MAX_REVIEW_FIX_ROUNDS} fix rounds.`);
+  const section = `## Cross-review\n${lines.join('\n')}\n`;
+  const summary = rounds.map(({ findings, ...rest }) => rest);
+  if (unresolved) {
+    return { section, summary, finalOutput: latest.finalOutput,
+      outcome: { ...(latest.outcome || {}), status: 'attention', reason: 'review_unresolved', warnings: true } };
+  }
+  return { section, summary, finalOutput: latest?.finalOutput, outcome: latest?.outcome };
 }
 
 /**
@@ -3281,6 +3550,41 @@ function readMode() {
   } catch {
     return { mode: 'off' };
   }
+}
+
+/**
+ * The same `agy mcp …` on every account. Each profile keeps its own MCP
+ * config, so a server added once reaches one worker out of ten; this is the
+ * loop people otherwise type by hand. Unavailable workers are skipped.
+ */
+/** `agy mcp list` prints each server's full command line, credentials
+ *  included (`--password=…`, `-e TOKEN=…`). Mask the value of anything that
+ *  looks like one before it reaches a transcript. */
+function redactSecrets(text) {
+  const names = '[\\w-]*(?:password|passwd|secret|token|api[_-]?key|authorization|auth)[\\w-]*';
+  return text
+    .replace(/(Bearer\s+)\S+/gi, '$1***')
+    .replace(new RegExp(`((?:^|[\\s"'])${names}\\s*[=:]\\s*)(?!Bearer\\b)("[^"]*"|'[^']*'|\\S+)`, 'gi'), '$1***')
+    .replace(new RegExp(`((?:^|\\s)--?${names}\\s+)(?!-)(\\S+)`, 'gi'), '$1***');
+}
+
+async function cmdPoolMcp(args) {
+  if (!args.length || args[0] === '--help' || args[0] === '-h') {
+    process.stdout.write(commandHelp('pool-mcp') + '\nexample: pool-mcp add context7 npx -y @upstash/context7-mcp\n');
+    if (!args.length) process.exitCode = 1;
+    return;
+  }
+  const workers = (await discoverWorkers({ config: configPath() })).filter((worker) => worker.status !== 'unavailable');
+  if (!workers.length) die('no AGY worker discovered');
+  let failed = 0;
+  for (const worker of workers) {
+    const agy = agyCommand(['mcp', ...args], worker.bin);
+    const r = spawnSync(agy.cmd, agy.args, { encoding: 'utf8', timeout: 60000, windowsHide: true });
+    const out = redactSecrets(`${r.stdout || ''}${r.stderr || ''}`.trim().split('\n').slice(-3).join(' | '));
+    if (r.status !== 0) failed++;
+    process.stdout.write(`${worker.id}: ${r.status === 0 ? 'ok' : `failed (exit ${r.status ?? r.signal})`}${out ? ` — ${out}` : ''}\n`);
+  }
+  if (failed) process.exitCode = 1;
 }
 
 function cmdMode(opts) {
@@ -3798,7 +4102,7 @@ async function cmdContinue(opts) {
   // one-line note buildPrompt's {{COMPANION_GATES}} injects for a fresh
   // implement dispatch — resolved.gates already carries this call's
   // resolution (explicit or inherited; see resolveGates via resolveRun above).
-  const gatesNote = resolved.gates?.length ? `\n\n${companionGatesPrompt(resolved.gates).trim()}` : '';
+  const gatesNote = resolved.gates?.length ? `\n\n${companionGatesPrompt(resolved.gates, gatesInside()).trim()}` : '';
   const prompt = `${workspace ? `${workspace}\n\n` : ''}Follow-up in the same conversation:\n\n${task}${gatesNote}`;
   let json = opts.json;
   if (prior?.spec_file) { try { json ||= JSON.parse(fs.readFileSync(prior.spec_file, 'utf8')).opts.json; } catch {} }
@@ -3840,7 +4144,7 @@ async function cmdRestart(opts) {
   if (opts.timeout) {
     resolved.timeout = resolveRun(job.mode, { ...opts, model: resolved.model, [resolved.profile]: true }).timeout;
   }
-  const gatesNote = resolved.gates?.length ? companionGatesPrompt(resolved.gates).trim() : '';
+  const gatesNote = resolved.gates?.length ? companionGatesPrompt(resolved.gates, gatesInside()).trim() : '';
   let prompt;
   if (source.kind === 'template') prompt = buildPrompt(job.mode, { prompt: source.task, timeout: resolved.timeout, allowGate: resolved.allowGate, gates: resolved.gates });
   else if (source.kind === 'followup') prompt = `${job.mode === 'implement' ? dirtyWorkspacePrompt() + '\n\n' : ''}Follow-up task in a fresh conversation:\n\n${source.task}${gatesNote ? `\n\n${gatesNote}` : ''}`;
@@ -4037,6 +4341,9 @@ function main() {
         'Per-repo policy: `setup --restrict review,research` makes those modes restricted by default here.'
     );
   }
+  // pool-mcp forwards its arguments verbatim to `agy mcp`, flags included
+  // (`-e KEY=value`, `--`), so it never goes through the companion's parser.
+  if (cmd === 'pool-mcp') return cmdPoolMcp(rest);
   // --help/-h is answered before parsing: a run command's parser rejects any
   // positional, and help must work whatever else was typed alongside it.
   if (rest.includes('--help') || rest.includes('-h')) {

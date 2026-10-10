@@ -42,7 +42,7 @@ The command returns a job id. Read `../agy-jobs/SKILL.md` for result collection 
 - `--prompt <text>` / `--prompt-file <path>` / `--stdin` — the task, from exactly one of these three sources. Use file/stdin for long prompts.
 - `--gate <names>` / `--gate-cmd <cmd>` / `--gate-timeout <dur>` / `--allow-gate` — see "Don't brief agy to run its own gate" below.
 
-## Don't brief agy to run its own gate
+## Don't brief agy to run its own gate; declare it
 
 Never order a full build/test/lint/typecheck baseline in the briefing (e.g. "run `pnpm check` and `pnpm build` to confirm the state of the project") — a briefing like that refuses **before dispatch** (exit 1, no job, no agy call), because the worker has burned entire runs on the gate instead of the task. Targeted tests for what you changed are fine in the briefing (`pnpm test src/x.test.ts`, `pytest tests/x.py -k foo`, `go test ./pkg/...`).
 
@@ -52,7 +52,13 @@ To prove the result instead, declare a gate for the COMPANION to run after the w
 {"gates": {"check": "pnpm check", "build": "pnpm build"}}
 ```
 
-in `.agy-staff/config.json`, then dispatch with `--gate check,build`. A failing or timed-out gate ends the job `attention`/`gate_failed`; a passing gate turns even a worker's own `verification_incomplete` into `done`. Use `--gate-cmd "<cmd>"` for a one-off command with no config entry.
+in `.agy-staff/config.json`, then dispatch with `--gate check,build`. The companion tells the worker the gate commands and has it **run them itself until green** before reporting (the time-budget limit on full gates is lifted for exactly those commands). It then runs them again to confirm. A failing or timed-out confirmation ends the job `attention`/`gate_failed`; a passing one turns even a worker's own `verification_incomplete` into `done`. `"gates_inside": false` in the config restores the old contract, where only the companion runs them. Use `--gate-cmd "<cmd>"` for a one-off command with no config entry.
+
+**Gates that need a database.** With parallel workers, give each its own: `"worker_env": {"DATABASE_URL": "postgres://localhost:54339/app_test_{worker}"}` reaches the worker's agy process, its gates and `"worker_setup"`. `worker_setup` is one command the companion runs before agy on each worker a job lands on, for example creating and migrating that database. A failing setup ends the job `error`/`worker_setup_failed` before agy starts.
+
+**Closed sets go in the brief, not in the worker's imagination.** `"facts": {"CapabilityKind values": "<command that prints them>"}` runs each command at dispatch and pastes its output under `## Project facts` in the brief (up to 4 KiB each, 16 KiB in total). Use it for enum members, union literals, i18n keys and table columns: what the worker would otherwise guess.
+
+**Cross-review.** A pool job that ran on a Gemini model is reviewed after green gates by another account (`claude-sonnet-4-6`, or `gemini-3.1-pro-high` in a fresh session). The review looks for symbols that do not exist, behaviour against the task or the rules, and changes outside the scope. Blocking findings are sent back to the implementer's own conversation for up to two fix rounds, each re-verified by the gates. If they persist, the job ends `attention`/`review_unresolved`. The report gains `## Cross-review`. Set `"auto_review"` to `"all"` or `"off"` to change this; the legacy single worker is never auto-reviewed.
 
 Only pass `--allow-gate` when the user explicitly wants agy itself to run the gate inside its own run (it authorizes a detected order instead of refusing it) — prefer `--gate` so the companion verifies the result independently.
 

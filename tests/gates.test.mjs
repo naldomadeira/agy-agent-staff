@@ -122,14 +122,27 @@ describe('a passing gate keeps the job done, with a Companion verification secti
     assert.match(statusOut, /"exit":\s*0/);
   });
 
-  test('the implement prompt tells the worker the companion will run the gate itself', async () => {
+  test('the implement prompt has the worker run the gate itself until green, then the companion confirms', async () => {
     const sb = sandbox('gates-prompt-note');
     writeGates(sb.repo, { check: nodeCmd('process.exit(0)') });
     const r = run(sb, ['implement', '--gate', 'check', '--prompt', 'a task'], touchEnv(sb));
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id), 'done');
     const [argv] = await waitForCalls(sb, 1);
-    assert.match(promptOf(argv), /the companion runs/);
+    assert.match(promptOf(argv), /run it yourself, in the foreground, after your edits, and fix every failure until it passes/);
+    assert.match(promptOf(argv), /the companion runs it again to confirm/);
+    assert.doesNotMatch(promptOf(argv), /do not run it yourself/);
+  });
+
+  test('"gates_inside": false keeps the old contract: only the companion runs the gate', async () => {
+    const sb = sandbox('gates-prompt-outside');
+    fs.mkdirSync(path.join(sb.repo, '.agy-staff'), { recursive: true });
+    fs.writeFileSync(path.join(sb.repo, '.agy-staff', 'config.json'),
+      JSON.stringify({ gates: { check: nodeCmd('process.exit(0)') }, gates_inside: false }));
+    const r = run(sb, ['implement', '--gate', 'check', '--prompt', 'a task'], touchEnv(sb));
+    const id = jobIdOf(r.stdout);
+    assert.equal(await waitForJob(sb, id), 'done');
+    const [argv] = await waitForCalls(sb, 1);
     assert.match(promptOf(argv), /do not run it yourself/);
   });
 });
