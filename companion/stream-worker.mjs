@@ -233,7 +233,7 @@ export async function stopExecution(root, known = [], table = processTable) {
   signal(table(), 'SIGKILL');
 }
 
-export async function runStreaming({ binary, args, job, budget, signal, update, conversation }) {
+export async function runStreaming({ binary, args, job, budget, signal, update, conversation, env }) {
   const hardDeadline = Date.now() + Math.max(0, budget);
   const rawFd = fs.openSync(job.events_file, 'a');
   const projection = createProjection(conversation);
@@ -282,6 +282,7 @@ export async function runStreaming({ binary, args, job, budget, signal, update, 
     // On Windows, detached: true creates a new console window; piped stdio keeps the
     // process stream connected. On POSIX, detached: true creates a new process group.
     child = spawn(binary, args, {
+      env: env ?? process.env,
       detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
