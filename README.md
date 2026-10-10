@@ -115,6 +115,8 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 | Inspect or select an AGY worker | `/agy:pool workers` |
 | Route by live quota across accounts | `implement --model auto` (`--class feature\|mechanical\|review\|research\|design`) |
 | Prioritize the pool for this work | `/agy:mode agy-first` |
+| Run a whole spec across the accounts | write `plan.json`, then `run-spec plan.json` (see `skills/lead/references/run-spec.md`) |
+| Watch accounts, quota and jobs live | `agy-companion.mjs top`, or `dashboard` for a local web page |
 | Job ops (wait/status/cancel/continue) | natural language: "is the agy job done?", "continue: also check the error path" |
 
 `reviewer` is fully prompt-based: you describe the subject and agy gathers the evidence itself (`gh pr view`, `git diff`, reading the file) — there is no flag for handing it a diff. It has two flavors, routed by subject: code review (severity-ranked findings) and general review (a multi-angle challenge of a plan, design, or decision).

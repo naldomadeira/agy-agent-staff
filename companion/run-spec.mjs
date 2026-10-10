@@ -250,6 +250,20 @@ function cancelMarker(root, id) {
   return path.join(runsDir(root), id, 'cancel');
 }
 
+/** Every run recorded here, summarized for the dashboard and `top`. */
+export function listRuns(root) {
+  const dir = runsDir(root);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((name) => fs.existsSync(statePathFor(root, name))).sort().flatMap((id) => {
+    try {
+      const state = readJSON(statePathFor(root, id));
+      const tasks = Object.values(state.tasks);
+      return [{ id, name: state.name, status: liveStatus(state), started_at: state.started_at, total: tasks.length,
+        done: tasks.filter((t) => t.status === 'done').length, waiting: tasks.filter((t) => t.status === 'waiting_quota').length }];
+    } catch { return []; }
+  });
+}
+
 function loadRun(root, id) {
   const file = statePathFor(root, id);
   if (!fs.existsSync(file)) throw new Error(`no run ${id} in this repository`);

@@ -37,6 +37,13 @@ A project overrides or adds classes in `.agy-staff/config.json` (`"routing": {"f
 
 **Quota deaths are recovered inside the job.** When a job whose worker was picked by `auto` hits `quota_exhausted`, the companion moves it to another account with the same pool open. For a `--model auto` job it then steps down the chain. It makes at most four attempts. Each new attempt starts a fresh conversation, sees the partial edits the dead attempt left (flagged as unverified), and is listed under `## Routing` in the report. A worker you named with `--worker <id>`, and any continuation, stays where you put it.
 
+**Watching the pool.**
+- `top`: a live terminal view of every account's Gemini and 3p bars with reopen times, the jobs running in this repository with their last step, active runs, recent outcomes, and 14 days of results per model. Keys: `q` quits, `p` probes stale readings.
+- `dashboard [--port 7377]`: the same view as a local web page on 127.0.0.1, live over server-sent events.
+- `status --line`: one line for a status bar.
+
+All three read the quota cache and `usage.jsonl`, the per-job history of worker, model, pool, duration, tokens, and slack at start and at end. None of them starts agy. Suggest `top` or `dashboard` to a user who wants to follow a run.
+
 **One MCP config for ten accounts: `pool-mcp`.** Each profile keeps its own MCP servers. `pool-mcp <agy mcp args…>` runs the same `agy mcp` command on every discovered worker, for example `pool-mcp add context7 npx -y @upstash/context7-mcp` or `pool-mcp list`. It masks credential-looking values in what it prints.
 
 **Status is three-way, not a boolean.** `available` answered `--version`; `unavailable` is not there (no such binary, or not executable); `unknown` exists but did not answer in time, even after a longer retry. `unknown` is eligible for `--worker auto`, ranked behind everything that answered: it is used when nothing better is free, never instead of a worker that answered. Idle capacity never reports itself, while a dispatch to a dead worker fails fast and says so. The distinction earns its keep: a wrapper that provisions a keychain on first use takes seconds to answer, and calling that "unavailable" sends you hunting an installation problem that is not there.

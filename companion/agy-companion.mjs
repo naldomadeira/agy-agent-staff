@@ -114,9 +114,10 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
-import { appendInbox, repoKey } from './inbox.mjs';
-import { cmdRunSpec, cmdRunStatus, cmdRunWait, cmdRunCancel, runMain } from './run-spec.mjs';
-import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
+import { appendInbox, appendUsage, readInbox, readUsage, repoKey } from './inbox.mjs';
+import { cmdRunSpec, cmdRunStatus, cmdRunWait, cmdRunCancel, listRuns, runMain } from './run-spec.mjs';
+import { aggregateUsage, runTop, serveDashboard } from './views.mjs';
+import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, quotaNow, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
 import { agyLaunch } from './agy-launch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -520,6 +521,12 @@ function finishJob(id, output, fields) {
     appendInbox({ repo: repoKey(job.cwd || process.cwd()), job: job.id, mode: job.mode, status: job.status,
       reason: job.reason || null, worker: job.worker?.id || null, model: job.model || null,
       line: jobStatusLine(job, job.status).replace(/^STATUS: /, ''), collect: `result ${job.id}`, cwd: job.cwd || null });
+    appendUsage({ repo: repoKey(job.cwd || process.cwd()), job: job.id, mode: job.mode, status: job.status, reason: job.reason || null,
+      worker: job.worker?.id || null, model: job.model || null, pool: quotaPoolForModel(job.model),
+      started_at: job.started_at, duration_seconds: Math.round((Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000),
+      tokens: job.usage?.total_tokens ?? null, attempts: (job.attempts?.length || 0) + 1,
+      slack_start: job.slack_at_start ?? null,
+      slack_end: job.worker && job.worker.id !== LEGACY_WORKER_ID ? quotaNow(job.worker.bin, job.model) : null });
     return job;
   });
 }
@@ -550,7 +557,7 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout', 'class', 'max-parallel']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout', 'class', 'max-parallel', 'port']);
 const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate', 'probe', 'line', 'suggest']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
@@ -687,7 +694,7 @@ function parseFlags(argv, { taskCommand = false } = {}) {
 //   - `json` is read unconditionally by `continue` (it forwards whatever was
 //     passed) but only changes anything when the resumed conversation's mode
 //     is `review` — same as a direct `review --json` call.
-const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', 'mode', 'run-spec', 'run-status', 'run-wait', 'run-cancel', '_worker', '_run'];
+const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', 'mode', 'run-spec', 'run-status', 'run-wait', 'run-cancel', 'top', 'dashboard', '_worker', '_run'];
 
 const FLAG_SCOPE = {
   // task text (taskText(), called from cmdRun/cmdContinue). Also accepted,
@@ -748,6 +755,7 @@ const FLAG_SCOPE = {
   // explicitly and still writes nothing").
   'dry-run': ['setup', 'run-spec'],
   'max-parallel': ['run-spec'],
+  port: ['dashboard'],
 };
 
 const FLAG_SCOPE_DESCRIPTIONS = {
@@ -776,6 +784,7 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   line: 'it prints one short pool/quota/jobs line for a status bar',
   class: 'it picks the routing chain (feature, mechanical, review, research, design, or a project class) for --model auto and workers --suggest',
   suggest: 'it lists the best open model/worker options for a --class instead of the full table',
+  port: 'it sets the local port the dashboard listens on (default 7377, 127.0.0.1 only)',
   'max-parallel': 'it caps how many plan tasks run at once (default 4, or the plan\'s "max_parallel")',
   apply: 'it confirms writing the setup allowlist',
   'dry-run': "it previews without writing (setup) or prints the plan's waves without starting anything (run-spec)",
@@ -800,6 +809,8 @@ const COMMAND_SUMMARIES = {
   'run-status': 'run-status [run-id] [--json]: list runs, or one run\'s tasks',
   'run-wait': 'run-wait <run-id> [--follow] [--timeout <dur>]: block until a run finishes, then print its report',
   'run-cancel': 'run-cancel <run-id>: stop a run and its running jobs',
+  top: 'top: live terminal view of accounts, quota, running jobs, runs and recent outcomes (q quits)',
+  dashboard: 'dashboard [--port 7377]: local web page with the same view, live, plus usage history',
   'pool-mcp': 'pool-mcp <add|remove|list|enable|disable> [agy mcp args…]: run the same `agy mcp` command on every discovered worker',
   setup: 'setup [--restrict <modes|none>] [--apply]: write the restricted-mode allowlist',
 };
@@ -2665,6 +2676,7 @@ async function dispatch(resolved, prompt, opts) {
     // How the worker was chosen decides how far a quota death may move the
     // job: `auto` may change account, a routed model may also change model,
     // an explicitly named worker or a continuation stays where it was put.
+    if (resolved.worker && resolved.worker.id !== LEGACY_WORKER_ID) record.slack_at_start = quotaNow(resolved.worker.bin, resolved.model);
     resolved.worker_selection = opts.workerPlan?.selection
       || (opts.workerPlan?.requested === 'auto' ? 'auto' : opts.workerPlan?.requested ? 'explicit' : opts.workerPlan?.affinity ? 'affinity' : 'legacy');
     fs.writeFileSync(specFile, JSON.stringify({
@@ -3513,6 +3525,46 @@ async function cmdPoolStatus(opts) {
 }
 
 const STATUS_FRESH_MS = 10 * 60 * 1000;
+
+/** Everything `top` and `dashboard` draw: the pool summary and workers
+ *  (no `--version` probe — this redraws every few seconds), this repository's
+ *  recent jobs with their last tool step, its runs, the inbox, and 14 days of
+ *  usage history aggregated per worker and per model. */
+async function viewSnapshot() {
+  const workers = await discoverWorkers({ config: configPath(), probe: false });
+  let jobs = [];
+  try { jobs = loadState().jobs || []; } catch { /* no state here yet */ }
+  const live = jobs.map((job) => ({ job, status: liveJobStatus(job) }));
+  const active = live.filter((entry) => entry.status === 'running').map((entry) => entry.job);
+  const repo = repoKey(process.cwd());
+  return {
+    generated_at: new Date().toISOString(),
+    mode: readMode().mode,
+    summary: poolSummary(workers, active),
+    workers: workers.map((worker) => workerJSON(worker, active)),
+    jobs: live.slice(-15).reverse().map(({ job, status }) => ({
+      id: job.id, mode: job.mode, status, reason: job.reason || null, worker: job.worker?.id || null, model: job.model || null,
+      phase: job.phase || null, started_at: job.started_at, finished_at: job.finished_at || null,
+      elapsed_seconds: Math.round(((Date.parse(job.finished_at) || Date.now()) - Date.parse(job.started_at)) / 1000),
+      last_activity: status === 'running' ? lastActivity(job) : null,
+    })),
+    runs: listRuns(repoRoot()),
+    inbox: readInbox().filter((entry) => entry.repo === repo).slice(-30),
+    usage: aggregateUsage(readUsage()),
+  };
+}
+
+/** The newest tool step of a running job, one short line. */
+function lastActivity(job) {
+  try {
+    const progress = JSON.parse(fs.readFileSync(job.progress_file, 'utf8'));
+    const step = (progress.recent_activities || []).slice(-1)[0];
+    if (!step) return progress.latest_text ? String(progress.latest_text).replace(/\s+/g, ' ').slice(0, 80) : null;
+    return `${step.tool || 'step'} ${String(step.input_preview || '').replace(/\s+/g, ' ')}`.trim().slice(0, 80);
+  } catch {
+    return null;
+  }
+}
 
 function poolSummary(workers, active, now = Date.now()) {
   const known = workers.filter((worker) => worker.status !== 'unavailable');
@@ -4407,6 +4459,15 @@ function main() {
       return cmdRunCancel({ root: repoRoot(), id: opts._[0], companion: SELF });
     case '_run':
       return runMain({ root: repoRoot(), id: rest[0], companion: SELF });
+    case 'top':
+      return runTop({ snapshot: viewSnapshot, probe: async () => { await refreshQuota(await discoverWorkers({ config: configPath() })); } });
+    case 'dashboard': {
+      const port = opts.port === undefined ? 7377 : Number.parseInt(opts.port, 10);
+      if (!(port > 0 && port < 65536)) die('--port must be a TCP port number');
+      return serveDashboard({ snapshot: viewSnapshot, port, log: (line) => process.stderr.write(`dashboard: ${line}\n`) })
+        .then(() => process.stdout.write(`agy dashboard on http://127.0.0.1:${port}/ (Ctrl-C to stop)\n`))
+        .catch((error) => die(error.code === 'EADDRINUSE' ? `port ${port} is in use; pass --port <n>` : error.message));
+    }
     case '_worker':
       return workerMain(rest[0]);
     default:

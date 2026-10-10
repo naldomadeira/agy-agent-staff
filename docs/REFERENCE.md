@@ -104,6 +104,17 @@ Where `--allow-gate` authorizes the *worker* to run a gate itself (inside its ow
 - **Waiting and blocking.** A routed task with no open account becomes `waiting_quota` and is retried every 5 minutes (`AGY_RUN_QUOTA_RETRY_MS`). A failed or blocked task blocks its dependents.
 - **Commands.** `run-status [run] [--json]`, `run-wait <run> [--follow] [--timeout d]` (exit 0 when every task is done, 5 otherwise, 2 still running, 3 crashed; prints `report.md` with the merge commands in dependency order), `run-cancel <run>`. Nothing is merged into the host's branch.
 
+**Usage history and views.**
+- **History.** Every terminal job appends one line to `$XDG_CONFIG_HOME/agy-staff/usage.jsonl`: repository, job, mode, status and reason, worker, model, pool, start time, duration, total tokens, number of attempts, and the pool's slack on that account when the job was registered (`slack_start`) and when it finished (`slack_end`). The slack is read from the quota cache, so it is null for the legacy worker or a stale reading.
+- **`top`.** Redraws every 2 s:
+  - the accounts, with Gemini and 3p bars, reopen times, reading age, and load;
+  - this repository's running jobs, each with its last tool step;
+  - active runs, recent inbox lines, and 14 days of jobs, done jobs, and quota deaths per model.
+
+  Keys: `q` quits, `r` redraws, `p` probes stale readings. Without a TTY it prints one frame.
+- **`dashboard [--port 7377]`.** Serves the same snapshot on 127.0.0.1 only: `/` (page), `/api/snapshot` (JSON) and `/events` (server-sent events every 3 s).
+- None of these probes `--version` or starts agy.
+
 **Inbox and hooks.** Every job that reaches a terminal state, and every run that finishes, appends one line to `$XDG_CONFIG_HOME/agy-staff/inbox.jsonl` (default `~/.config`). The line is keyed by the main checkout, so jobs in a run's worktrees report to the session in the main checkout. The Claude Code plugin hook (`hooks/agy-hook.mjs`, on `UserPromptSubmit` and `SessionStart`) adds three kinds of lines to the session context, all framed as data:
 - unread lines for the current repository, at most 5, with a per-repository cursor and a 10 s cooldown;
 - under a mode other than `off`, the mode and a pool summary, at most every 10 min;
