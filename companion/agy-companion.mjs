@@ -1920,8 +1920,8 @@ async function runWorkerSetup(worker, cwd, jobId, signal) {
   return result;
 }
 
-const FACT_BYTES = 4096;
-const FACTS_TOTAL_BYTES = 16384;
+const FACT_BYTES = 8192;
+const FACTS_TOTAL_BYTES = 24576;
 
 /**
  * `"facts"`: named commands whose output is pasted into the brief, so the
