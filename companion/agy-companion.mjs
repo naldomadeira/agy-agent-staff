@@ -2445,8 +2445,9 @@ async function dispatch(resolved, prompt, opts) {
       `AGY worker: ${workerLabel(resolved.worker)}\n` +
       `model: ${resolved.model}  profile: ${resolved.profile}  timeout: ${resolved.timeout}\n` +
       `result file (written when the job finishes): ${resultFile}\n` +
-      `Collect: run \`wait ${jobId} --timeout 10m\` as a background command ` +
-      `(one background wait per job; exit 0 = result printed, 2 = still running — wait again for the same job, without extra progress checks).\n` +
+      `Collect: one wait per job. Do not pipe or redirect wait output.\n` +
+      `Claude Code: \`wait ${jobId} --until-done --follow\` (run_in_background; live steps in Shell details).\n` +
+      `Codex: \`wait ${jobId} --timeout 10m --follow\` (exit 2 = still running, re-arm; exit 0 = result delivered).\n` +
       `Progress only if the user asks: \`observe ${jobId}\`   Stop: \`cancel ${jobId}\`\n`
   );
 }

@@ -70,9 +70,11 @@ describe('execution style is fixed per mode', () => {
       assert.match(r.stdout, new RegExp(`Started background ${mode} job\\.`));
       const id = jobIdOf(r.stdout);
       assert.match(id, new RegExp(`^${mode}-`));
-      // the collect contract is stated in the job-start output itself
-      assert.match(r.stdout, new RegExp('Collect: run `wait ' + id + ' --timeout \\d+m`'));
-      assert.match(r.stdout, /one background wait per job/);
+      // The dispatch text is what the host sees first; it must give the
+      // live-output command instead of reviving the old silent/tail pattern.
+      assert.match(r.stdout, new RegExp('Claude Code: `wait ' + id + ' --until-done --follow`'));
+      assert.match(r.stdout, new RegExp('Codex: `wait ' + id + ' --timeout 10m --follow`'));
+      assert.match(r.stdout, /Do not pipe or redirect wait output/);
       // the dispatch itself must not have blocked on agy — no telemetry on
       // either stream, the run has not happened yet
       assert.doesNotMatch(r.stdout, /\[agy-staff\] mode=/);
