@@ -66,6 +66,9 @@ function envFor(sb, extraEnv) {
     AGY_QUOTA_CACHE_DIR: '',
     AGY_PROBE_TIMEOUT_MS: '',
     AGY_PROBE_RETRY_TIMEOUT_MS: '',
+    // mode, inbox and cursors live under XDG_CONFIG_HOME (or HOME): keep
+    // them inside the sandbox, never in the maintainer's real config.
+    XDG_CONFIG_HOME: '',
     FAKE_AGY_ARGV_FILE: sb.argvFile,
     // The fake agy answers in microseconds; a real one takes seconds. Keep a
     // realistic minimum latency so these suites measure the interface, not

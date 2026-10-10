@@ -20,6 +20,7 @@
  *                            instead of racing this process's own startup
  *   FAKE_AGY_EXIT            process exit code        (default 0)
  *   FAKE_AGY_TOUCH_FILE      create this file mid-"run" (default: touch nothing)
+ *   FAKE_AGY_TOUCH_UNIQUE    write different content on every run
  *                            — simulates agy dirtying the working tree, which
  *                            the review/research delta report must catch
  *   FAKE_AGY_GIT_COMMIT      commit message; stage everything and commit it
@@ -154,7 +155,9 @@ const touch = process.env.FAKE_AGY_TOUCH_FILE;
 if (touch) {
   const target = path.resolve(touch);
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, 'written by fake agy\n');
+  // FAKE_AGY_TOUCH_UNIQUE: different content on every run, so a run on top
+  // of an earlier one's file still changes the tree.
+  fs.writeFileSync(target, process.env.FAKE_AGY_TOUCH_UNIQUE ? `written by fake agy ${process.pid} ${Date.now()}\n` : 'written by fake agy\n');
 }
 
 // Same window as the touch knob above: strictly between the companion's

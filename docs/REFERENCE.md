@@ -98,6 +98,18 @@ Where `--allow-gate` authorizes the *worker* to run a gate itself (inside its ow
 - The report gains `## Cross-review`, and the job record gains `review` (one entry per round).
 - Phases `reviewing` and `fixing` show in `status`/`observe`.
 
+**Runs (`run-spec`).** `run-spec <plan.json> [--max-parallel N] [--dry-run]` validates a host-written plan and reports every problem at once: ids, unknown dependencies, cycles, a missing prompt, or `model` together with `class`. `--dry-run` prints the waves and starts nothing. Otherwise a detached run process works the DAG under `.agy-staff/runs/<run>/`:
+- **Worktrees.** Each task gets a worktree `.agy-staff/worktrees/<run>/<task>` on branch `agy/<run>/<task>`, created from `base` (HEAD by default) or from its prerequisite's branch. Several prerequisites are merged in, and a conflict blocks the task. The main checkout's `.env*` files are copied in, and `worktree_setup` runs first.
+- **Jobs.** Each step is a job: the first is `<mode> [--model auto --class c | --model m] [--worker w]` and later ones are `continue --job`, each with its step's `--gate`s. Every implement step is committed (`agy(<task>) step i/n: <title>`).
+- **Waiting and blocking.** A routed task with no open account becomes `waiting_quota` and is retried every 5 minutes (`AGY_RUN_QUOTA_RETRY_MS`). A failed or blocked task blocks its dependents.
+- **Commands.** `run-status [run] [--json]`, `run-wait <run> [--follow] [--timeout d]` (exit 0 when every task is done, 5 otherwise, 2 still running, 3 crashed; prints `report.md` with the merge commands in dependency order), `run-cancel <run>`. Nothing is merged into the host's branch.
+
+**Inbox and hooks.** Every job that reaches a terminal state, and every run that finishes, appends one line to `$XDG_CONFIG_HOME/agy-staff/inbox.jsonl` (default `~/.config`). The line is keyed by the main checkout, so jobs in a run's worktrees report to the session in the main checkout. The Claude Code plugin hook (`hooks/agy-hook.mjs`, on `UserPromptSubmit` and `SessionStart`) adds three kinds of lines to the session context, all framed as data:
+- unread lines for the current repository, at most 5, with a per-repository cursor and a 10 s cooldown;
+- under a mode other than `off`, the mode and a pool summary, at most every 10 min;
+- under mode `off`, when Claude's weekly window (`claude-quota.json` in the quota cache) is at least 70% used and Gemini is open on at least two accounts, a suggestion to offer `agy-first`, at most every 6 h.
+`AGY_STAFF_HOOK_QUIET=1` silences it.
+
 **`pool-mcp <agy mcp args…>`** runs `agy mcp <args>` on every discovered, non-unavailable worker (60 s each) and prints one line per worker, with credential-looking values masked. Exit 1 if any failed.
 
 **When gates run.** Only for the two outcomes that mean the worker actually finished its work: `done`, and `verification_incomplete` (see below — a passing gate is stronger evidence than the worker's own pending claim). Gates never run for `quota_exhausted`, `error`, a timeout (`response_timeout`/`hard_timeout`), `canceled`, `implement_no_changes`, or `implement_uncommitted` — none of those mean the worker delivered anything to verify yet. While a gate runs, the job's own `status` stays `running` (nothing new to poll for), but `phase: "verifying"` and `verifying_gate: "<name>"` appear in `status <id>`'s JSON, in `observe`'s running snapshot, and as a one-line announcement on `wait --follow`'s stderr each time the running gate changes.

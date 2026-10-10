@@ -114,6 +114,8 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
+import { appendInbox, repoKey } from './inbox.mjs';
+import { cmdRunSpec, cmdRunStatus, cmdRunWait, cmdRunCancel, runMain } from './run-spec.mjs';
 import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
 import { agyLaunch } from './agy-launch.mjs';
 
@@ -515,6 +517,9 @@ function finishJob(id, output, fields) {
     fs.writeFileSync(job.result_file, typeof output === 'function' ? output(completed) : output);
     atomicJSON(job.result_file + '.status.json', final);
     Object.assign(job, final);
+    appendInbox({ repo: repoKey(job.cwd || process.cwd()), job: job.id, mode: job.mode, status: job.status,
+      reason: job.reason || null, worker: job.worker?.id || null, model: job.model || null,
+      line: jobStatusLine(job, job.status).replace(/^STATUS: /, ''), collect: `result ${job.id}`, cwd: job.cwd || null });
     return job;
   });
 }
@@ -545,7 +550,7 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout', 'class']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout', 'class', 'max-parallel']);
 const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate', 'probe', 'line', 'suggest']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
@@ -682,7 +687,7 @@ function parseFlags(argv, { taskCommand = false } = {}) {
 //   - `json` is read unconditionally by `continue` (it forwards whatever was
 //     passed) but only changes anything when the resumed conversation's mode
 //     is `review` — same as a direct `review --json` call.
-const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', 'mode', '_worker'];
+const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', 'mode', 'run-spec', 'run-status', 'run-wait', 'run-cancel', '_worker', '_run'];
 
 const FLAG_SCOPE = {
   // task text (taskText(), called from cmdRun/cmdContinue). Also accepted,
@@ -702,7 +707,7 @@ const FLAG_SCOPE = {
   unrestricted: [...MODES, 'continue'],
   restrict: [...MODES, 'continue', 'setup'],
   // execution (resolveRun / cmdRestart / cmdWait)
-  timeout: [...MODES, 'continue', 'restart', 'wait'],
+  timeout: [...MODES, 'continue', 'restart', 'wait', 'run-wait'],
   worker: [...MODES, 'continue', 'restart'],
   // explicit commit authorization for a single implement run (resolveRun /
   // buildPrompt / implementPostcondition); meaningless on every other mode
@@ -722,12 +727,12 @@ const FLAG_SCOPE = {
   'gate-timeout': ['implement', 'continue', 'restart'],
   // wait's own opt-in progress feed (cmdWait); meaningless anywhere else,
   // since only wait polls a job's events file at all
-  follow: ['wait'],
+  follow: ['wait', 'run-wait'],
   // wait's no-ceiling variant (cmdWait); same scoping reason as --follow
   'until-done': ['wait'],
   // review's schema-enforced findings (executeRun), also read through by
   // continue; on workers/status it switches the output to machine-readable JSON
-  json: ['review', 'continue', 'workers', 'status'],
+  json: ['review', 'continue', 'workers', 'status', 'run-status'],
   // workers: refresh stale quota readings with a minimal flash-low turn first
   probe: ['workers', 'status'],
   // routing class for `--model auto` (resolveRun) and for `workers --suggest`
@@ -741,7 +746,8 @@ const FLAG_SCOPE = {
   // default without --apply, so this is kept as an accepted no-op alias there
   // rather than rejected — see tests/setup.test.mjs ("--dry-run is accepted
   // explicitly and still writes nothing").
-  'dry-run': ['setup'],
+  'dry-run': ['setup', 'run-spec'],
+  'max-parallel': ['run-spec'],
 };
 
 const FLAG_SCOPE_DESCRIPTIONS = {
@@ -770,8 +776,9 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   line: 'it prints one short pool/quota/jobs line for a status bar',
   class: 'it picks the routing chain (feature, mechanical, review, research, design, or a project class) for --model auto and workers --suggest',
   suggest: 'it lists the best open model/worker options for a --class instead of the full table',
+  'max-parallel': 'it caps how many plan tasks run at once (default 4, or the plan\'s "max_parallel")',
   apply: 'it confirms writing the setup allowlist',
-  'dry-run': "it is setup's own no-op preview flag",
+  'dry-run': "it previews without writing (setup) or prints the plan's waves without starting anything (run-spec)",
 };
 
 const COMMAND_SUMMARIES = {
@@ -789,6 +796,10 @@ const COMMAND_SUMMARIES = {
   cancel: 'cancel <job-id>: stop a running job',
   workers: 'workers [--probe] [--json] [--suggest [--class <c>]]: list pool workers with Gemini and Anthropic/3p quota, or the best open options for a class',
   mode: 'mode [agy-first|mixed|off]: show or set how much work the host sends to the pool',
+  'run-spec': 'run-spec <plan.json> [--max-parallel N] [--dry-run]: run a host-written plan as a DAG of jobs, one worktree and branch per task',
+  'run-status': 'run-status [run-id] [--json]: list runs, or one run\'s tasks',
+  'run-wait': 'run-wait <run-id> [--follow] [--timeout <dur>]: block until a run finishes, then print its report',
+  'run-cancel': 'run-cancel <run-id>: stop a run and its running jobs',
   'pool-mcp': 'pool-mcp <add|remove|list|enable|disable> [agy mcp args…]: run the same `agy mcp` command on every discovered worker',
   setup: 'setup [--restrict <modes|none>] [--apply]: write the restricted-mode allowlist',
 };
@@ -4376,6 +4387,26 @@ function main() {
       return cmdWorkers(opts);
     case 'mode':
       return cmdMode(opts);
+    case 'run-spec': {
+      if (opts._.length !== 1) die('usage: run-spec <plan.json> [--max-parallel N] [--dry-run]');
+      const maxParallel = opts['max-parallel'] === undefined ? null : Number.parseInt(opts['max-parallel'], 10);
+      if (maxParallel !== null && !(maxParallel > 0)) die('--max-parallel must be a positive integer');
+      if (!opts['dry-run']) ensureStateDir();
+      return cmdRunSpec({ root: repoRoot(), companion: SELF, planFile: path.resolve(opts._[0]), maxParallel, dryRun: !!opts['dry-run'] });
+    }
+    case 'run-status':
+      return cmdRunStatus({ root: repoRoot(), id: opts._[0], json: !!opts.json });
+    case 'run-wait': {
+      if (!opts._[0]) die('usage: run-wait <run-id> [--follow] [--timeout <dur>]');
+      const timeoutMs = opts.timeout ? durationToMs(opts.timeout) : Infinity;
+      if (opts.timeout && !Number.isFinite(timeoutMs)) die(`invalid --timeout "${opts.timeout}"`);
+      return cmdRunWait({ root: repoRoot(), id: opts._[0], follow: !!opts.follow, timeoutMs }).then((code) => { process.exitCode = code; });
+    }
+    case 'run-cancel':
+      if (!opts._[0]) die('usage: run-cancel <run-id>');
+      return cmdRunCancel({ root: repoRoot(), id: opts._[0], companion: SELF });
+    case '_run':
+      return runMain({ root: repoRoot(), id: rest[0], companion: SELF });
     case '_worker':
       return workerMain(rest[0]);
     default:
