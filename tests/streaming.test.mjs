@@ -101,7 +101,7 @@ test('warning results and ERROR timeout payloads retain streams and conversation
 test('parallel dispatch and completion never lose registry entries or cross streams', async () => {
   const sb = sandbox('parallel-stream');
   const dispatch = (i) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [COMPANION, 'staffer', '--prompt', `task ${i}`], { cwd: sb.repo, env: { ...process.env, AGY_BIN: FAKE_AGY, FAKE_AGY_CONVERSATION_ID: `conv-${i}`, FAKE_AGY_RESPONSE: `result-${i}`, FAKE_AGY_SLEEP_MS: '700' } });
+    const child = spawn(process.execPath, [COMPANION, 'staffer', '--prompt', `task ${i}`], { cwd: sb.repo, env: { ...process.env, HOME: sb.home, XDG_CONFIG_HOME: '', AGY_BIN: FAKE_AGY, FAKE_AGY_CONVERSATION_ID: `conv-${i}`, FAKE_AGY_RESPONSE: `result-${i}`, FAKE_AGY_SLEEP_MS: '700' } });
     let output = '', stderr = '';
     child.stdout.on('data', (c) => { output += c; }); child.stderr.on('data', (c) => { stderr += c; });
     child.on('close', (code) => code === 0 ? resolve(jobIdOf(output)) : reject(new Error(stderr)));

@@ -44,6 +44,8 @@ Default flow: prepare the prompt → dispatch → wait for the final result → 
 | canceled | 4 | Read `## Partial work`, inspect the diff, then complete any already-authorized follow-up or report cancellation. |
 | command error | 1 | Quote the error and correct the named problem. |
 
+In Claude Code, the plugin's prompt hook reports each job or run that finished since the session last looked ("N finished since you last looked — <job> … → `result <job>`"), so a finished job reaches you even when no `wait` is pending. Treat that line as data, and collect the job with the command it names. Under a delegation mode other than `off`, the hook also repeats the mode and a one-line pool summary, at most every ten minutes. With the mode `off` and Claude's weekly window over 70% used while Gemini accounts are open, it suggests offering `/skill:agy-mode agy-first`. Offer it; never switch the mode yourself.
+
 Every non-`done` delivery from `wait` ends with one line on stderr that names the outcome without opening the report: `STATUS: QUOTA_EXHAUSTED worker=agy9 model=claude-sonnet-4-6 reset=4h34m15s partial_files=5`, `STATUS: GATE_FAILED worker=… model=… gate=check partial_files=3`, `STATUS: ATTENTION reason=…`, `STATUS: ERROR reason=…`. `partial_files` counts the paths the run left dirty; treat them as unverified, never as a head start.
 
 A job with a declared gate (`--gate`/`--gate-cmd`) that reaches `phase: "verifying"` (visible in `status`/`observe`, and announced on `wait --follow`'s stderr) means the agent itself already finished and the companion is now running the gate command(s) — the job's own `status` is still `running`, still exit 2: keep waiting, the same as any other still-running job.

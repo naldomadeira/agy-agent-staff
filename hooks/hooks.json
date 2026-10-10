@@ -1,0 +1,17 @@
+{
+  "description": "agy-staff: deliver finished AGY jobs and runs to the session, show the delegation mode and pool state, and suggest agy-first when Claude's weekly quota runs low",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/agy-hook.mjs\" prompt" }]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/agy-hook.mjs\" session" }]
+      }
+    ]
+  }
+}

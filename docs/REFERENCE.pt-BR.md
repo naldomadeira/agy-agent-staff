@@ -89,6 +89,18 @@ Antes do dispatch, o companion também varre o texto da tarefa em busca de uma *
 - Achados `critical`/`high`/`medium` com `request_changes` voltam à conversa do implementador. Os gates verificam cada correção de novo, por no máximo 2 rodadas. Se ainda restarem achados bloqueantes, o job termina `attention`/`review_unresolved`.
 - O relatório ganha `## Cross-review`.
 
+**Runs (`run-spec`).** `run-spec <plan.json> [--max-parallel N] [--dry-run]` valida um plano escrito pelo host e reporta todos os problemas de uma vez. Um processo de run destacado trabalha o DAG:
+- **Worktrees.** Cada task ganha um worktree `.agy-staff/worktrees/<run>/<task>` na branch `agy/<run>/<task>`, criada a partir de `base` ou da branch do pré-requisito. Os `.env*` são copiados e o `worktree_setup` roda antes.
+- **Jobs.** Cada passo é um job: o primeiro com `--model auto --class c` ou `--model m`, os seguintes com `continue --job`. Cada passo de implement é commitado.
+- **Espera e bloqueio.** Uma task roteada sem conta aberta fica `waiting_quota` e é tentada de novo a cada 5 min. Uma task que falha bloqueia as dependentes.
+- **Comandos.** `run-status`, `run-wait <run> [--follow]` (exit 0 se tudo terminou, 5 caso contrário) e `run-cancel`. Nada é mesclado na branch do host; o relatório traz os comandos de merge em ordem de dependência.
+
+**Inbox e hooks.** Todo job terminal, e todo run que termina, acrescenta uma linha em `$XDG_CONFIG_HOME/agy-staff/inbox.jsonl`, com a chave do checkout principal. O hook do plugin no Claude Code (`hooks/agy-hook.mjs`, em `UserPromptSubmit` e `SessionStart`) mostra:
+- as linhas não lidas do repositório atual (até 5, cooldown de 10 s);
+- num modo diferente de `off`, o modo e um resumo da pool, no máximo a cada 10 min;
+- no modo `off`, quando a janela semanal do Claude passa de 70% e há Gemini aberto em pelo menos duas contas, a sugestão de oferecer `agy-first`, no máximo a cada 6 h.
+`AGY_STAFF_HOOK_QUIET=1` desliga o hook.
+
 **`pool-mcp <args do agy mcp…>`** roda `agy mcp <args>` em todos os workers descobertos e imprime uma linha por worker, mascarando valores com cara de credencial.
 
 ### Gates declarados: verificação executada pelo companion (`implement`/`continue`/`restart`)

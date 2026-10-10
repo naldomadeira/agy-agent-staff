@@ -328,13 +328,13 @@ describe('wait --follow', () => {
     assert.equal(run(sb, ['wait', id]).code, 0);
   });
 
-  test('rejected on every subcommand but wait, coherent with FLAG_SCOPE', () => {
+  test('rejected on every subcommand but wait and run-wait, coherent with FLAG_SCOPE', () => {
     for (const cmd of ['status', 'result', 'cancel', 'observe', 'setup', 'workers']) {
       const sb = sandbox(`wait-follow-scope-${cmd}`);
       const r = run(sb, [cmd, '--follow']);
       assert.equal(r.code, 1, `${cmd} --follow must use the usage-error exit code`);
       assert.match(r.stderr, new RegExp(`--follow has no effect on ${cmd}`));
-      assert.match(r.stderr, /\(valid on: wait\)/);
+      assert.match(r.stderr, /\(valid on: wait, run-wait\)/);
     }
   });
 
