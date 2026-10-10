@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -38,6 +39,75 @@ function writeJSON(file, value) {
   fs.renameSync(tmp, file);
 }
 
+function expandHome(value) {
+  if (value === '~') return os.homedir();
+  if (/^~[\\/]/.test(value)) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+/** A relative path is resolved against `baseDir` (the plan's folder, like
+ *  `prompt_file`), never against wherever the command happened to run. */
+function normalizeWorktreePath(value, baseDir = process.cwd()) {
+  return path.resolve(baseDir, expandHome(value));
+}
+
+/** The main checkout, even when `root` is a linked worktree: `{repo}` and the
+ *  default location name the repository, not whichever worktree ran this. */
+function mainCheckout(root) {
+  const commonDir = git(root, ['rev-parse', '--git-common-dir']);
+  if (commonDir.code !== 0 || !commonDir.out) return root;
+  const common = path.resolve(root, commonDir.out);
+  return path.basename(common) === '.git' ? path.dirname(common) : root;
+}
+
+/** Same location on both sides, symlinks resolved: on macOS /tmp and /var are
+ *  links into /private, and git may report either spelling. */
+function samePath(a, b) {
+  const real = (value) => { try { return fs.realpathSync(value); } catch { return path.resolve(value); } };
+  return real(a) === real(b);
+}
+
+function readConfig(file) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return null; }
+  try { return JSON.parse(raw); } catch { throw new Error(`project config is corrupt: ${file} — fix or delete it, then retry`); }
+}
+
+/** Reads one shared setting from this checkout or, in a linked worktree, its
+ * main checkout. Keep this local: run-spec is also invoked without the main
+ * companion module in tests and background runs. */
+function loadSharedSetting(root, key) {
+  const own = path.join(root, '.agy-staff', 'config.json');
+  const ownConfig = readConfig(own);
+  if (ownConfig && ownConfig[key] !== undefined) return ownConfig[key];
+
+  const commonDir = git(root, ['rev-parse', '--git-common-dir']);
+  const gitDir = git(root, ['rev-parse', '--git-dir']);
+  if (commonDir.code === 0 && commonDir.out && gitDir.code === 0 && gitDir.out) {
+    const common = path.resolve(root, commonDir.out);
+    const local = path.resolve(root, gitDir.out);
+    if (common !== local) {
+      const mainConfig = readConfig(path.join(path.dirname(common), '.agy-staff', 'config.json'));
+      if (mainConfig && mainConfig[key] !== undefined) return mainConfig[key];
+    }
+  }
+  return undefined;
+}
+
+function worktreeRoot(root, configured, baseDir = root) {
+  const repo = path.basename(mainCheckout(root));
+  if (configured === undefined) {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+    return path.join(configHome, 'agy-staff', 'worktrees', repo);
+  }
+  if (typeof configured !== 'string' || !configured.trim()) throw new Error('"worktree_root" must be a non-empty string');
+  return normalizeWorktreePath(configured.replaceAll('{repo}', repo), baseDir);
+}
+
+function taskWorktree(state, root, id, task) {
+  return task.worktree || task.worktree_path || path.join(state.worktree_root || worktreeRoot(root, undefined), `agy/${id}/${task.id}`);
+}
+
 /**
  * Validate a plan and return it normalized, or throw with every problem at
  * once — a plan is written by a model, and one round trip per mistake is the
@@ -50,6 +120,9 @@ export function loadPlan(file) {
   const dir = path.dirname(path.resolve(file));
   if (plan.version !== PLAN_VERSION) problems.push(`"version" must be ${PLAN_VERSION}`);
   if (!Array.isArray(plan.tasks) || !plan.tasks.length) problems.push('"tasks" must be a non-empty array');
+  if (plan.worktree_root !== undefined && (typeof plan.worktree_root !== 'string' || !plan.worktree_root.trim())) {
+    problems.push('"worktree_root" must be a non-empty string');
+  }
   const defaults = plan.defaults || {};
   const ids = new Set();
   const tasks = (plan.tasks || []).map((raw, index) => {
@@ -72,6 +145,10 @@ export function loadPlan(file) {
     });
     if (task.model && task.class) problems.push(`${where}: give "model" or "class", not both`);
     if (task.worker !== undefined && (typeof task.worker !== 'string' || !task.worker)) problems.push(`${where}: "worker" must be a worker id`);
+    if (task.worktree !== undefined) {
+      if (typeof task.worktree !== 'string' || !task.worktree.trim()) problems.push(`${where}: "worktree" must be a non-empty string`);
+      else task.worktree = normalizeWorktreePath(task.worktree, dir);
+    }
     return task;
   });
   for (const task of tasks) {
@@ -80,7 +157,8 @@ export function loadPlan(file) {
   const cycle = findCycle(tasks);
   if (cycle) problems.push(`dependency cycle: ${cycle.join(' → ')}`);
   if (problems.length) throw new Error(`plan ${file} is invalid:\n- ${problems.join('\n- ')}`);
-  return { name: plan.name || path.basename(file, '.json'), base: plan.base || null, worktree_setup: plan.worktree_setup || null,
+  return { name: plan.name || path.basename(file, '.json'), base: plan.base || null, worktree_root: plan.worktree_root, plan_dir: dir,
+    worktree_setup: plan.worktree_setup || null,
     max_parallel: plan.max_parallel || null, tasks };
 }
 
@@ -159,16 +237,22 @@ export function cmdRunSpec({ root, companion, planFile, maxParallel, dryRun, out
   }
   const base = head.out;
   const id = `run-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  // A plan's own root is relative to the plan; the config's to the checkout.
+  const resolvedWorktreeRoot = plan.worktree_root !== undefined
+    ? worktreeRoot(root, plan.worktree_root, plan.plan_dir)
+    : worktreeRoot(root, loadSharedSetting(root, 'worktree_root'));
   const dir = path.join(runsDir(root), id);
   fs.mkdirSync(dir, { recursive: true });
   const state = {
     id, name: plan.name, plan_file: path.resolve(planFile), root, base, status: 'running',
     max_parallel: maxParallel || plan.max_parallel || DEFAULT_MAX_PARALLEL, worktree_setup: plan.worktree_setup,
+    worktree_root: resolvedWorktreeRoot,
     started_at: new Date().toISOString(), pid: null,
     tasks: Object.fromEntries(plan.tasks.map((task) => [task.id, {
       id: task.id, title: task.title || null, mode: task.mode, model: task.model || null, class: task.class || null,
       depends_on: task.depends_on, steps: task.steps, timeout: task.timeout || null, worker: task.worker || null,
-      status: 'pending', step: 0, job: null, branch: null, worktree: null, status_line: null, note: null,
+      status: 'pending', step: 0, job: null, branch: null, worktree: null,
+      worktree_path: task.worktree || path.join(resolvedWorktreeRoot, `agy/${id}/${task.id}`), status_line: null, note: null,
     }])),
   };
   writeJSON(statePathFor(root, id), state);
@@ -180,7 +264,8 @@ export function cmdRunSpec({ root, companion, planFile, maxParallel, dryRun, out
   writeJSON(statePathFor(root, id), { ...readJSON(statePathFor(root, id)), pid: child.pid });
   out.write(
     `Started run ${id}: ${plan.tasks.length} task(s), ${order.length} wave(s), up to ${state.max_parallel} at a time.\n` +
-      `Each task gets a worktree under .agy-staff/worktrees/${id}/ and a branch agy/${id}/<task>; nothing is merged for you.\n` +
+      `Worktrees:\n${Object.values(state.tasks).map((task) => `  ${task.id}: ${task.worktree_path}`).join('\n')}\n` +
+      `Each task uses branch agy/${id}/<task>; nothing is merged for you.\n` +
       `Collect: \`run-wait ${id} --follow\` (Claude Code: run_in_background). Progress: \`run-status ${id}\`. Stop: \`run-cancel ${id}\`.\n`
   );
 }
@@ -364,20 +449,27 @@ async function runTask({ root, id, companion, taskId, update, readState, log }) 
   const state = readState();
   const task = state.tasks[taskId];
   const branch = `agy/${id}/${task.id}`;
-  const worktree = task.worktree || path.join(root, '.agy-staff', 'worktrees', id, task.id);
+  const worktree = taskWorktree(state, root, id, task);
 
   if (!task.worktree) {
-    const deps = task.depends_on.map((dep) => state.tasks[dep].branch);
-    const start = deps[0] || state.base;
-    const added = git(root, ['worktree', 'add', '-b', branch, worktree, start]);
-    if (added.code !== 0) throw new Error(`git worktree add failed: ${added.err}`);
-    update(task.id, { branch, worktree });
-    for (const dep of deps.slice(1)) {
-      const merged = git(worktree, ['merge', '--no-edit', dep]);
-      if (merged.code !== 0) {
-        git(worktree, ['merge', '--abort']);
-        update(task.id, { status: 'blocked', note: `prerequisite branches conflict (${dep}); merge them by hand, then rerun` });
-        return;
+    if (fs.existsSync(worktree)) {
+      if (!registeredWorktree(root, worktree, branch)) {
+        throw new Error(`worktree path already exists and is not registered on ${branch}: ${worktree}`);
+      }
+      update(task.id, { branch, worktree });
+    } else {
+      const deps = task.depends_on.map((dep) => state.tasks[dep].branch);
+      const start = deps[0] || state.base;
+      const added = git(root, ['worktree', 'add', '-b', branch, worktree, start]);
+      if (added.code !== 0) throw new Error(`git worktree add failed: ${added.err}`);
+      update(task.id, { branch, worktree });
+      for (const dep of deps.slice(1)) {
+        const merged = git(worktree, ['merge', '--no-edit', dep]);
+        if (merged.code !== 0) {
+          git(worktree, ['merge', '--abort']);
+          update(task.id, { status: 'blocked', note: `prerequisite branches conflict (${dep}); merge them by hand, then rerun` });
+          return;
+        }
       }
     }
     for (const name of ENV_FILES) {
@@ -444,6 +536,19 @@ async function runTask({ root, id, companion, taskId, update, readState, log }) 
   update(task.id, { status: 'done', note: null });
 }
 
+function registeredWorktree(root, worktree, branch) {
+  const listed = git(root, ['worktree', 'list', '--porcelain']);
+  if (listed.code !== 0) return false;
+  const expectedBranch = `refs/heads/${branch}`;
+  return listed.out.split('\n\n').some((entry) => {
+    const fields = Object.fromEntries(entry.split('\n').map((line) => {
+      const [key, ...value] = line.split(' ');
+      return [key, value.join(' ')];
+    }));
+    return fields.worktree && samePath(fields.worktree, worktree) && fields.branch === expectedBranch;
+  });
+}
+
 function waitJob(companion, cwd, job) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [companion, 'wait', job, '--until-done'], { cwd, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -473,6 +578,13 @@ function report(state) {
     }
     lines.push('');
   }
-  lines.push('## Clean up', '', '```bash', `git worktree list | grep ${state.id}  # then: git worktree remove <path>`, '```', '');
+  const created = tasks.filter((task) => task.worktree);
+  lines.push('## Clean up', '');
+  if (created.length) {
+    for (const task of created) lines.push(`- ${task.id}: ${task.worktree}`);
+    lines.push('', '```bash', ...created.map((task) => `git worktree remove ${JSON.stringify(task.worktree)}`), '```', '');
+  } else {
+    lines.push('No worktrees were created.', '');
+  }
   return lines.join('\n');
 }
