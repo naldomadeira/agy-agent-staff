@@ -23,6 +23,20 @@ node "<skill-dir>/../../companion/agy-companion.mjs" <staffer|research|review|im
 
 The two quota families are independent. Exhausted Anthropic/3p quota does not imply exhausted Gemini quota. Before choosing a model for pooled work, inspect both columns; if 3p is exhausted and Gemini has headroom, choose an appropriate Gemini model explicitly with `--model`, then use `--worker auto`. Do not silently change a user's explicitly requested model. Cache readings older than six hours are labeled `stale` and ignored by auto selection; `-` means no usable reading, including when one family window reset without a new measurement. Neither state proves a worker has no quota. `limitesv2 --agy` shows the underlying 5h and 7d windows when that local command is installed.
 
+**Route by class, not by guess: `--model auto`.** Prefer it to naming a model. The companion picks the model and the account together from the class's chain: the first model whose quota pool is open (≥5% slack, freshly read) on some account wins. Readings older than ten minutes are refreshed first.
+
+| `--class` | chain (first open wins) | default for |
+|---|---|---|
+| `feature` | `claude-sonnet-4-6` → `gemini-3.1-pro-high` | `implement` |
+| `mechanical` | `gemini-3.8-flash-high` → `gemini-3.1-pro-low` | `staffer` |
+| `review` | `gemini-3.1-pro-high` → `claude-sonnet-4-6` | `review` |
+| `research` | `gemini-3.8-flash-high` → `gemini-3.1-pro-high` | `research` |
+| `design` | `claude-opus-4-6-thinking` | — |
+
+A project overrides or adds classes in `.agy-staff/config.json` (`"routing": {"feature": ["…", "…"]}`). Name a model explicitly (`--model claude-opus-4-6-thinking`) only with a reason; an explicit model is always honoured. `workers --suggest --class <c>` lists the open options in the same order, so you can choose yourself. With nothing open, `--model auto` refuses: it names each model's next reopen instead of dispatching into a closed pool.
+
+**Quota deaths are recovered inside the job.** When a job whose worker was picked by `auto` hits `quota_exhausted`, the companion moves it to another account with the same pool open. For a `--model auto` job it then steps down the chain. It makes at most four attempts. Each new attempt starts a fresh conversation, sees the partial edits the dead attempt left (flagged as unverified), and is listed under `## Routing` in the report. A worker you named with `--worker <id>`, and any continuation, stays where you put it.
+
 **Status is three-way, not a boolean.** `available` answered `--version`; `unavailable` is not there (no such binary, or not executable); `unknown` exists but did not answer in time, even after a longer retry. `unknown` is eligible for `--worker auto`, ranked behind everything that answered: it is used when nothing better is free, never instead of a worker that answered. Idle capacity never reports itself, while a dispatch to a dead worker fails fast and says so. The distinction earns its keep: a wrapper that provisions a keychain on first use takes seconds to answer, and calling that "unavailable" sends you hunting an installation problem that is not there.
 
 **Quota slack is a reading off disk, and it carries its age.** It comes from whatever hook writes the quota cache (agy's status line rewrites it during every run). A worker with no reading shows `-`, which is a real answer and not a failure. Read the age next to the number; a reading from yesterday is marked `stale`, not treated as live capacity. A closed pool shows when it reopens (`0% (3m) ↻15h54m`): the reset of the window that closes it, so a full weekly window wins over an empty 5h one. A window agy marks `disabled` closes its pool even when its percentage reads 0%.

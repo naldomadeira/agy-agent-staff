@@ -24,7 +24,7 @@ If you use Codex you know the feeling: GPT-5.6-Sol is slow even with fast mode o
 
 ### Invoke a persona
 
-Type `/agy:` in Claude Code and all eight skills are right there:
+Type `/agy:` in Claude Code and all nine skills are right there:
 
 ![the /agy: command menu in Claude Code](assets/claude-code-screenshot.png)
 
@@ -113,6 +113,8 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 | Survey a topic | `/agy:researcher how does auth work in this repo` |
 | Implement a scoped fix | `/agy:implementer fix the flaky retry test` |
 | Inspect or select an AGY worker | `/agy:pool workers` |
+| Route by live quota across accounts | `implement --model auto` (`--class feature\|mechanical\|review\|research\|design`) |
+| Prioritize the pool for this work | `/agy:mode agy-first` |
 | Job ops (wait/status/cancel/continue) | natural language: "is the agy job done?", "continue: also check the error path" |
 
 `reviewer` is fully prompt-based: you describe the subject and agy gathers the evidence itself (`gh pr view`, `git diff`, reading the file) — there is no flag for handing it a diff. It has two flavors, routed by subject: code review (severity-ranked findings) and general review (a multi-angle challenge of a plan, design, or decision).
@@ -123,7 +125,7 @@ Examples below use Claude Code's `/agy:…`; in Codex use `$agy:…`.
 
 ### Optional worker pool
 
-Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `$agy:pool workers` (or `/agy:pool workers`) to inspect workers and `--worker <id>` to select one. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, executables `agy`, `agy2`, `agy3` and installed `agy4` through `agy7` on `PATH`, then optional `.agy-staff/config.json`. `AGY_POOL_BINS` remains available for extra names or paths outside `PATH`. Shell aliases and functions are not visible to Node; use executable wrappers or explicit paths. Jobs retain worker affinity across `continue` and `restart`. Every dispatch, status entry, and observation identifies its external AGY worker, which gives Codex and Claude Code the same visible context even though host-native subagent panels cannot represent external processes. Parallel work is for independent tasks; writes require separate worktrees or explicit authorization.
+Normal installation uses one worker: `AGY_BIN || agy`. The pool is opt-in; use `$agy:pool workers` (or `/agy:pool workers`) to inspect workers and `--worker <id>` to select one. Discovery checks `AGY_BIN`, `AGY_POOL_BINS`, executables `agy`, `agy2`, `agy3` and installed `agy4` through `agy20` on `PATH`, then optional `.agy-staff/config.json`. `AGY_POOL_BINS` remains available for extra names or paths outside `PATH`. Shell aliases and functions are not visible to Node; use executable wrappers or explicit paths. Jobs retain worker affinity across `continue` and `restart`. Every dispatch, status entry, and observation identifies its external AGY worker, which gives Codex and Claude Code the same visible context even though host-native subagent panels cannot represent external processes. Parallel work is for independent tasks; writes require separate worktrees or explicit authorization. `workers --probe` refreshes stale quota readings, `status --line` summarizes the pool for a status bar, and `--model auto` picks model and account from live quota and moves a job that dies of quota to another account (see `docs/REFERENCE.md`).
 
 `lead` adds task orchestration guidance for your current agent. Within lead, orient enough to frame the assignment, delegate substantive work to `staffer` by default, wait for the result, then assess it and integrate or follow up. Specialists provide dedicated guidance when useful, while `ask` is reserved for testing. The host owns cross-task decisions, acceptance, integration, and delivery, using the existing jobs workflow. Invoke `/agy:lead` in Claude Code, `$agy:lead` in Codex, or `/skill:agy-lead` in Pi.
 

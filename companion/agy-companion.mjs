@@ -114,7 +114,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
-import { discoverWorkers, refreshQuota, reserveWorker, PROBE_MODEL } from './worker-pool.mjs';
+import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
 import { agyLaunch } from './agy-launch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -155,6 +155,33 @@ const DEFAULTS = {
   // No flag overrides this; execution style is a property of the mode.
   background: { staffer: true, research: true, review: true, implement: true, ask: false },
 };
+
+// `--model auto` routing: per task class, the models to try in order. The
+// first model whose quota pool is open on some account wins; a job that dies
+// of quota falls back to another account, then down this chain. A project
+// overrides any class in .agy-staff/config.json "routing". Opus is reachable
+// only by naming it: it burns an account's 3p window in minutes.
+const DEFAULT_ROUTING = {
+  feature: ['claude-sonnet-4-6', 'gemini-3.1-pro-high'],
+  mechanical: ['gemini-3.8-flash-high', 'gemini-3.1-pro-low'],
+  review: ['gemini-3.1-pro-high', 'claude-sonnet-4-6'],
+  research: ['gemini-3.8-flash-high', 'gemini-3.1-pro-high'],
+  design: ['claude-opus-4-6-thinking'],
+};
+// The class a mode routes as when `--model auto` is given without `--class`.
+const MODE_CLASS = { implement: 'feature', staffer: 'mechanical', review: 'review', research: 'research' };
+// Quota deaths a single job may recover from before it gives up and reports.
+const MAX_ROUTE_ATTEMPTS = 4;
+
+function routingChain(routeClass) {
+  const project = loadProjectConfig()?.routing;
+  const chain = Array.isArray(project?.[routeClass]) ? project[routeClass] : DEFAULT_ROUTING[routeClass];
+  if (!chain?.length) {
+    const known = [...new Set([...Object.keys(DEFAULT_ROUTING), ...Object.keys(project || {})])].join(', ');
+    die(`unknown --class "${routeClass}" (known: ${known}; add more under "routing" in ${configPath()})`);
+  }
+  return chain.map((model) => normalizeModel(model));
+}
 
 // Fase 2 item 1: bump this whenever templates/implement.md's Decision
 // discipline section (or the facts it's rendered with) changes meaning, so a
@@ -502,8 +529,8 @@ function pidAlive(pid) {
   }
 }
 
-const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout']);
-const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate', 'probe', 'line']);
+const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout', 'class']);
+const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate', 'probe', 'line', 'suggest']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
 // "unknown flag", so a 0.1 caller learns what replaced them.
@@ -639,7 +666,7 @@ function parseFlags(argv, { taskCommand = false } = {}) {
 //   - `json` is read unconditionally by `continue` (it forwards whatever was
 //     passed) but only changes anything when the resumed conversation's mode
 //     is `review` — same as a direct `review --json` call.
-const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', '_worker'];
+const KNOWN_COMMANDS = [...MODES, 'continue', 'restart', 'observe', 'status', 'wait', 'result', 'cancel', 'setup', 'workers', 'mode', '_worker'];
 
 const FLAG_SCOPE = {
   // task text (taskText(), called from cmdRun/cmdContinue). Also accepted,
@@ -687,6 +714,9 @@ const FLAG_SCOPE = {
   json: ['review', 'continue', 'workers', 'status'],
   // workers: refresh stale quota readings with a minimal flash-low turn first
   probe: ['workers', 'status'],
+  // routing class for `--model auto` (resolveRun) and for `workers --suggest`
+  class: ['staffer', 'research', 'review', 'implement', 'workers'],
+  suggest: ['workers'],
   // status: one short line for a host status bar (cmdStatusLine)
   line: ['status'],
   // setup
@@ -706,7 +736,7 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   job: 'it selects which job/conversation to resume',
   conversation: 'it selects which agy conversation to resume or continue',
   continue: "it reuses this mode's last conversation id when starting a run",
-  model: 'it selects the agy model for a run',
+  model: 'it selects the agy model for a run (`auto` routes by --class and live quota)',
   effort: 'it selects the agy model effort for a run',
   restricted: 'it sets the permission profile for a run',
   unrestricted: 'it sets the permission profile for a run',
@@ -722,6 +752,8 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   json: '(review) it asks for schema-enforced findings instead of free-form markdown; (workers/status) it prints machine-readable JSON',
   probe: `it refreshes stale quota readings with a minimal ${PROBE_MODEL} turn per account before reporting`,
   line: 'it prints one short pool/quota/jobs line for a status bar',
+  class: 'it picks the routing chain (feature, mechanical, review, research, design, or a project class) for --model auto and workers --suggest',
+  suggest: 'it lists the best open model/worker options for a --class instead of the full table',
   apply: 'it confirms writing the setup allowlist',
   'dry-run': "it is setup's own no-op preview flag",
 };
@@ -739,7 +771,8 @@ const COMMAND_SUMMARIES = {
   wait: 'wait <job-id> (--until-done | --timeout <dur>) [--follow]: block until the job finishes, then print it',
   result: 'result [job-id]: reprint a finished job\'s stored output',
   cancel: 'cancel <job-id>: stop a running job',
-  workers: 'workers [--probe] [--json]: list pool workers with Gemini and Anthropic/3p quota',
+  workers: 'workers [--probe] [--json] [--suggest [--class <c>]]: list pool workers with Gemini and Anthropic/3p quota, or the best open options for a class',
+  mode: 'mode [agy-first|mixed|off]: show or set how much work the host sends to the pool',
   setup: 'setup [--restrict <modes|none>] [--apply]: write the restricted-mode allowlist',
 };
 
@@ -1367,7 +1400,16 @@ function resolveRun(mode, opts, priorJob = null) {
     die(`--deliver accepts only "commit" (got "${opts.deliver}")`);
   }
   let model;
-  if (opts.model) {
+  let routing = null;
+  if (opts.model === 'auto' || (opts.class && !opts.model)) {
+    if (mode === 'ask') die('ask does not route: pass --model <id>, or omit it for the default');
+    if (opts.effort) die('--effort has no effect with --model auto: the routing chain names effort-suffixed models');
+    const routeClass = opts.class || MODE_CLASS[mode];
+    routing = { class: routeClass, chain: routingChain(routeClass) };
+    model = null; // chosen with the worker, under the registration lock
+  } else if (opts.class) {
+    die(`--class only applies to --model auto; --model ${opts.model} is explicit`);
+  } else if (opts.model) {
     model = normalizeModel(opts.model, opts.effort);
   } else if (opts.effort) {
     model = `gemini-3.8-flash-${opts.effort}`;
@@ -1426,8 +1468,9 @@ function resolveRun(mode, opts, priorJob = null) {
   // inheritance already uses above, so a continue's --gate/--gate-cmd omission
   // inherits the resumed job's gates exactly the way it inherits its model.
   const { gates, gate_timeout } = resolveGates(opts, prior);
+  if (routing && (conversation || prior)) die('--model auto starts a new routed run; a continuation keeps its conversation\'s model and worker');
   return { mode, model, profile, profileSource, background, timeout, conversation, parentJobId: prior?.id || null, originalCwd: prior?.cwd || null,
-    worker: prior?.worker || null, deliver: opts.deliver === 'commit', allowGate: !!opts['allow-gate'], gates, gate_timeout };
+    worker: prior?.worker || null, deliver: opts.deliver === 'commit', allowGate: !!opts['allow-gate'], gates, gate_timeout, routing };
 }
 
 /** Marker id of the pre-pool executable. It is never probed and never enters
@@ -1443,7 +1486,8 @@ const legacyWorker = () => ({ id: LEGACY_WORKER_ID, bin: AGY_BIN, version: null,
  * past; the choice itself is made by takeWorker, inside the lock that writes
  * the job record.
  * @returns {Promise<null|{pinned:object}|{workers:Array, requested?:string, affinity:object|null}>} */
-async function planWorker(opts, prior = null, model = null) {
+async function planWorker(opts, prior = null, model = null, routing = null) {
+  if (routing) return planRoute(opts, routing);
   const requested = opts.worker;
   const affinity = prior?.worker || null;
   if (affinity && requested && requested !== 'auto' && requested !== affinity.id && requested !== affinity.bin) {
@@ -1456,11 +1500,61 @@ async function planWorker(opts, prior = null, model = null) {
   return { workers: await discoverWorkers({ config: configPath(), model }), requested, affinity };
 }
 
+/**
+ * Discovery for `--model auto`: like planWorker, but every reading older than
+ * ten minutes is refreshed first, because the choice rests on it. A 20-minute
+ * reading said 98% free on the two accounts that then died four minutes in.
+ */
+async function planRoute(opts, routing) {
+  const discover = () => discoverWorkers({ config: configPath() });
+  let workers = await discover();
+  const probed = await refreshQuota(workers);
+  if (probed.some((result) => !result.skipped)) {
+    process.stderr.write(`agy-staff: refreshed quota on ${probed.filter((r) => r.ok && !r.skipped).map((r) => r.id).join(', ') || 'no account'} before routing\n`);
+    workers = await discover();
+  }
+  return { workers, requested: opts.worker && opts.worker !== 'auto' ? opts.worker : 'auto', affinity: null, routing,
+    selection: opts.worker && opts.worker !== 'auto' ? 'explicit' : 'auto' };
+}
+
+/** Why nothing could be routed, per model: open accounts and next reopen. */
+function noRouteError(plan) {
+  const lines = plan.routing.chain.map((model) => {
+    const pool = quotaPoolForModel(model);
+    const field = pool === 'gemini' ? 'quotaResetGemini' : 'quotaResetThirdParty';
+    const reopen = plan.workers.map((w) => w[field]).filter((ms) => typeof ms === 'number' && ms > Date.now());
+    const unread = plan.workers.filter((w) => w.status !== 'unavailable' && slackForModel(w, model) === null).map((w) => w.id);
+    return `  ${model} (${pool}): no account with ≥${OPEN_SLACK_PERCENT}% slack` +
+      (reopen.length ? `; next reopens in ${remainingLabel(Math.min(...reopen) - Date.now())}` : '') +
+      (unread.length ? `; no fresh reading: ${unread.join(', ')}` : '');
+  });
+  return Object.assign(new Error(
+    `no open account for --class ${plan.routing.class}${plan.requested !== 'auto' ? ` on worker ${plan.requested}` : ''}:\n${lines.join('\n')}\n` +
+      'Pass an explicit --model to dispatch anyway, wait for a reopen, or check `workers --probe`.'
+  ), { reason: 'no_route' });
+}
+
 /** Second half of planWorker: pick the worker and register `record`, both
  *  against the state snapshot held by the caller's lock. Selecting outside
  *  that lock let two concurrent dispatches read the same idle pool and take
  *  the same capacity-1 worker. */
 function takeWorker(plan, state, record = null) {
+  if (plan?.routing) {
+    state.jobs ||= [];
+    const activeJobs = state.jobs.filter((job) => liveJobStatus(job) === 'running');
+    const route = routeWorker({ workers: plan.workers, chain: plan.routing.chain, activeJobs,
+      requestedWorkerId: plan.requested !== 'auto' ? plan.requested : undefined });
+    if (!route) throw noRouteError(plan);
+    const selected = { id: route.worker.id, bin: route.worker.bin, version: route.worker.version ?? null, capacity: route.worker.capacity };
+    plan.routedModel = route.model;
+    plan.routedSlack = slackForModel(route.worker, route.model);
+    if (record) {
+      record.worker = selected;
+      record.model = route.model;
+      state.jobs.push(record);
+    }
+    return selected;
+  }
   return reserveWorker(state, {
     pinned: plan ? plan.pinned : legacyWorker(),
     workers: plan?.workers,
@@ -2258,13 +2352,17 @@ function verificationIncompleteMessage(evidence) {
 }
 
 async function executeRun(resolved, prompt, opts, execution = null) {
-  const workspaceBefore = resolved.mode === 'ask' ? null : porcelainSnapshot();
+  // A fallback attempt measures against the tree the FIRST attempt started
+  // from (opts.retryBaseline): its predecessor's partial edits are part of
+  // this job's work, not a pre-existing dirty state, and must not make a
+  // finishing attempt look like a no-op.
+  const workspaceBefore = resolved.mode === 'ask' ? null : opts.retryBaseline ? opts.retryBaseline.workspace : porcelainSnapshot();
   // HEAD before the run, for every mode that can edit or commit — not just
   // implement. partialWorkReport() (Fase 1, item 3) needs it for any
   // non-done terminal state, so this is captured once here instead of only
   // inside the implement guard below. Cheap and failure-tolerant; see
   // headSnapshot().
-  const runHeadBefore = resolved.mode === 'ask' ? null : headSnapshot();
+  const runHeadBefore = resolved.mode === 'ask' ? null : opts.retryBaseline ? opts.retryBaseline.head : headSnapshot();
   const implementBefore = implementGuardApplies(resolved) ? workspaceBefore : null;
   const treeBefore = treeReportApplies(resolved) ? workspaceBefore : null;
   // Fase 2 item 3: same side channel as opts.telemetry/opts.warnings below —
@@ -2403,7 +2501,7 @@ async function cmdRun(mode, opts) {
   // A direct mode continuation (`research --continue`) reaches this path too.
   // Feed its resolved conversation affinity back into the selector; otherwise
   // it would silently fall back to AGY_BIN instead of its original worker.
-  const workerPlan = await planWorker(opts, resolved.worker ? { worker: resolved.worker } : null, resolved.model);
+  const workerPlan = await planWorker(opts, resolved.worker ? { worker: resolved.worker } : null, resolved.model, resolved.routing);
   enterOriginalWorkspace(resolved.originalCwd);
   if (resolved.parentJobId) {
     const prior = findJob(resolved.parentJobId);
@@ -2458,6 +2556,12 @@ async function dispatch(resolved, prompt, opts) {
     // registration lock, before accepting the job or writing its prompt file.
     refuseRunningFollowUp(state, resolved.conversation);
     resolved.worker = takeWorker(opts.workerPlan, state, record);
+    if (opts.workerPlan?.routedModel) resolved.model = opts.workerPlan.routedModel;
+    // How the worker was chosen decides how far a quota death may move the
+    // job: `auto` may change account, a routed model may also change model,
+    // an explicitly named worker or a continuation stays where it was put.
+    resolved.worker_selection = opts.workerPlan?.selection
+      || (opts.workerPlan?.requested === 'auto' ? 'auto' : opts.workerPlan?.requested ? 'explicit' : opts.workerPlan?.affinity ? 'affinity' : 'legacy');
     fs.writeFileSync(specFile, JSON.stringify({
       resolved, prompt, prompt_source: opts.promptSource || null, opts: { json: !!opts.json },
       // Fase 2 item 1: which Decision discipline wording (if any) this prompt
@@ -2496,6 +2600,9 @@ async function dispatch(resolved, prompt, opts) {
       `job id: ${jobId} (pid ${child.pid})\n` +
       `AGY worker: ${workerLabel(resolved.worker)}\n` +
       `model: ${resolved.model}  profile: ${resolved.profile}  timeout: ${resolved.timeout}\n` +
+      (resolved.routing
+        ? `routing: class ${resolved.routing.class} → ${resolved.model} on ${resolved.worker.id} (${quotaPoolForModel(resolved.model)} slack ${Math.round(opts.workerPlan.routedSlack)}%); chain ${resolved.routing.chain.join(' → ')}\n`
+        : '') +
       `result file (written when the job finishes): ${resultFile}\n` +
       `Collect: one wait per job. Do not pipe or redirect wait output.\n` +
       `Claude Code: \`wait ${jobId} --until-done --follow\` (run_in_background; live steps in Shell details).\n` +
@@ -2667,7 +2774,7 @@ async function workerMain(jobId) {
       if (!current?.available) throw new Error(`worker ${spec.resolved.worker.id} (${spec.resolved.worker.bin}) became unavailable after job creation; no automatic migration was attempted`);
     }
     opts = { ...spec.opts, jobId };
-    const output = await executeRun(spec.resolved, spec.prompt, opts, (invoke) => {
+    const runAttempt = (resolved, prompt) => executeRun(resolved, prompt, opts, (invoke) => {
       const agy = agyCommand(agyArgs(invoke, 'stream-json'), invoke.worker?.bin || AGY_BIN);
       return runStreaming({ binary: agy.cmd, args: agy.args, job,
         budget: durationToMs(spec.resolved.timeout) - (Date.now() - started), signal: controller.signal,
@@ -2680,6 +2787,28 @@ async function workerMain(jobId) {
         throw error;
       });
     });
+    let output;
+    let current = spec.resolved;
+    let prompt = spec.prompt;
+    const attempts = [];
+    for (;;) {
+      try {
+        output = await runAttempt(current, prompt);
+        break;
+      } catch (error) {
+        const next = error.reason === 'quota_exhausted' && !controller.signal.aborted
+          ? await nextRoute(jobId, current, attempts, error) : null;
+        if (!next) {
+          if (attempts.length) error.message = `${routingHistory(attempts, current, 'quota_exhausted')}\n${error.message}`;
+          throw error;
+        }
+        opts.retryBaseline ||= { workspace: error.partialWorkspace?.beforeLines ?? null, head: error.partialWorkspace?.headBefore ?? null };
+        process.stderr.write(`[agy-staff] quota_exhausted on ${current.worker.id}/${current.model}; retrying on ${next.worker.id}/${next.model}\n`);
+        current = next;
+        prompt = retryPrompt(spec.prompt, attempts);
+      }
+    }
+    if (attempts.length) output = `${routingHistory(attempts, current, 'finished')}\n${output}`;
     if (controller.signal.aborted) throw Object.assign(new Error('Execution canceled.'), { reason: 'canceled' });
     // Result and conversation metadata are durable before completion is visible.
     // implement is the only mode either implementNoop or implementUncommitted
@@ -2790,6 +2919,81 @@ async function workerMain(jobId) {
     process.removeListener('SIGTERM', onSignal);
     process.removeListener('SIGINT', onSignal);
   }
+}
+
+/**
+ * After a quota death, the next (worker, model) for the same job, or null.
+ *
+ * Only a job whose worker was chosen by `auto` moves: a named worker or a
+ * continuation stays where the caller put it. An explicit model keeps its
+ * model and may only change account; a routed model (`--model auto`) may also
+ * step down its chain. Every (account, pool) that already died in this job
+ * is excluded even when the cache has not caught up. The move is reserved
+ * under the state lock, so the job's own load leaves the old worker and joins
+ * the new one in one write. A new account means a new conversation:
+ * conversations live inside one account's profile.
+ */
+async function nextRoute(jobId, resolved, attempts, error) {
+  const changed = changedPaths(error.partialWorkspace);
+  attempts.push({ worker: resolved.worker?.id ?? null, model: resolved.model, outcome: 'quota_exhausted',
+    resets_in: error.resets_in ?? null, changed_paths: changed });
+  if (attempts.length >= MAX_ROUTE_ATTEMPTS || resolved.worker_selection !== 'auto') {
+    updateJob(jobId, { attempts });
+    return null;
+  }
+  const chain = resolved.routing
+    ? resolved.routing.chain.slice(Math.max(0, resolved.routing.chain.indexOf(resolved.model)))
+    : [resolved.model];
+  const exclude = attempts.map((attempt) => ({ id: attempt.worker, pool: quotaPoolForModel(attempt.model) }));
+  const workers = await discoverWorkers({ config: configPath() });
+  const route = updateState((state) => {
+    const job = state.jobs?.find((j) => j.id === jobId);
+    const activeJobs = (state.jobs || []).filter((j) => j.id !== jobId && liveJobStatus(j) === 'running');
+    const found = routeWorker({ workers, chain, activeJobs, exclude });
+    if (job) {
+      job.attempts = attempts;
+      if (found) {
+        job.worker = { id: found.worker.id, bin: found.worker.bin, version: found.worker.version ?? null, capacity: found.worker.capacity };
+        job.model = found.model;
+        job.conversation_id = null;
+      }
+    }
+    return found;
+  });
+  if (!route) return null;
+  return {
+    ...resolved,
+    worker: { id: route.worker.id, bin: route.worker.bin, version: route.worker.version ?? null, capacity: route.worker.capacity },
+    model: route.model,
+    conversation: null,
+  };
+}
+
+function changedPaths(partial) {
+  if (!partial || !Array.isArray(partial.afterLines)) return [];
+  const lines = Array.isArray(partial.beforeLines) ? porcelainDelta(partial.beforeLines, partial.afterLines) : partial.afterLines;
+  return lines.map((line) => line.slice(3));
+}
+
+/** The task again, headed by what the dead attempts left behind. Partial
+ *  edits from a quota death are unverified: the eval that motivated this
+ *  found a half-written feature with an unvalidated action in it. */
+function retryPrompt(original, attempts) {
+  const paths = [...new Set(attempts.flatMap((attempt) => attempt.changed_paths))];
+  if (!paths.length) return original;
+  const shown = paths.slice(0, 50).map((p) => `- ${p}`).join('\n');
+  return 'Note from the agy-staff companion: an earlier attempt at this same task stopped on quota exhaustion ' +
+    `and left these paths changed in the working tree:\n${shown}${paths.length > 50 ? `\n- … and ${paths.length - 50} more` : ''}\n` +
+    'Nothing in them is verified. Read each one before relying on it, keep what is correct, fix or discard the rest, ' +
+    'then complete the task below.\n\n' + original;
+}
+
+function routingHistory(attempts, current, finalOutcome) {
+  const lines = attempts.map((attempt, index) =>
+    `${index + 1}. ${attempt.worker}/${attempt.model}: quota_exhausted${attempt.resets_in ? ` (resets in ${attempt.resets_in})` : ''}` +
+      `${attempt.changed_paths.length ? `, left ${attempt.changed_paths.length} changed path(s)` : ''}`);
+  if (finalOutcome === 'finished') lines.push(`${attempts.length + 1}. ${current.worker?.id}/${current.model}: finished (see below)`);
+  return `## Routing\n${lines.join('\n')}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,9 +3150,11 @@ function workerJSON(worker, active) {
 }
 
 async function cmdWorkers(opts = {}) {
+  if (opts.class && !opts.suggest) die('--class on workers only applies with --suggest');
   const workers = await discoverWithProbe(opts, { config: configPath() });
   const jobs = loadState().jobs || [];
   const active = jobs.filter((j) => liveJobStatus(j) === 'running');
+  if (opts.suggest) return printSuggestions(opts, workers, active);
   if (opts.json) {
     process.stdout.write(JSON.stringify(workers.map((worker) => workerJSON(worker, active)), null, 2) + '\n');
     return;
@@ -2964,6 +3170,43 @@ async function cmdWorkers(opts = {}) {
     process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker, 'quotaGemini')} | ${quotaCell(worker, 'quotaThirdParty')}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
+}
+
+/**
+ * The open (model, worker) options for a class, best first: for each model of
+ * the chain in order, every account whose pool for it is open, by slack. This
+ * is what `--model auto` would choose from — shown so the host can pick
+ * itself, or see why auto would refuse.
+ */
+function printSuggestions(opts, workers, active) {
+  const routeClass = opts.class || 'feature';
+  const chain = routingChain(routeClass);
+  const options = [];
+  for (const model of chain) {
+    const open = workers
+      .filter((worker) => worker.status !== 'unavailable' && (slackForModel(worker, model) ?? -1) >= OPEN_SLACK_PERCENT)
+      .sort((a, b) => slackForModel(b, model) - slackForModel(a, model) || activeJobsFor(a, active) - activeJobsFor(b, active));
+    for (const worker of open) {
+      options.push({ model, pool: quotaPoolForModel(model), worker: worker.id, slack_percent: Math.round(slackForModel(worker, model)),
+        active_jobs: activeJobsFor(worker, active), capacity: worker.capacity,
+        quota_age_seconds: typeof worker.quotaAgeMs === 'number' ? Math.round(worker.quotaAgeMs / 1000) : null });
+    }
+  }
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ class: routeClass, chain, options }, null, 2) + '\n');
+    return;
+  }
+  process.stdout.write(`class ${routeClass}: ${chain.join(' → ')}\n`);
+  if (!options.length) {
+    process.stdout.write('no open option: every account is closed or unread for this chain (try --probe)\n');
+    return;
+  }
+  options.slice(0, 10).forEach((option, index) => {
+    const busy = option.active_jobs >= option.capacity ? ' (busy)' : '';
+    process.stdout.write(`${index + 1}. --model ${option.model} --worker ${option.worker}  ${option.pool} ${option.slack_percent}%` +
+      `${option.quota_age_seconds !== null ? ` (${quotaAgeLabel(option.quota_age_seconds * 1000)})` : ''}${busy}\n`);
+  });
+  if (options.length > 10) process.stdout.write(`… and ${options.length - 10} more\n`);
 }
 
 /**
@@ -3009,6 +3252,7 @@ function poolSummary(workers, active, now = Date.now()) {
     };
   };
   return {
+    mode: readMode().mode,
     total: known.length,
     gemini: pool('quotaGemini'),
     third_party: pool('quotaThirdParty'),
@@ -3017,13 +3261,48 @@ function poolSummary(workers, active, now = Date.now()) {
   };
 }
 
+// How much the host should hand to the pool. The companion stores it and
+// shows it; the host reads it (the `mode` skill, the status line) and decides.
+const DELEGATION_MODES = {
+  'agy-first': 'Send implementation, research and review to the pool by default (`--model auto`); keep integration, final review and decisions with a stated reason (architecture) in the host.',
+  mixed: 'Split by quota on both sides: pool for work that fits a routed class, host models when the pool is closed or the task needs them.',
+  off: 'Use the pool only when asked.',
+};
+
+function modeFile() {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || path.join(os.homedir(), '.config');
+  return path.join(base, 'agy-staff', 'mode.json');
+}
+
+function readMode() {
+  try {
+    const data = JSON.parse(fs.readFileSync(modeFile(), 'utf8'));
+    return DELEGATION_MODES[data?.mode] ? data : { mode: 'off' };
+  } catch {
+    return { mode: 'off' };
+  }
+}
+
+function cmdMode(opts) {
+  const requested = opts._[0];
+  if (opts._.length > 1) die('usage: mode [agy-first|mixed|off]');
+  if (requested !== undefined) {
+    if (!DELEGATION_MODES[requested]) die(`unknown mode "${requested}" (agy-first, mixed, off)`);
+    fs.mkdirSync(path.dirname(modeFile()), { recursive: true });
+    atomicJSON(modeFile(), { mode: requested, set_at: new Date().toISOString() });
+  }
+  const current = readMode();
+  process.stdout.write(`mode: ${current.mode}${current.set_at ? ` (set ${current.set_at})` : ''}\n${DELEGATION_MODES[current.mode]}\n`);
+}
+
 function poolLine(summary) {
   const part = (label, pool) => {
     const reopen = pool.open < summary.total && pool.next_reopen_in_seconds !== null
       ? ` ↻${remainingLabel(pool.next_reopen_in_seconds * 1000)}` : '';
     return `${label} ${pool.open}/${summary.total}${reopen}`;
   };
-  const pieces = [`agy ${part('gem', summary.gemini)}`, part('3p', summary.third_party)];
+  const mode = readMode().mode;
+  const pieces = [`agy${mode !== 'off' ? `[${mode}]` : ''} ${part('gem', summary.gemini)}`, part('3p', summary.third_party)];
   if (summary.stale.length) pieces.push(`stale ${summary.stale.length}`);
   if (summary.running_jobs) pieces.push(`▶${summary.running_jobs}`);
   return pieces.join(' · ');
@@ -3788,6 +4067,8 @@ function main() {
       return cmdSetup(opts);
     case 'workers':
       return cmdWorkers(opts);
+    case 'mode':
+      return cmdMode(opts);
     case '_worker':
       return workerMain(rest[0]);
     default:

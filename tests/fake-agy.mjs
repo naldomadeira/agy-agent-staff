@@ -33,6 +33,10 @@
  *   FAKE_AGY_NO_JSON         die before printing any payload (default exit 1),
  *                            with FAKE_AGY_STDERR on stderr — simulates agy
  *                            being killed by a harness sandbox pre-JSON
+ *   FAKE_AGY_ID              worker id, set by a per-worker wrapper script
+ *   FAKE_AGY_RUNS_FILE       append {id, model, prompt} per model run (JSONL)
+ *   FAKE_AGY_QUOTA_FOR       comma list of `<id>` or `<id>/<model>` that die
+ *                            of quota (needs FAKE_AGY_ID)
  *   FAKE_AGY_QUOTA           deterministic quota-exhaustion shortcut: sets
  *                            status ERROR (unless FAKE_AGY_STATUS is already
  *                            given) and a payload `error` reproducing agy's
@@ -80,6 +84,23 @@ if (argvFile) {
     fs.appendFileSync(argvFile, JSON.stringify(argv) + '\n');
   } catch {
     /* recording is best-effort */
+  }
+}
+
+// Which worker ran which model (F2 routing tests). FAKE_AGY_ID is set by a
+// per-worker wrapper script, since every worker shares this one file.
+const modelArg = argv.includes('--model') ? argv[argv.indexOf('--model') + 1] : null;
+if (process.env.FAKE_AGY_RUNS_FILE && argv.includes('-p')) {
+  fs.appendFileSync(process.env.FAKE_AGY_RUNS_FILE,
+    JSON.stringify({ id: process.env.FAKE_AGY_ID || null, model: modelArg, prompt: argv[argv.indexOf('-p') + 1] }) + '\n');
+}
+// FAKE_AGY_QUOTA_FOR: comma list of `<id>` or `<id>/<model>` that die of
+// quota, so one account can fail while its siblings answer.
+if (process.env.FAKE_AGY_QUOTA_FOR && process.env.FAKE_AGY_ID) {
+  const entries = process.env.FAKE_AGY_QUOTA_FOR.split(',').map((entry) => entry.trim());
+  if (entries.includes(process.env.FAKE_AGY_ID) || entries.includes(`${process.env.FAKE_AGY_ID}/${modelArg}`)) {
+    process.env.FAKE_AGY_QUOTA = '1';
+    process.env.FAKE_AGY_RESPONSE = '';
   }
 }
 

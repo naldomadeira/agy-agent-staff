@@ -20,9 +20,46 @@ const DEFAULT_MAX_PROFILE = 20;
 // A window this full leaves less than a job's worth of quota.
 const BLOCKED_PERCENT = 95;
 
-function quotaPoolForModel(model) {
+export function quotaPoolForModel(model) {
   if (!model) return null;
   return model.startsWith('gemini-') ? 'gemini' : '3p';
+}
+
+/** Below this slack a pool counts as closed for routing: a job would start
+ *  and die minutes in, burning the account's window for nothing. */
+export const OPEN_SLACK_PERCENT = 5;
+
+/** The measured slack of `model`'s pool on `worker`, or null when unknown. */
+export function slackForModel(worker, model) {
+  const value = quotaPoolForModel(model) === 'gemini' ? worker.quotaGemini : worker.quotaThirdParty;
+  return typeof value === 'number' ? value : null;
+}
+
+/**
+ * Escolhe modelo E worker a partir de uma cadeia de preferência.
+ *
+ * Percorre `chain` por ordem; para cada modelo, só conta um worker com
+ * leitura medida e folga aberta no pool desse modelo (`OPEN_SLACK_PERCENT`).
+ * Folga desconhecida não entra: `auto` existe para não despachar às cegas, e
+ * um palpite foi exatamente o que gastou oito despachos num dia. O primeiro
+ * modelo com algum worker elegível ganha; dentro dele, `selectWorker` decide
+ * por folga e carga. `exclude` tira pares (worker, pool) que já morreram de
+ * quota neste job, mesmo que o cache ainda não o saiba.
+ *
+ * @returns {{worker:object, model:string}|null}
+ */
+export function routeWorker({ workers = [], chain = [], activeJobs = {}, requestedWorkerId, exclude = [] } = {}) {
+  const excluded = (worker, model) => exclude.some((entry) =>
+    (entry.id === worker.id || entry.bin === worker.bin) && entry.pool === quotaPoolForModel(model));
+  for (const model of chain) {
+    const candidates = workers
+      .filter((worker) => !excluded(worker, model))
+      .filter((worker) => (slackForModel(worker, model) ?? -1) >= OPEN_SLACK_PERCENT)
+      .map((worker) => ({ ...worker, quotaSlack: slackForModel(worker, model) }));
+    const worker = selectWorker({ workers: candidates, activeJobs, requestedWorkerId });
+    if (worker) return { worker: workers.find((entry) => entry.id === worker.id) ?? worker, model };
+  }
+  return null;
 }
 
 /** A positive millisecond count from the environment, or null. Anything else
@@ -133,12 +170,17 @@ export const DEFAULT_PROBE_MAX_AGE_MS = 10 * 60 * 1000;
  *
  * @returns {Promise<Array<{id:string, ok:boolean, ms:number, error?:string}>>}
  */
-export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFAULT_PROBE_MAX_AGE_MS, timeoutMs = 60000, ping } = {}) {
+export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFAULT_PROBE_MAX_AGE_MS, timeoutMs = 60000, ping, lockDir = os.tmpdir() } = {}) {
   const stale = workers.filter((worker) =>
     worker.status !== 'unavailable' && (typeof worker.quotaAgeMs !== 'number' || worker.quotaAgeMs >= maxAgeMs));
   const run = ping ?? pingWorker;
   return Promise.all(stale.map(async (worker) => {
     const started = Date.now();
+    // Ten parallel `--model auto` dispatches would otherwise ping every
+    // stale account ten times. The first one takes a short-lived lock; the
+    // rest skip that account and read whatever the first one refreshed.
+    const release = probeLock(lockDir, worker, timeoutMs + 10000);
+    if (!release) return { id: worker.id, ok: true, ms: 0, skipped: 'probe already running' };
     try {
       await run(worker.bin, { env, timeoutMs });
       return { id: worker.id, ok: true, ms: Date.now() - started };
@@ -148,8 +190,30 @@ export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFA
       // has recorded it by the time the error surfaces: that is a reading.
       const exhausted = /RESOURCE_EXHAUSTED|quota/i.test(text);
       return { id: worker.id, ok: exhausted, ms: Date.now() - started, error: exhausted ? 'quota_exhausted' : firstLine(text) };
+    } finally {
+      release();
     }
   }));
+}
+
+function probeLock(dir, worker, staleMs) {
+  const name = `agy-staff-probe-${String(worker.id).replace(/[^\w.-]/g, '_')}.lock`;
+  const file = pathModule.join(dir, name);
+  const take = () => {
+    fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+    return () => { try { fs.unlinkSync(file); } catch { /* already gone */ } };
+  };
+  try {
+    return take();
+  } catch {
+    try {
+      if (Date.now() - fs.statSync(file).mtimeMs < staleMs) return null;
+      fs.unlinkSync(file);
+      return take();
+    } catch {
+      return null;
+    }
+  }
 }
 
 async function pingWorker(bin, { env, timeoutMs }) {
