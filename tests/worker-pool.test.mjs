@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { discoverWorkers, reserveWorker, selectWorker } from '../companion/worker-pool.mjs';
+import { discoverWorkers, refreshQuota, reserveWorker, selectWorker } from '../companion/worker-pool.mjs';
 
 const available = (...bins) => async (bin) => {
   if (!bins.includes(bin)) throw new Error('not found');
@@ -134,6 +134,7 @@ test('deduplica e aplica id/capacidade da configuração ao bin já descoberto',
   assert.deepEqual(workers.find((worker) => worker.bin === 'agy'), {
     id: 'primary', bin: 'agy', available: true, status: 'available', version: 'agy-1.0.0', capacity: 4,
     quotaSlack: null, quotaAgeMs: null, quotaGemini: null, quotaThirdParty: null,
+    quotaResetGemini: null, quotaResetThirdParty: null,
   });
 });
 
@@ -637,4 +638,105 @@ test('quando todos estão a 0% de folga, auto ainda escolhe pela regra antiga', 
     { id: 'agy2', bin: 'agy2', available: true, status: 'available', capacity: 5, quotaSlack: 0 },
   ];
   assert.equal(selectWorker({ workers, activeJobs: { agy: 4, agy2: 1 } }).id, 'agy2');
+});
+
+// --- F1: verdade da quota ----------------------------------------------------
+
+test('descobre agy8 até agy10 no PATH: uma pool de 10 contas não perde as últimas', async () => {
+  const dir = fakeBinDir('agy8');
+  for (const name of ['agy9', 'agy10']) {
+    fs.writeFileSync(path.join(dir, name), '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(path.join(dir, name), 0o755);
+  }
+  const workers = await discoverWorkers({ env: {}, path: dir, probe: available('agy8', 'agy9', 'agy10') });
+  assert.deepEqual(workers.filter((worker) => worker.available).map((worker) => worker.id), ['agy8', 'agy9', 'agy10']);
+});
+
+test('AGY_POOL_BINS separado por dois-pontos descobre cada worker', { skip: process.platform === 'win32' }, async () => {
+  const workers = await discoverWorkers({
+    env: { AGY_POOL_BINS: 'agy4:agy5:agy9' }, path: '/fake', probe: available('agy4', 'agy5', 'agy9'),
+  });
+  assert.deepEqual(workers.filter((worker) => worker.available).map((worker) => worker.id), ['agy4', 'agy5', 'agy9']);
+});
+
+test('--worker de um id não descoberto diz isso, e não "at capacity"', () => {
+  const workers = [{ id: 'agy4', bin: 'agy4', available: true, capacity: 1 }];
+  const error = thrown(() => reserveWorker({ jobs: [] }, { workers, requestedWorkerId: 'agy9' }));
+  assert.equal(error.reason, 'worker_not_found');
+  assert.match(error.message, /"agy9" was not discovered \(known: agy4\)/);
+  assert.match(error.message, /AGY_POOL_BINS/);
+  assert.doesNotMatch(error.message, /capacity/);
+});
+
+test('--worker de um id ocupado diz ocupado, com a carga', () => {
+  const workers = [{ id: 'agy4', bin: 'agy4', available: true, capacity: 1 }];
+  const state = { jobs: [{ status: 'running', worker: { id: 'agy4', bin: 'agy4' } }] };
+  const error = thrown(() => reserveWorker(state, { workers, requestedWorkerId: 'agy4', isRunning: running }));
+  assert.equal(error.reason, 'worker_busy');
+  assert.match(error.message, /busy \(1\/1 active jobs\)/);
+});
+
+test('janela disabled no raw fecha o pool mesmo com 0% usado nos buckets', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, 'agy-quota-profile3.json'), JSON.stringify({
+    profile: 'profile3', captured_at: now / 1000,
+    buckets: {
+      '3p 5h': { used_percent: 0, resets_at: now / 1000 + 3600 },
+      '3p 7d': { used_percent: 0, resets_at: now / 1000 + 86400 },
+      'gemini 5h': { used_percent: 10, resets_at: now / 1000 + 3600 },
+      'gemini 7d': { used_percent: 10, resets_at: now / 1000 + 86400 },
+    },
+    raw: { quota: { '3p-5h': { remaining_fraction: 1, disabled: true }, '3p-weekly': { remaining_fraction: 1 } } },
+  }));
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy3' }, path: '/fake', now, probe: available('agy3') });
+  const worker = workers.find((entry) => entry.id === 'agy3');
+  assert.equal(worker.quotaThirdParty, 0);
+  assert.equal(worker.quotaGemini, 90);
+});
+
+test('o reset reportado é o da janela que fecha o pool, não o da mais curta', async () => {
+  const dir = quotaDir();
+  const now = Date.now();
+  writeQuotaBuckets(dir, 'profile2', { capturedAtMs: now, buckets: {
+    '3p 5h': { usedPercent: 0, resetsAtMs: now + 3600_000 },
+    '3p 7d': { usedPercent: 100, resetsAtMs: now + 30 * 3600_000 },
+    'gemini 5h': { usedPercent: 10, resetsAtMs: now + 3600_000 },
+    'gemini 7d': { usedPercent: 5, resetsAtMs: now + 96 * 3600_000 },
+  } });
+  const workers = await discoverWorkers({ env: { AGY_QUOTA_CACHE_DIR: dir, AGY_POOL_BINS: 'agy2' }, path: '/fake', now, probe: available('agy2') });
+  const worker = workers.find((entry) => entry.id === 'agy2');
+  // the weekly window closes 3p, so its reset (not the 5h one) is when it reopens
+  assert.ok(Math.abs(worker.quotaResetThirdParty - (now + 30 * 3600_000)) < 5);
+  // gemini is open: no reopen time to report
+  assert.equal(worker.quotaResetGemini, null);
+});
+
+test('probe: false não corre --version: existe dá unknown, ausente dá unavailable', async () => {
+  const dir = fakeBinDir('agy4');
+  const workers = await discoverWorkers({ env: {}, path: dir, probe: false });
+  assert.equal(workers.find((worker) => worker.id === 'agy4').status, 'unknown');
+  // the default candidates agy/agy2/agy3 are not on this PATH
+  assert.deepEqual(workers.filter((worker) => worker.status === 'unavailable').map((worker) => worker.id), ['agy', 'agy2', 'agy3']);
+});
+
+test('refreshQuota só pinga leituras velhas ou ausentes, e nunca um unavailable', async () => {
+  const pinged = [];
+  const workers = [
+    { id: 'fresh', bin: 'agy2', status: 'available', quotaAgeMs: 60_000 },
+    { id: 'old', bin: 'agy3', status: 'available', quotaAgeMs: 3 * 3600_000 },
+    { id: 'none', bin: 'agy4', status: 'unknown', quotaAgeMs: null },
+    { id: 'dead', bin: 'agy5', status: 'unavailable', quotaAgeMs: null },
+  ];
+  const results = await refreshQuota(workers, { ping: async (bin) => { pinged.push(bin); } });
+  assert.deepEqual(pinged.sort(), ['agy3', 'agy4']);
+  assert.deepEqual(results.map((r) => [r.id, r.ok]).sort(), [['none', true], ['old', true]]);
+});
+
+test('refreshQuota conta um RESOURCE_EXHAUSTED como leitura feita', async () => {
+  const workers = [{ id: 'agy2', bin: 'agy2', status: 'available', quotaAgeMs: null }];
+  const results = await refreshQuota(workers, { ping: async () => {
+    throw Object.assign(new Error('exit 1'), { stderr: 'RESOURCE_EXHAUSTED (code 429): Individual quota reached' });
+  } });
+  assert.deepEqual(results.map((r) => [r.ok, r.error]), [[true, 'quota_exhausted']]);
 });

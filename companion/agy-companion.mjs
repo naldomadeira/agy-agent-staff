@@ -114,7 +114,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity, processTable, tree, stopExecution } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
-import { discoverWorkers, reserveWorker } from './worker-pool.mjs';
+import { discoverWorkers, refreshQuota, reserveWorker, PROBE_MODEL } from './worker-pool.mjs';
 import { agyLaunch } from './agy-launch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -503,7 +503,7 @@ function pidAlive(pid) {
 }
 
 const VALUE_FLAGS = new Set(['job', 'conversation', 'model', 'effort', 'timeout', 'restrict', 'prompt', 'prompt-file', 'worker', 'deliver', 'gate', 'gate-cmd', 'gate-timeout']);
-const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate']);
+const BOOL_FLAGS = new Set(['continue', 'restricted', 'unrestricted', 'json', 'apply', 'dry-run', 'stdin', 'follow', 'until-done', 'allow-gate', 'probe', 'line']);
 
 // Flags dropped in 0.2. They get their own error instead of falling through to
 // "unknown flag", so a 0.1 caller learns what replaced them.
@@ -682,8 +682,13 @@ const FLAG_SCOPE = {
   follow: ['wait'],
   // wait's no-ceiling variant (cmdWait); same scoping reason as --follow
   'until-done': ['wait'],
-  // review's schema-enforced findings (executeRun), also read through by continue
-  json: ['review', 'continue'],
+  // review's schema-enforced findings (executeRun), also read through by
+  // continue; on workers/status it switches the output to machine-readable JSON
+  json: ['review', 'continue', 'workers', 'status'],
+  // workers: refresh stale quota readings with a minimal flash-low turn first
+  probe: ['workers', 'status'],
+  // status: one short line for a host status bar (cmdStatusLine)
+  line: ['status'],
   // setup
   apply: ['setup'],
   // never read anywhere in the companion; setup's own dry run is already the
@@ -714,10 +719,50 @@ const FLAG_SCOPE_DESCRIPTIONS = {
   'gate-timeout': "it sets each gate's own time budget (default 15m), separate from the agent's --timeout",
   follow: "it streams a running job's steps to stderr while wait polls for completion",
   'until-done': 'it blocks wait until the job reaches a terminal state, with no timeout ceiling',
-  json: '(review) it asks for schema-enforced findings instead of free-form markdown',
+  json: '(review) it asks for schema-enforced findings instead of free-form markdown; (workers/status) it prints machine-readable JSON',
+  probe: `it refreshes stale quota readings with a minimal ${PROBE_MODEL} turn per account before reporting`,
+  line: 'it prints one short pool/quota/jobs line for a status bar',
   apply: 'it confirms writing the setup allowlist',
   'dry-run': "it is setup's own no-op preview flag",
 };
+
+const COMMAND_SUMMARIES = {
+  staffer: 'staffer --prompt <task>: general task, background job',
+  research: 'research --prompt <topic>: deep research, background job',
+  review: 'review --prompt <subject> [--json]: second-opinion review, background job',
+  implement: 'implement --prompt <task> [--gate <names>] [--gate-cmd <cmd>]: edit the working tree, background job',
+  ask: 'ask --prompt <question>: quick tool-free answer, foreground',
+  continue: 'continue --job <id> --prompt <follow-up>: resume a finished job\'s conversation',
+  restart: 'restart <job-id>: rerun a job\'s stored task as a new linked job',
+  observe: 'observe [job-id]: bounded JSON snapshot of a job, never the report',
+  status: 'status [job-id] | status --line | status --json [--probe]: jobs, or a pool/quota summary',
+  wait: 'wait <job-id> (--until-done | --timeout <dur>) [--follow]: block until the job finishes, then print it',
+  result: 'result [job-id]: reprint a finished job\'s stored output',
+  cancel: 'cancel <job-id>: stop a running job',
+  workers: 'workers [--probe] [--json]: list pool workers with Gemini and Anthropic/3p quota',
+  setup: 'setup [--restrict <modes|none>] [--apply]: write the restricted-mode allowlist',
+};
+
+/** Help is generated from FLAG_SCOPE, the same table that rejects a flag out
+ *  of scope, so the two can never disagree about what a subcommand accepts. */
+function commandHelp(cmd) {
+  const lines = [`usage: agy-companion.mjs ${COMMAND_SUMMARIES[cmd] || cmd}`];
+  const flags = Object.keys(FLAG_SCOPE).filter((name) => FLAG_SCOPE[name].includes(cmd));
+  if (flags.length) {
+    lines.push('', 'flags:');
+    for (const name of flags) {
+      const value = VALUE_FLAGS.has(name) ? ' <value>' : '';
+      lines.push(`  --${name}${value}  ${FLAG_SCOPE_DESCRIPTIONS[name] || ''}`.trimEnd());
+    }
+  }
+  lines.push('', 'exit codes (status <id>, wait): 0 done, 2 still running, 3 error/crashed, 4 canceled, 5 attention, 6 quota exhausted; 1 companion error');
+  return lines.join('\n') + '\n';
+}
+
+function generalHelp() {
+  return 'usage: agy-companion.mjs <command> [flags]   (`<command> --help` for its flags)\n\n' +
+    Object.values(COMMAND_SUMMARIES).map((line) => `  ${line}`).join('\n') + '\n';
+}
 
 /** Reject any flag outside the scope of the subcommand it was given to,
  *  instead of letting parseFlags' shared, global flag set accept it and
@@ -1822,6 +1867,13 @@ function headSnapshot() {
   return inGitRepo() ? UNBORN_HEAD : null;
 }
 
+/** How many paths the run left dirty: the porcelain delta when a before
+ *  snapshot exists, every dirty path otherwise, null when git could not say. */
+function partialFileCount(beforeLines, afterLines) {
+  if (!Array.isArray(afterLines)) return null;
+  return Array.isArray(beforeLines) ? porcelainDelta(beforeLines, afterLines).length : afterLines.length;
+}
+
 /** True only when two porcelain snapshots are the same lines in the same
  *  order. Unlike porcelainDelta (which is one-directional, built for
  *  reporting what *appeared*), this also catches entries that *disappeared*
@@ -2674,10 +2726,12 @@ async function workerMain(jobId) {
         outcome = { status: 'done', warnings: opts.warnings, ...telemetry, gate_results: summary };
         finalOutput = `${supersedeNote}${output}\n${section}`;
       } else {
-        outcome = { status: 'attention', reason: 'gate_failed', warnings: true, ...telemetry, gate_results: summary };
+        const afterLines = porcelainSnapshot();
+        outcome = { status: 'attention', reason: 'gate_failed', warnings: true, ...telemetry, gate_results: summary,
+          partial_files: partialFileCount(opts.runWorkspaceBefore ?? null, afterLines) };
         const partial = partialWorkReport({
           status: 'attention', reason: 'gate_failed',
-          beforeLines: opts.runWorkspaceBefore ?? null, afterLines: porcelainSnapshot(),
+          beforeLines: opts.runWorkspaceBefore ?? null, afterLines,
           headBefore: opts.runHeadBefore ?? null, headAfter: headSnapshot(), finished: true,
         });
         finalOutput = `Job needs attention: a companion verification gate failed.\n\n${output}\n${section}\n${partial}`;
@@ -2724,10 +2778,11 @@ async function workerMain(jobId) {
       return `${label ? `${label}:\n` : ''}${body}\n\n${partial}\n${JSON.stringify(report, null, 2)}\n`;
     }, (current) => {
       const telemetry = opts?.telemetry || {};
+      const partialFiles = partialFileCount(workspaceSnapshot.beforeLines, workspaceSnapshot.afterLines);
       return current.cancel_requested_at
-        ? { status: 'canceled', reason: 'canceled', ...telemetry }
-        : status === 'quota_exhausted' ? { status, reason, resets_in: error.resets_in ?? null, ...telemetry }
-        : { status, reason, ...telemetry };
+        ? { status: 'canceled', reason: 'canceled', partial_files: partialFiles, ...telemetry }
+        : status === 'quota_exhausted' ? { status, reason, resets_in: error.resets_in ?? null, partial_files: partialFiles, ...telemetry }
+        : { status, reason, partial_files: partialFiles, ...telemetry };
     });
     process.exitCode = JOB_EXIT_CODES[job.status] ?? 1;
   } finally {
@@ -2834,18 +2889,73 @@ function quotaAgeLabel(ms) {
  *  hook has never run, has no quota, and that is not a failure. */
 function quotaCell(worker, field) {
   const age = typeof worker.quotaAgeMs === 'number' ? ` (${quotaAgeLabel(worker.quotaAgeMs)})` : '';
-  if (typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs >= 6 * 60 * 60 * 1000) return `stale${age}`;
+  const reset = resetSuffix(worker, field);
+  if (typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs >= 6 * 60 * 60 * 1000) return `stale${age}${reset}`;
   if (typeof worker[field] !== 'number') return '-';
-  return `${Math.round(worker[field])}%${age}`;
+  return `${Math.round(worker[field])}%${age}${reset}`;
 }
 
-async function cmdWorkers() {
-  const workers = await discoverWorkers({ config: configPath() });
+const QUOTA_RESET_FIELDS = { quotaGemini: 'quotaResetGemini', quotaThirdParty: 'quotaResetThirdParty' };
+// Below this slack a pool is treated as closed: a job would start and die.
+const QUOTA_LOW_PERCENT = 5;
+
+/** ` ↻4h12m` on a pool that is closed or unread, so "0%" says when it reopens. */
+function resetSuffix(worker, field, now = Date.now()) {
+  const slack = worker[field];
+  if (typeof slack === 'number' && slack >= QUOTA_LOW_PERCENT) return '';
+  const resetAt = worker[QUOTA_RESET_FIELDS[field]];
+  return typeof resetAt === 'number' && resetAt > now ? ` ↻${remainingLabel(resetAt - now)}` : '';
+}
+
+function remainingLabel(ms) {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function activeJobsFor(worker, active) {
+  return active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
+}
+
+/** `--probe` first refreshes every reading older than ten minutes with one
+ *  flash-low turn per account, then discovers again so the table shows the
+ *  fresh cache. Its own outcome goes to stderr: stdout stays the table/JSON. */
+async function discoverWithProbe(opts, discoverOptions) {
+  let workers = await discoverWorkers(discoverOptions);
+  if (!opts.probe) return workers;
+  const probed = await refreshQuota(workers);
+  for (const result of probed) {
+    process.stderr.write(`probe ${result.id}: ${result.ok ? 'ok' : `failed (${result.error})`} in ${Math.round(result.ms / 1000)}s\n`);
+  }
+  if (!probed.length) process.stderr.write('probe: every quota reading is fresh (under 10m); nothing to refresh\n');
+  else workers = await discoverWorkers(discoverOptions);
+  return workers;
+}
+
+function workerJSON(worker, active) {
+  const iso = (ms) => (typeof ms === 'number' ? new Date(ms).toISOString() : null);
+  return {
+    id: worker.id, bin: worker.bin, status: worker.status, version: worker.version, capacity: worker.capacity,
+    active_jobs: activeJobsFor(worker, active),
+    quota_age_seconds: typeof worker.quotaAgeMs === 'number' ? Math.round(worker.quotaAgeMs / 1000) : null,
+    gemini: { slack_percent: worker.quotaGemini ?? null, blocked_until: iso(worker.quotaResetGemini) },
+    third_party: { slack_percent: worker.quotaThirdParty ?? null, blocked_until: iso(worker.quotaResetThirdParty) },
+  };
+}
+
+async function cmdWorkers(opts = {}) {
+  const workers = await discoverWithProbe(opts, { config: configPath() });
   const jobs = loadState().jobs || [];
   const active = jobs.filter((j) => liveJobStatus(j) === 'running');
+  if (opts.json) {
+    process.stdout.write(JSON.stringify(workers.map((worker) => workerJSON(worker, active)), null, 2) + '\n');
+    return;
+  }
   process.stdout.write('id | executable | status | version | capacity | active jobs | Gemini slack | Anthropic/3p slack\n');
   for (const worker of workers) {
-    const count = active.filter((j) => j.worker?.id === worker.id || j.worker?.bin === worker.bin).length;
+    const count = activeJobsFor(worker, active);
     // `status` carries the three-way verdict; `available` is the older boolean
     // kept for callers that still read it. Printing the boolean here would
     // collapse `unknown` back into `unavailable` — the exact false negative
@@ -2854,6 +2964,69 @@ async function cmdWorkers() {
     process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker, 'quotaGemini')} | ${quotaCell(worker, 'quotaThirdParty')}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
+}
+
+/**
+ * Pool summary for a status bar or a script: how many accounts can take a
+ * Gemini job and an Anthropic/3p job right now, when the next closed pool
+ * reopens, how many readings are too old to trust, and how many jobs run.
+ *
+ * It skips the `--version` probe (a status line redraws every few seconds and
+ * ten wrapper starts would stall it), so it reads only the quota cache and
+ * this repository's job registry. A reading older than ten minutes counts as
+ * stale here, not six hours: this line is what decides a dispatch.
+ */
+async function cmdPoolStatus(opts) {
+  const discoverOptions = { config: configPath(), probe: opts.probe ? undefined : false };
+  const workers = await discoverWithProbe(opts, discoverOptions);
+  let active = [];
+  try { active = (loadState().jobs || []).filter((j) => liveJobStatus(j) === 'running'); } catch {}
+  const summary = poolSummary(workers, active);
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ ...summary, workers: workers.map((worker) => workerJSON(worker, active)) }, null, 2) + '\n');
+    return;
+  }
+  process.stdout.write(poolLine(summary) + '\n');
+}
+
+const STATUS_FRESH_MS = 10 * 60 * 1000;
+
+function poolSummary(workers, active, now = Date.now()) {
+  const known = workers.filter((worker) => worker.status !== 'unavailable');
+  const fresh = (worker) => typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs < STATUS_FRESH_MS;
+  const pool = (field) => {
+    const open = known.filter((worker) => typeof worker[field] === 'number' && worker[field] >= QUOTA_LOW_PERCENT);
+    const resets = known
+      .filter((worker) => !open.includes(worker))
+      .map((worker) => worker[QUOTA_RESET_FIELDS[field]])
+      .filter((ms) => typeof ms === 'number' && ms > now);
+    const next = resets.length ? Math.min(...resets) : null;
+    return {
+      open: open.length,
+      open_workers: open.map((worker) => worker.id),
+      next_reopen: next === null ? null : new Date(next).toISOString(),
+      next_reopen_in_seconds: next === null ? null : Math.round((next - now) / 1000),
+    };
+  };
+  return {
+    total: known.length,
+    gemini: pool('quotaGemini'),
+    third_party: pool('quotaThirdParty'),
+    stale: known.filter((worker) => !fresh(worker)).map((worker) => worker.id),
+    running_jobs: active.length,
+  };
+}
+
+function poolLine(summary) {
+  const part = (label, pool) => {
+    const reopen = pool.open < summary.total && pool.next_reopen_in_seconds !== null
+      ? ` ↻${remainingLabel(pool.next_reopen_in_seconds * 1000)}` : '';
+    return `${label} ${pool.open}/${summary.total}${reopen}`;
+  };
+  const pieces = [`agy ${part('gem', summary.gemini)}`, part('3p', summary.third_party)];
+  if (summary.stale.length) pieces.push(`stale ${summary.stale.length}`);
+  if (summary.running_jobs) pieces.push(`▶${summary.running_jobs}`);
+  return pieces.join(' · ');
 }
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -3194,7 +3367,41 @@ function renderJobResponse(initial, { observeOnly = false, waitNotice = false } 
   if (status === 'done' && job.warnings) {
     process.stderr.write(`Job diagnostics (tail, up to 8192 bytes). Full log: ${job.log_file}\n${readTail(job.log_file)}\n`);
   }
+  // stderr, like the STILL RUNNING notice: stdout keeps its existing shape
+  // (callers parse the trailing diagnostic JSON), and both Claude Code's
+  // background shell and Codex show stderr next to it.
+  // A clean `done` stays silent on stderr (exit 0 already says it all).
+  if (status !== 'done') process.stderr.write(`${jobStatusLine(job, status)}\n`);
   process.exitCode = JOB_EXIT_CODES[status] ?? 1;
+}
+
+/**
+ * The last line of every delivered job: the outcome as one greppable token
+ * plus the facts that decide the next step. An orchestrator used to learn
+ * that a job died of quota only by opening the report and searching for
+ * `"reason": "quota_exhausted"`; the exit code alone does not tell a gate
+ * failure from a timeout, and neither says how many files were left behind.
+ */
+function jobStatusLine(job, status) {
+  const reason = job.reason || null;
+  const fields = [];
+  const add = (key, value) => { if (value !== null && value !== undefined && value !== '') fields.push(`${key}=${value}`); };
+  let token;
+  if (status === 'done') token = 'DONE';
+  else if (status === 'quota_exhausted') token = 'QUOTA_EXHAUSTED';
+  else if (reason === 'gate_failed') token = 'GATE_FAILED';
+  else if (status === 'attention') token = 'ATTENTION';
+  else if (status === 'canceled') token = 'CANCELED';
+  else token = status === 'crashed' ? 'CRASHED' : 'ERROR';
+  if (token !== 'DONE' && token !== 'QUOTA_EXHAUSTED' && token !== 'GATE_FAILED') add('reason', reason);
+  add('worker', job.worker?.id);
+  add('model', job.model);
+  if (token === 'QUOTA_EXHAUSTED') add('reset', job.resets_in ? String(job.resets_in).replace(/\s+/g, '') : 'unknown');
+  if (token === 'GATE_FAILED' && Array.isArray(job.gate_results)) {
+    add('gate', job.gate_results.filter((r) => r.exit !== 0 || r.timed_out).map((r) => r.name).join(','));
+  }
+  if (token !== 'DONE') add('partial_files', job.partial_files ?? 'unknown');
+  return `STATUS: ${token}${fields.length ? ` ${fields.join(' ')}` : ''}`;
 }
 
 
@@ -3533,6 +3740,11 @@ function printSetupNotes() {
 
 function main() {
   const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
+    const topic = rest[0];
+    process.stdout.write(topic && COMMAND_SUMMARIES[topic] ? commandHelp(topic) : generalHelp());
+    return;
+  }
   if (!cmd) {
     die(
       'usage: agy-companion.mjs <staffer|research|review|implement|ask|continue|restart|observe|status|wait|result|cancel|workers|setup> [flags]\n' +
@@ -3546,6 +3758,13 @@ function main() {
         'Per-repo policy: `setup --restrict review,research` makes those modes restricted by default here.'
     );
   }
+  // --help/-h is answered before parsing: a run command's parser rejects any
+  // positional, and help must work whatever else was typed alongside it.
+  if (rest.includes('--help') || rest.includes('-h')) {
+    if (!COMMAND_SUMMARIES[cmd]) die(`unknown subcommand: ${cmd}\n${generalHelp()}`);
+    process.stdout.write(commandHelp(cmd));
+    return;
+  }
   const opts = parseFlags(rest, { taskCommand: MODES.includes(cmd) || cmd === 'continue' });
   checkFlagScope(cmd, opts);
 
@@ -3558,7 +3777,7 @@ function main() {
     case 'observe':
       return renderJobResponse(findJob(opts._[0]), { observeOnly: true });
     case 'status':
-      return cmdStatus(opts);
+      return opts.line || opts.json ? cmdPoolStatus(opts) : cmdStatus(opts);
     case 'wait':
       return cmdWait(opts);
     case 'result':
@@ -3568,7 +3787,7 @@ function main() {
     case 'setup':
       return cmdSetup(opts);
     case 'workers':
-      return cmdWorkers();
+      return cmdWorkers(opts);
     case '_worker':
       return workerMain(rest[0]);
     default:
