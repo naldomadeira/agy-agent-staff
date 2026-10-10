@@ -12,6 +12,7 @@ The companion does the bookkeeping.
 {
   "version": 1,
   "name": "marketplace-br",
+  "worktree_root": "~/worktrees/{repo}",
   "worktree_setup": "pnpm install --frozen-lockfile",
   "max_parallel": 4,
   "defaults": { "class": "feature", "gates": ["typecheck", "lint"] },
@@ -34,6 +35,10 @@ The companion does the bookkeeping.
   account, which turns off moving to another one).
 - `defaults` applies to every task. `base` is the commit to start from (HEAD by default).
   `worktree_setup` runs in each new worktree before its first job.
+- `worktree_root` chooses the parent directory for the run's worktrees. It can also be set in the
+  main checkout's `.agy-staff/config.json`; `~` expands to your home directory and `{repo}` to the
+  main checkout's directory name, and a relative path is resolved against the plan's folder. A task's
+  `worktree` (absolute, `~/`, or relative to the plan) has priority over it.
 
 ## Slice for Gemini
 
@@ -55,8 +60,11 @@ node "<skill-dir>/../../companion/agy-companion.mjs" run-spec plan.json
 node "<skill-dir>/../../companion/agy-companion.mjs" run-wait <run-id> --follow    # Claude Code: run_in_background
 ```
 
-- Each task gets the worktree `.agy-staff/worktrees/<run>/<task>` and the branch `agy/<run>/<task>`.
-  The worktree gets copies of the main checkout's `.env*` files.
+- By default, each task gets `$XDG_CONFIG_HOME/agy-staff/worktrees/<repo>/agy/<run>/<task>` (or
+  `~/.config` when `XDG_CONFIG_HOME` is unset) and the branch `agy/<run>/<task>`, so worktrees are
+  outside the checkout. `worktree_root` changes that parent; a task-level `worktree` wins. A
+  matching pre-existing registered worktree is reused; any other existing path fails safely. The
+  worktree gets copies of the main checkout's `.env*` files.
 - A routed task with no open account waits (`waiting_quota`, retried every 5 minutes) instead of
   failing.
 - A failed task blocks the tasks that depend on it.
