@@ -81,7 +81,7 @@ Antes do dispatch, o companion também varre o texto da tarefa em busca de uma *
 
 **Ambiente por worker.** `"worker_env"` mapeia nomes de variáveis para strings, com `{worker}` trocado pelo id do worker. Os valores chegam ao processo agy do worker, ao `"worker_setup"` e a todos os gates. `"worker_setup"` é um comando de uma linha que o companion roda antes do agy, uma vez por worker em que o job cai, inclusive depois de um fallback de quota. Uma falha termina o job `error`/`worker_setup_failed`, com a saída do comando e sem rodar o agy. Como `gates`, estas chaves, `facts` e `auto_review` caem para a config do worktree principal.
 
-**Fatos do projeto.** `"facts"` mapeia um nome para um comando. Em despachos de `implement`, `staffer` e `review`, cada comando roda na raiz do repositório (timeout de 20 s). A saída entra na tarefa como `## Project facts`, com até 4 KiB por fato e 16 KiB no total, e fica guardada no spec do job.
+**Fatos do projeto.** `"facts"` mapeia um nome para um comando. Em despachos de `implement`, `staffer` e `review`, cada comando roda na raiz do repositório (timeout de 20 s). A saída entra na tarefa como `## Project facts`, com até 8 KiB por fato e 24 KiB no total, e fica guardada no spec do job.
 
 **Revisão cruzada.** Depois que os gates confirmam um implement `done` num worker da pool, o companion o revisa em outra conta quando `"auto_review"` (padrão `"gemini"`) se aplica: `"gemini"` revisa jobs em modelo Gemini, `"all"` revisa todos, `"off"` nenhum, e o worker legado nunca é revisado.
 - O revisor é roteado por `claude-sonnet-4-6` → `gemini-3.1-pro-high`, nunca na conta do implementador.
