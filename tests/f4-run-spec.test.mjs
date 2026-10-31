@@ -155,7 +155,7 @@ describe('F4: run-spec', () => {
     quota(cache, { 2: { thirdParty: 10 } });
     const waited = run(sb, ['run-wait', id, '--timeout', '60s'], env);
     assert.equal(waited.code, 0, waited.stdout);
-    assert.deepEqual(prompts(sb).map((entry) => entry.model), ['claude-sonnet-4-6']);
+    assert.deepEqual(prompts(sb).map((entry) => entry.model), ['claude-sonnet-5-5-medium']);
   });
 
   test('the prompt hook delivers unread jobs once, then the mode and pool line', posixOnly, async () => {

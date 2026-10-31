@@ -38,7 +38,7 @@ The companion does the bookkeeping.
 ## Slice for Gemini
 
 Gemini delivers well on bounded steps and badly on cross-cutting features. When a task's chain can
-land on Gemini (`feature` falls back to `gemini-3.1-pro-high`), split it into `steps`:
+land on Gemini (`feature` falls back to `gemini-4-argon-high`), split it into `steps`:
 
 - each step touches at most 2–3 files and has its own gates;
 - the order follows the dependencies: data or schema first, then logic, then the screen and i18n;

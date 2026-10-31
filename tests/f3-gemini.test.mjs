@@ -20,10 +20,15 @@ function workers(sb, numbers) {
 }
 
 const nowS = () => Date.now() / 1000;
+// What `agy models` lists on the profiles before 11: no Argon, no 5.5 ids.
+const OLD_CATALOG = ['gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low',
+  'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b-medium'];
 function quota(sb, readings) {
   const dir = path.join(sb.root, 'quota-cache');
   fs.mkdirSync(dir, { recursive: true });
   for (const [n, { gemini = 10, thirdParty = 10 }] of Object.entries(readings)) {
+    fs.writeFileSync(path.join(dir, `agy-models-profile${n}.json`), JSON.stringify({
+      captured_at: nowS(), models: OLD_CATALOG.map((id) => ({ id, name: id })) }));
     fs.writeFileSync(path.join(dir, `agy-quota-profile${n}.json`), JSON.stringify({
       captured_at: nowS(),
       buckets: {
@@ -68,7 +73,7 @@ describe('F3: Gemini power', () => {
     const bins = workers(sb, [2]);
     const dir = quota(sb, { 2: {} });
     config(sb, { facts: { 'CapabilityKind values': node("console.log('read | write | apply')") }, auto_review: 'off' });
-    const r = run(sb, ['implement', '--model', 'gemini-3.1-pro-high', '--worker', 'auto', '--prompt', 'add a tool'], envFor(sb, bins, dir));
+    const r = run(sb, ['implement', '--model', 'gemini-3.8-flash-high', '--worker', 'auto', '--prompt', 'add a tool'], envFor(sb, bins, dir));
     assert.equal(r.code, 0, r.stderr);
     await waitForJob(sb, jobIdOf(r.stdout));
     const prompt = runs(sb)[0].prompt;
@@ -88,7 +93,7 @@ describe('F3: Gemini power', () => {
       gates: { check: node("process.exit(process.env.APP_DB === 'app_test_agy2' ? 0 : 7)") },
       auto_review: 'off',
     });
-    const r = run(sb, ['implement', '--model', 'gemini-3.1-pro-high', '--worker', 'auto', '--gate', 'check', '--prompt', 'x'], envFor(sb, bins, dir));
+    const r = run(sb, ['implement', '--model', 'gemini-3.8-flash-high', '--worker', 'auto', '--gate', 'check', '--prompt', 'x'], envFor(sb, bins, dir));
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id, { tries: 80 }), 'done');
     assert.equal(fs.readFileSync(marker, 'utf8'), 'app_test_agy2');
@@ -99,7 +104,7 @@ describe('F3: Gemini power', () => {
     const bins = workers(sb, [2]);
     const dir = quota(sb, { 2: {} });
     config(sb, { worker_setup: node("console.log('migration exploded'); process.exit(3)"), auto_review: 'off' });
-    const r = run(sb, ['implement', '--model', 'gemini-3.1-pro-high', '--worker', 'auto', '--prompt', 'x'], envFor(sb, bins, dir));
+    const r = run(sb, ['implement', '--model', 'gemini-3.8-flash-high', '--worker', 'auto', '--prompt', 'x'], envFor(sb, bins, dir));
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id, { tries: 80 }), 'error');
     assert.equal(runs(sb).length, 0);
@@ -110,11 +115,11 @@ describe('F3: Gemini power', () => {
     const sb = sandbox('f3-review-approve');
     const bins = workers(sb, [2, 3]);
     const dir = quota(sb, { 2: { thirdParty: 100 }, 3: { thirdParty: 20, gemini: 90 } });
-    const r = run(sb, ['implement', '--model', 'gemini-3.1-pro-high', '--worker', 'auto', '--prompt', 'add a tool'],
+    const r = run(sb, ['implement', '--model', 'gemini-3.8-flash-high', '--worker', 'auto', '--prompt', 'add a tool'],
       envFor(sb, bins, dir, { FAKE_AGY_REVIEW_RESPONSE: APPROVE }));
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id, { tries: 120 }), 'done');
-    assert.deepEqual(runs(sb).map(({ id: w, model }) => [w, model]), [['agy2', 'gemini-3.1-pro-high'], ['agy3', 'claude-sonnet-4-6']]);
+    assert.deepEqual(runs(sb).map(({ id: w, model }) => [w, model]), [['agy2', 'gemini-3.8-flash-high'], ['agy3', 'claude-sonnet-4-6']]);
     assert.match(runs(sb)[1].prompt, /Symbols that do not exist/);
     assert.match(jobResultFile(sb, id), /## Cross-review\n- Round 1 \(agy3\/claude-sonnet-4-6\): approve/);
   });
@@ -123,7 +128,7 @@ describe('F3: Gemini power', () => {
     const sb = sandbox('f3-review-unresolved');
     const bins = workers(sb, [2, 3]);
     const dir = quota(sb, { 2: { thirdParty: 100 }, 3: { thirdParty: 20 } });
-    const r = run(sb, ['implement', '--model', 'gemini-3.1-pro-high', '--worker', 'auto', '--prompt', 'add a tool'],
+    const r = run(sb, ['implement', '--model', 'gemini-3.8-flash-high', '--worker', 'auto', '--prompt', 'add a tool'],
       envFor(sb, bins, dir, { FAKE_AGY_REVIEW_RESPONSE: REJECT }));
     const id = jobIdOf(r.stdout);
     assert.equal(await waitForJob(sb, id, { tries: 200 }), 'attention');

@@ -66,7 +66,8 @@ function poolStatus(cwd) {
 
 function poolLine(summary) {
   const r = (pool) => `${pool.open}/${summary.total}`;
-  return `gemini open on ${r(summary.gemini)}, 3p open on ${r(summary.third_party)}` +
+  const argon = summary.argon?.total ? `, argon open on ${summary.argon.open}/${summary.argon.total}` : '';
+  return `gemini open on ${r(summary.gemini)}${argon}, 3p open on ${r(summary.third_party)}` +
     `${summary.stale?.length ? `, ${summary.stale.length} stale reading(s)` : ''}` +
     `${summary.running_jobs ? `, ${summary.running_jobs} job(s) running here` : ''}`;
 }

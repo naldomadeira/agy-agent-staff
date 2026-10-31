@@ -96,7 +96,7 @@ describe('F1: quota truth', () => {
     const dir = quotaCache(sb, { profile2: reading({ weeklyResetS: 3 * 3600 + 120 }) });
     const r = run(sb, ['workers'], env({ AGY_POOL_BINS: bins.join(','), AGY_QUOTA_CACHE_DIR: dir }));
     assert.equal(r.code, 0, r.stderr);
-    assert.match(r.stdout, /agy2 .*\| 90% \(1m\) \| 0% \(1m\) ↻3h0[12]m$/m);
+    assert.match(r.stdout, /agy2 .*\| 90% \(1m\) \| - \| 0% \(1m\) ↻3h0[12]m$/m);
   });
 
   test('wait ends a quota death with one STATUS line on stderr', async () => {

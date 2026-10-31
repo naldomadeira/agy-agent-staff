@@ -42,7 +42,7 @@ a background test run instead of running it in the foreground and reading the re
 
 ## Allocation by model weight, inside agy's own pool
 
-- **Pro** (`gemini-3.1-pro`, high effort) for judgment calls: a migration touching a production
+- **Argon** (`gemini-4-argon`, high effort; own quota, profiles 11–13 only) for judgment calls: a migration touching a production
   table, and anything crypto-related.
 - **Flash** (`gemini-3.8-flash`, high effort) for mechanical refactors and focused, well-defined
   fixes.
