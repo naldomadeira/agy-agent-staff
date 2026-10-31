@@ -218,9 +218,9 @@ describe('workers table reports what discovery found', () => {
     });
     const result = run(sb, ['workers'], { AGY_POOL_BINS: bins.join(','), AGY_QUOTA_CACHE_DIR: dir });
     assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /id \| executable \| status \| version \| capacity \| active jobs \| Gemini slack \| Anthropic\/3p slack/);
-    assert.match(result.stdout, /agy2.*\| 79% \(2h\) \| 10% \(2h\)/);
-    assert.match(result.stdout, /agy3.*\| - \| -$/m);
+    assert.match(result.stdout, /id \| executable \| status \| version \| capacity \| active jobs \| Gemini slack \| Argon slack \| Anthropic\/3p slack/);
+    assert.match(result.stdout, /agy2.*\| 79% \(2h\) \| - \| 10% \(2h\)/);
+    assert.match(result.stdout, /agy3.*\| - \| - \| -$/m);
   });
 
   test('a worker that never answers the probe prints unknown, not unavailable', () => {

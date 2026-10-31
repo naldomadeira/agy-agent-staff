@@ -63,12 +63,12 @@ describe('F5: visibility', () => {
 
   test('aggregateUsage counts jobs, deliveries and quota deaths per model', () => {
     const rows = aggregateUsage([
-      { ts: '2026-10-09T10:00:00Z', model: 'gemini-3.1-pro-high', worker: 'agy2', status: 'done', tokens: 10, slack_start: 90, slack_end: 80 },
-      { ts: '2026-10-09T11:00:00Z', model: 'gemini-3.1-pro-high', worker: 'agy3', status: 'attention', tokens: 5 },
+      { ts: '2026-10-09T10:00:00Z', model: 'gemini-4-argon-high', worker: 'agy2', status: 'done', tokens: 10, slack_start: 90, slack_end: 80 },
+      { ts: '2026-10-09T11:00:00Z', model: 'gemini-4-argon-high', worker: 'agy3', status: 'attention', tokens: 5 },
       { ts: '2026-10-10T09:00:00Z', model: 'claude-sonnet-4-6', worker: 'agy9', status: 'quota_exhausted' },
     ]);
     assert.deepEqual(rows.by_model.map((r) => [r.name, r.jobs, r.done, r.quota_deaths, r.tokens]),
-      [['gemini-3.1-pro-high', 2, 1, 0, 15], ['claude-sonnet-4-6', 1, 0, 1, 0]]);
+      [['gemini-4-argon-high', 2, 1, 0, 15], ['claude-sonnet-4-6', 1, 0, 1, 0]]);
     assert.equal(rows.by_worker.find((r) => r.name === 'agy2').spent, 10);
     assert.deepEqual(rows.per_day, [{ day: '2026-10-09', jobs: 2 }, { day: '2026-10-10', jobs: 1 }]);
   });

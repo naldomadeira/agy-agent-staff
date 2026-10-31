@@ -75,13 +75,13 @@ export function renderTop(snapshot, { width = 100, colorOn = true } = {}) {
   const on = colorOn;
   const s = snapshot.summary;
   const lines = [];
-  lines.push(color('1', `agy pool · mode ${snapshot.mode} · gemini ${s.gemini.open}/${s.total} open · 3p ${s.third_party.open}/${s.total} open` +
+  lines.push(color('1', `agy pool · mode ${snapshot.mode} · gemini ${s.gemini.open}/${s.total} open${s.argon?.total ? ` · argon ${s.argon.open}/${s.argon.total} open` : ''} · 3p ${s.third_party.open}/${s.total} open` +
     `${s.stale.length ? ` · ${s.stale.length} stale` : ''} · ${snapshot.generated_at.slice(11, 19)}`, on));
   lines.push('');
-  lines.push(color('2', 'worker   gemini                    anthropic/3p              read   jobs', on));
+  lines.push(color('2', 'worker   gemini                    argon                     anthropic/3p              read   jobs', on));
   for (const worker of snapshot.workers) {
     if (worker.status === 'unavailable') continue;
-    lines.push(`${worker.id.padEnd(8)} ${cell(worker.gemini, on)} ${cell(worker.third_party, on)} ${age(worker.quota_age_seconds).padStart(5)}  ${worker.active_jobs}/${worker.capacity}`);
+    lines.push(`${worker.id.padEnd(8)} ${cell(worker.gemini, on)} ${worker.argon?.in_catalog === false || !worker.argon ? ''.padEnd(25) : cell(worker.argon, on)} ${cell(worker.third_party, on)} ${age(worker.quota_age_seconds).padStart(5)}  ${worker.active_jobs}/${worker.capacity}`);
   }
   lines.push('');
   const running = snapshot.jobs.filter((job) => job.status === 'running');
@@ -231,9 +231,9 @@ const bar=(p)=>{if(typeof p!=='number')return'<span class="muted">—</span>';co
 const pool=(q)=>bar(q.slack_percent)+(q.blocked_until?' <span class="muted">↻'+rem(q.blocked_until)+'</span>':'');
 const rows=(head,list)=>'<tr>'+head.map((h)=>'<th>'+h+'</th>').join('')+'</tr>'+(list.length?list.join(''):'<tr><td class="muted" colspan="'+head.length+'">none</td></tr>');
 function draw(s){
-  $('mode').textContent='mode '+s.mode;$('open').textContent='gemini '+s.summary.gemini.open+'/'+s.summary.total+' · 3p '+s.summary.third_party.open+'/'+s.summary.total+(s.summary.stale.length?' · '+s.summary.stale.length+' stale':'');
+  $('mode').textContent='mode '+s.mode;$('open').textContent='gemini '+s.summary.gemini.open+'/'+s.summary.total+(s.summary.argon&&s.summary.argon.total?' · argon '+s.summary.argon.open+'/'+s.summary.argon.total:'')+' · 3p '+s.summary.third_party.open+'/'+s.summary.total+(s.summary.stale.length?' · '+s.summary.stale.length+' stale':'');
   $('at').textContent='updated '+new Date(s.generated_at).toLocaleTimeString();
-  $('workers').innerHTML=rows(['worker','gemini','anthropic/3p','read','jobs'],s.workers.filter((w)=>w.status!=='unavailable').map((w)=>'<tr><td>'+esc(w.id)+'</td><td>'+pool(w.gemini)+'</td><td>'+pool(w.third_party)+'</td><td class="muted">'+(w.quota_age_seconds==null?'—':Math.round(w.quota_age_seconds/60)+'m')+'</td><td>'+w.active_jobs+'/'+w.capacity+'</td></tr>'));
+  $('workers').innerHTML=rows(['worker','gemini','argon','anthropic/3p','read','jobs'],s.workers.filter((w)=>w.status!=='unavailable').map((w)=>'<tr><td>'+esc(w.id)+'</td><td>'+pool(w.gemini)+'</td><td>'+(w.argon&&w.argon.in_catalog===false?'<span class="muted">—</span>':w.argon?pool(w.argon):'<span class="muted">—</span>')+'</td><td>'+pool(w.third_party)+'</td><td class="muted">'+(w.quota_age_seconds==null?'—':Math.round(w.quota_age_seconds/60)+'m')+'</td><td>'+w.active_jobs+'/'+w.capacity+'</td></tr>'));
   $('jobs').innerHTML=rows(['job','status','worker/model','phase','last'],s.jobs.slice(0,15).map((j)=>'<tr><td>'+esc(j.id)+'</td><td class="'+(j.status==='done'?'ok':j.status==='running'?'warn':'bad')+'">'+esc(j.status)+(j.reason?' · '+esc(j.reason):'')+'</td><td>'+esc((j.worker||'-')+'/'+(j.model||'-'))+'</td><td>'+esc(j.phase||'')+'</td><td class="muted">'+esc(j.last_activity||'')+'</td></tr>'));
   $('runs').innerHTML=rows(['run','name','status','done'],s.runs.slice(-10).reverse().map((r)=>'<tr><td>'+esc(r.id)+'</td><td>'+esc(r.name)+'</td><td>'+esc(r.status)+'</td><td>'+r.done+'/'+r.total+(r.waiting?' · '+r.waiting+' waiting':'')+'</td></tr>'));
   $('inbox').innerHTML=rows(['time','job/run','outcome'],s.inbox.slice(-12).reverse().map((e)=>'<tr><td class="muted">'+esc(String(e.ts).slice(11,16))+'</td><td>'+esc(e.job||e.run)+'</td><td>'+esc(e.line)+'</td></tr>'));

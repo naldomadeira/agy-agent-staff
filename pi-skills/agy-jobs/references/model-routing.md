@@ -18,24 +18,27 @@ agy models
 ```
 
 Reading the output: an id is `<family>-<tier>`. Flash families (`gemini-3.8-flash`,
-`gemini-3.7-flash`, `gemini-3.6-flash`, ...) take `high`/`medium`/`low`; `gemini-3.1-pro` takes only
-`high`/`low` (the companion falls back to `high` if you ask it for an effort it does not have,
-with a note on stderr). The Anthropic and GPT-OSS ids carry a fixed suffix instead of a chosen
-effort (`claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`) — pass them as-is,
-`--effort` does nothing for them. The bare aliases `flash` and `pro` resolve to the current default
-flash family and to `gemini-3.1-pro`, respectively, combined with `--effort` if given.
+`gemini-3.7-flash`, `gemini-3.6-flash`, ...) and the Argon (`gemini-4-argon`) take
+`high`/`medium`/`low`. **The Argon has its own quota, separate from Flash and from Claude, and exists
+only on profiles 11–13**; so do `claude-sonnet-5-5-*` and `claude-opus-5-5-*`. The older profiles
+have Flash 3.8, `claude-sonnet-4-6`, `claude-opus-4-6-thinking` and `gpt-oss-120b-medium`. The
+companion only routes a model to a worker whose `agy models` catalog lists it. `gemini-3.1-pro` no
+longer exists in any profile: naming it is an error that lists the ids that do. The older Anthropic
+and GPT-OSS ids carry a fixed suffix (`claude-sonnet-4-6`, `claude-opus-4-6-thinking`,
+`gpt-oss-120b-medium`) — pass them as-is, `--effort` does nothing for them. The bare aliases `flash`
+and `argon` resolve to `gemini-3.8-flash` and `gemini-4-argon`, combined with `--effort` if given.
 
 ## Routing rules
 
 - **Flash is the default and serves the volume.** Reading, sweeps, well-scoped tasks with a clear
   answer shape — leave the persona's default model alone. Most delegated work is this.
-- **`gemini-3.1-pro` and the Claude ids are for the hard cases**: architecture decisions, a fix
+- **The Argon and the Claude ids are for the hard cases**: architecture decisions, a fix
   that already failed once and needs the actual cause understood before a second attempt, a diff
   wide enough that the consequences need reasoning through rather than pattern-matching. Reach for
   these when the task itself demands it, not as a default upgrade for "important" work.
 - **Anthropic quota is scarcer than the Gemini families.** Use `claude-sonnet-4-6` or
   `claude-opus-4-6-thinking` when they are what resolves the task — not out of habit, and not
-  because the task merely seems important. If a flash tier or `gemini-3.1-pro` would do, prefer it.
+  because the task merely seems important. If a flash tier or the Argon would do, prefer it.
 - **Try `--effort` before you switch families.** It is the cheaper lever: `--effort high` on the
   current family often closes the gap that made a heavier model seem necessary. Escalate to a
   different family only once effort alone does not.

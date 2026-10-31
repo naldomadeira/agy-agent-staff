@@ -117,7 +117,7 @@ import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
 import { appendInbox, appendUsage, readInbox, readUsage, repoKey } from './inbox.mjs';
 import { cmdRunSpec, cmdRunStatus, cmdRunWait, cmdRunCancel, listRuns, runMain } from './run-spec.mjs';
 import { aggregateUsage, runTop, serveDashboard } from './views.mjs';
-import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, quotaNow, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
+import { discoverWorkers, refreshQuota, reserveWorker, routeWorker, slackForModel, quotaPoolForModel, quotaNow, markArgonClosed, workerHasModel, catalogModelIds, POOL_FIELDS, OPEN_SLACK_PERCENT, PROBE_MODEL } from './worker-pool.mjs';
 import { agyLaunch } from './agy-launch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -163,13 +163,19 @@ const DEFAULTS = {
 // first model whose quota pool is open on some account wins; a job that dies
 // of quota falls back to another account, then down this chain. A project
 // overrides any class in .agy-staff/config.json "routing". Opus is reachable
-// only by naming it: it burns an account's 3p window in minutes.
+// only by naming it, or by the design class: it burns an account's 3p window
+// in minutes.
+//
+// A model counts only on a worker whose `agy models` catalog lists it: the
+// 5.5 Claude ids and the Argon exist only on profiles 11–13, the older
+// profiles stop at claude-sonnet-4-6 / claude-opus-4-6-thinking. The Argon
+// has its own quota, apart from Flash (gemini) and Claude (3p).
 const DEFAULT_ROUTING = {
-  feature: ['claude-sonnet-4-6', 'gemini-3.1-pro-high'],
-  mechanical: ['gemini-3.8-flash-high', 'gemini-3.1-pro-low'],
-  review: ['gemini-3.1-pro-high', 'claude-sonnet-4-6'],
-  research: ['gemini-3.8-flash-high', 'gemini-3.1-pro-high'],
-  design: ['claude-opus-4-6-thinking'],
+  feature: ['claude-sonnet-5-5-medium', 'gemini-4-argon-high', 'claude-sonnet-4-6'],
+  mechanical: ['gemini-3.8-flash-high', 'gemini-3.8-flash-medium'],
+  review: ['gemini-4-argon-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-4-6'],
+  research: ['gemini-3.8-flash-high', 'gemini-4-argon-medium'],
+  design: ['claude-opus-5-5-high', 'claude-opus-4-6-thinking'],
 };
 // The class a mode routes as when `--model auto` is given without `--class`.
 const MODE_CLASS = { implement: 'feature', staffer: 'mechanical', review: 'review', research: 'research' };
@@ -194,46 +200,58 @@ const IMPLEMENT_POLICY_VERSION = 'implement-discipline-2';
 
 // agy only accepts effort-suffixed model ids; bare family names are rejected
 // with status ERROR ("--model gemini-3.8-flash requires --effort").
-// Known ids from `agy models` (v1.1.13):
+// Known ids from `agy models` (profiles 11–13 carry the Argon and the 5.5
+// Claude ids; the older profiles stop at claude-sonnet-4-6):
 const KNOWN_MODELS = new Set([
+  'gemini-4-argon-high', 'gemini-4-argon-medium', 'gemini-4-argon-low',
   'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low',
   'gemini-3.7-flash-high', 'gemini-3.7-flash-medium', 'gemini-3.7-flash-low',
   'gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low',
   'gemini-3.5-flash-high', 'gemini-3.5-flash-medium', 'gemini-3.5-flash-low',
-  'gemini-3.1-pro-high', 'gemini-3.1-pro-low',
+  'claude-sonnet-5-5-high', 'claude-sonnet-5-5-medium', 'claude-sonnet-5-5-low',
+  'claude-opus-5-5-high', 'claude-opus-5-5-medium', 'claude-opus-5-5-low',
   'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b-medium',
 ]);
 const MODEL_FAMILIES = {
+  'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-3.7-flash': ['low', 'medium', 'high'],
   'gemini-3.6-flash': ['low', 'medium', 'high'],
   'gemini-3.5-flash': ['low', 'medium', 'high'],
-  'gemini-3.1-pro': ['low', 'high'],
+  'claude-sonnet-5-5': ['low', 'medium', 'high'],
+  'claude-opus-5-5': ['low', 'medium', 'high'],
 };
-const MODEL_ALIASES = { flash: 'gemini-3.8-flash', pro: 'gemini-3.1-pro' };
+const MODEL_ALIASES = { flash: 'gemini-3.8-flash', argon: 'gemini-4-argon' };
+// gemini-3.1-pro was removed from every profile; naming it (or its old
+// "pro" alias) is an error that lists what exists, not a silent remap.
+const RETIRED_MODEL = /^(gemini-3\.1-pro(-|$)|pro$)/;
+
+function retiredModelError(raw) {
+  const catalog = catalogModelIds();
+  const models = catalog.length ? catalog : [...KNOWN_MODELS].sort();
+  return `model "${raw}" no longer exists: gemini-3.1-pro was removed from every profile. ` +
+    `Models that exist${catalog.length ? ' (from the cached `agy models` of the pool profiles)' : ''}: ${models.join(', ')}. ` +
+    'The Argon (gemini-4-argon-*) has its own quota and exists only on profiles 11–13.';
+}
 
 /** Normalize a user-supplied --model value to an id agy accepts, or die
  *  pre-flight with a helpful message. Never lets a bare family reach agy. */
 function normalizeModel(raw, effort) {
+  if (RETIRED_MODEL.test(String(raw))) die(retiredModelError(raw));
   const name = MODEL_ALIASES[raw] || raw;
   if (KNOWN_MODELS.has(name)) return name;
   const efforts = MODEL_FAMILIES[name];
   if (efforts) {
-    let e = effort || 'medium';
-    if (!efforts.includes(e)) {
-      // e.g. gemini-3.1-pro has no medium: fall back to its highest tier
-      const fallback = efforts[efforts.length - 1];
-      process.stderr.write(`agy-staff: ${name} has no "${e}" effort; using ${name}-${fallback}\n`);
-      e = fallback;
-    }
+    const e = effort || 'medium';
+    if (!efforts.includes(e)) die(`${name} has no "${e}" effort (${efforts.join('|')})`);
     return `${name}-${e}`;
   }
   // future-tolerance: pass through anything already effort-suffixed
   if (/-(low|medium|high|thinking)$/.test(name)) return name;
   die(
     `unknown model id "${raw}". agy needs effort-suffixed ids, e.g. ` +
-      `gemini-3.8-flash-low|medium|high, gemini-3.1-pro-low|high. ` +
-      `Aliases accepted here: "flash" (gemini-3.8-flash), "pro" (gemini-3.1-pro), ` +
+      `gemini-3.8-flash-low|medium|high, gemini-4-argon-low|medium|high. ` +
+      `Aliases accepted here: "flash" (gemini-3.8-flash), "argon" (gemini-4-argon), ` +
       `optionally combined with --effort. Run \`agy models\` for the full list.`
   );
 }
@@ -1091,12 +1109,6 @@ function recommendCompatibleModel(requestedModel, availableModelIds) {
       const otherFlash = sameEffort.find((id) => id.includes('flash') && id !== requestedModel);
       if (otherFlash) return otherFlash;
 
-      const proOrder = [`gemini-3.1-pro-${effort}`];
-      for (const candidate of proOrder) {
-        if (sameEffort.includes(candidate) && candidate !== requestedModel) {
-          return candidate;
-        }
-      }
       const otherSameEffort = sameEffort.find((id) => id !== requestedModel);
       if (otherSameEffort) return otherSameEffort;
     }
@@ -1536,7 +1548,15 @@ async function planWorker(opts, prior = null, model = null, routing = null) {
   // Historical/default jobs retain the legacy executable without probing or
   // entering the pool. This is an affinity marker, not an auto-pool request.
   if (!requested && affinity?.id === LEGACY_WORKER_ID) return { pinned: affinity };
-  return { workers: await discoverWorkers({ config: configPath(), model }), requested, affinity };
+  let workers = await discoverWorkers({ config: configPath(), model });
+  // `--worker auto` with a named model: only accounts whose `agy models`
+  // lists it can take the job (the Argon is on profiles 11–13 only).
+  if (model && requested === 'auto' && !affinity) {
+    const capable = workers.filter((worker) => workerHasModel(worker, model));
+    if (workers.length && !capable.length) die(`no worker lists model ${model} in its \`agy models\` catalog (checked: ${workers.map((worker) => worker.id).join(', ')}); pick a model that exists on the pool or name a worker.`);
+    workers = capable;
+  }
+  return { workers, requested, affinity };
 }
 
 /**
@@ -1560,12 +1580,15 @@ async function planRoute(opts, routing) {
 function noRouteError(plan) {
   const lines = plan.routing.chain.map((model) => {
     const pool = quotaPoolForModel(model);
-    const field = pool === 'gemini' ? 'quotaResetGemini' : 'quotaResetThirdParty';
+    const field = POOL_FIELDS[pool].reset;
     const reopen = plan.workers.map((w) => w[field]).filter((ms) => typeof ms === 'number' && ms > Date.now());
-    const unread = plan.workers.filter((w) => w.status !== 'unavailable' && slackForModel(w, model) === null).map((w) => w.id);
+    const reachable = plan.workers.filter((w) => w.status !== 'unavailable');
+    const unread = reachable.filter((w) => workerHasModel(w, model) && slackForModel(w, model) === null).map((w) => w.id);
+    const missing = reachable.filter((w) => !workerHasModel(w, model)).map((w) => w.id);
     return `  ${model} (${pool}): no account with ≥${OPEN_SLACK_PERCENT}% slack` +
       (reopen.length ? `; next reopens in ${remainingLabel(Math.min(...reopen) - Date.now())}` : '') +
-      (unread.length ? `; no fresh reading: ${unread.join(', ')}` : '');
+      (unread.length ? `; no fresh reading: ${unread.join(', ')}` : '') +
+      (missing.length ? `; not in the catalog of: ${missing.join(', ')}` : '');
   });
   return Object.assign(new Error(
     `no open account for --class ${plan.routing.class}${plan.requested !== 'auto' ? ` on worker ${plan.requested}` : ''}:\n${lines.join('\n')}\n` +
@@ -2508,6 +2531,7 @@ async function executeRun(resolved, prompt, opts, execution = null) {
     response = triageResult(result, resolved.mode, resolved.profile, resolved.profileSource, resolved.model);
   } catch (error) {
     const afterLines = porcelainSnapshot();
+    if (error.reason === 'quota_exhausted') noteArgonQuotaDeath(resolved, error.resets_in);
     error.workspace = {
       before: excerpt(workspaceBefore?.join('\n') ?? 'Git status unavailable', 3000),
       after: excerpt(afterLines?.join('\n') ?? 'Git status unavailable', 3000),
@@ -3074,7 +3098,7 @@ async function workerMain(jobId) {
 // cross-review (F3)
 // ---------------------------------------------------------------------------
 
-const REVIEW_CHAIN = ['claude-sonnet-4-6', 'gemini-3.1-pro-high'];
+const REVIEW_CHAIN = ['claude-sonnet-5-5-medium', 'gemini-4-argon-high', 'claude-sonnet-4-6'];
 const MAX_REVIEW_FIX_ROUNDS = 2;
 const BLOCKING_SEVERITIES = new Set(['critical', 'high', 'medium']);
 
@@ -3085,7 +3109,7 @@ function autoReviewApplies(current) {
   const { value } = loadSharedSetting('auto_review');
   const setting = value ?? 'gemini';
   if (setting === 'off' || !current.worker || current.worker.id === LEGACY_WORKER_ID) return false;
-  return setting === 'all' || quotaPoolForModel(current.model) === 'gemini';
+  return setting === 'all' || String(current.model || '').startsWith('gemini-');
 }
 
 function crossReviewPrompt(task) {
@@ -3121,7 +3145,7 @@ function parseReviewVerdict(text) {
 /** Reserve a reviewer on another account: never the implementer's own. */
 async function pickReviewer(jobId, current) {
   const workers = await discoverWorkers({ config: configPath() });
-  const exclude = [{ id: current.worker.id, pool: '3p' }, { id: current.worker.id, pool: 'gemini' }];
+  const exclude = Object.keys(POOL_FIELDS).map((pool) => ({ id: current.worker.id, pool }));
   return updateState((state) => {
     const activeJobs = (state.jobs || []).filter((j) => j.id !== jobId && liveJobStatus(j) === 'running');
     const route = routeWorker({ workers, chain: REVIEW_CHAIN, activeJobs, exclude });
@@ -3211,6 +3235,16 @@ async function crossReview({ jobId, job, task, current, signal, fix }) {
       outcome: { ...(latest.outcome || {}), status: 'attention', reason: 'review_unresolved', warnings: true } };
   }
   return { section, summary, finalOutput: latest?.finalOutput, outcome: latest?.outcome };
+}
+
+/** A job that died of quota on an Argon model closes the Argon of that
+ *  account, with the reset AGY printed: the next `--model auto` must not
+ *  route there while the 5h/weekly Flash window still reads open. */
+function noteArgonQuotaDeath(resolved, resetsIn) {
+  try {
+    if (quotaPoolForModel(resolved.model) !== 'argon' || !resolved.worker || resolved.worker.id === LEGACY_WORKER_ID) return;
+    markArgonClosed(resolved.worker.bin, resetsIn);
+  } catch { /* bookkeeping only: never mask the quota death itself */ }
 }
 
 /**
@@ -3384,14 +3418,16 @@ function quotaAgeLabel(ms) {
  *  is a real answer here — a worker outside the profile scheme, or one whose
  *  hook has never run, has no quota, and that is not a failure. */
 function quotaCell(worker, field) {
-  const age = typeof worker.quotaAgeMs === 'number' ? ` (${quotaAgeLabel(worker.quotaAgeMs)})` : '';
+  const ageField = field === 'quotaArgon' ? 'quotaArgonAgeMs' : 'quotaAgeMs';
+  const ageMs = worker[ageField];
+  const age = typeof ageMs === 'number' ? ` (${quotaAgeLabel(ageMs)})` : '';
   const reset = resetSuffix(worker, field);
-  if (typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs >= 6 * 60 * 60 * 1000) return `stale${age}${reset}`;
+  if (typeof ageMs === 'number' && ageMs >= 6 * 60 * 60 * 1000) return `stale${age}${reset}`;
   if (typeof worker[field] !== 'number') return '-';
   return `${Math.round(worker[field])}%${age}${reset}`;
 }
 
-const QUOTA_RESET_FIELDS = { quotaGemini: 'quotaResetGemini', quotaThirdParty: 'quotaResetThirdParty' };
+const QUOTA_RESET_FIELDS = { quotaGemini: 'quotaResetGemini', quotaThirdParty: 'quotaResetThirdParty', quotaArgon: 'quotaResetArgon' };
 // Below this slack a pool is treated as closed: a job would start and die.
 const QUOTA_LOW_PERCENT = 5;
 
@@ -3437,6 +3473,9 @@ function workerJSON(worker, active) {
     active_jobs: activeJobsFor(worker, active),
     quota_age_seconds: typeof worker.quotaAgeMs === 'number' ? Math.round(worker.quotaAgeMs / 1000) : null,
     gemini: { slack_percent: worker.quotaGemini ?? null, blocked_until: iso(worker.quotaResetGemini) },
+    argon: { slack_percent: worker.quotaArgon ?? null, blocked_until: iso(worker.quotaResetArgon),
+      read_age_seconds: typeof worker.quotaArgonAgeMs === 'number' ? Math.round(worker.quotaArgonAgeMs / 1000) : null,
+      in_catalog: Array.isArray(worker.models) ? worker.models.some((id) => quotaPoolForModel(id) === 'argon') : null },
     third_party: { slack_percent: worker.quotaThirdParty ?? null, blocked_until: iso(worker.quotaResetThirdParty) },
   };
 }
@@ -3451,7 +3490,7 @@ async function cmdWorkers(opts = {}) {
     process.stdout.write(JSON.stringify(workers.map((worker) => workerJSON(worker, active)), null, 2) + '\n');
     return;
   }
-  process.stdout.write('id | executable | status | version | capacity | active jobs | Gemini slack | Anthropic/3p slack\n');
+  process.stdout.write('id | executable | status | version | capacity | active jobs | Gemini slack | Argon slack | Anthropic/3p slack\n');
   for (const worker of workers) {
     const count = activeJobsFor(worker, active);
     // `status` carries the three-way verdict; `available` is the older boolean
@@ -3459,7 +3498,7 @@ async function cmdWorkers(opts = {}) {
     // collapse `unknown` back into `unavailable` — the exact false negative
     // the three-way probe exists to remove.
     const status = worker.status || (worker.available ? 'available' : 'unavailable');
-    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker, 'quotaGemini')} | ${quotaCell(worker, 'quotaThirdParty')}\n`);
+    process.stdout.write(`${worker.id} | ${worker.bin} | ${status} | ${worker.version || '-'} | ${worker.capacity} | ${count} | ${quotaCell(worker, 'quotaGemini')} | ${quotaCell(worker, 'quotaArgon')} | ${quotaCell(worker, 'quotaThirdParty')}\n`);
   }
   if (!workers.length) process.stdout.write('(no workers discovered)\n');
 }
@@ -3476,7 +3515,7 @@ function printSuggestions(opts, workers, active) {
   const options = [];
   for (const model of chain) {
     const open = workers
-      .filter((worker) => worker.status !== 'unavailable' && (slackForModel(worker, model) ?? -1) >= OPEN_SLACK_PERCENT)
+      .filter((worker) => worker.status !== 'unavailable' && workerHasModel(worker, model) && (slackForModel(worker, model) ?? -1) >= OPEN_SLACK_PERCENT)
       .sort((a, b) => slackForModel(b, model) - slackForModel(a, model) || activeJobsFor(a, active) - activeJobsFor(b, active));
     for (const worker of open) {
       options.push({ model, pool: quotaPoolForModel(model), worker: worker.id, slack_percent: Math.round(slackForModel(worker, model)),
@@ -3569,14 +3608,18 @@ function lastActivity(job) {
 function poolSummary(workers, active, now = Date.now()) {
   const known = workers.filter((worker) => worker.status !== 'unavailable');
   const fresh = (worker) => typeof worker.quotaAgeMs === 'number' && worker.quotaAgeMs < STATUS_FRESH_MS;
+  const hasArgon = (worker) => Array.isArray(worker.models) && worker.models.some((id) => quotaPoolForModel(id) === 'argon');
   const pool = (field) => {
-    const open = known.filter((worker) => typeof worker[field] === 'number' && worker[field] >= QUOTA_LOW_PERCENT);
-    const resets = known
+    // The Argon exists only on some profiles: it is counted against those.
+    const eligible = field === 'quotaArgon' ? known.filter(hasArgon) : known;
+    const open = eligible.filter((worker) => typeof worker[field] === 'number' && worker[field] >= QUOTA_LOW_PERCENT);
+    const resets = eligible
       .filter((worker) => !open.includes(worker))
       .map((worker) => worker[QUOTA_RESET_FIELDS[field]])
       .filter((ms) => typeof ms === 'number' && ms > now);
     const next = resets.length ? Math.min(...resets) : null;
     return {
+      total: eligible.length,
       open: open.length,
       open_workers: open.map((worker) => worker.id),
       next_reopen: next === null ? null : new Date(next).toISOString(),
@@ -3587,6 +3630,7 @@ function poolSummary(workers, active, now = Date.now()) {
     mode: readMode().mode,
     total: known.length,
     gemini: pool('quotaGemini'),
+    argon: pool('quotaArgon'),
     third_party: pool('quotaThirdParty'),
     stale: known.filter((worker) => !fresh(worker)).map((worker) => worker.id),
     running_jobs: active.length,
@@ -3664,12 +3708,16 @@ function cmdMode(opts) {
 
 function poolLine(summary) {
   const part = (label, pool) => {
-    const reopen = pool.open < summary.total && pool.next_reopen_in_seconds !== null
+    const total = pool.total ?? summary.total;
+    const reopen = pool.open < total && pool.next_reopen_in_seconds !== null
       ? ` ↻${remainingLabel(pool.next_reopen_in_seconds * 1000)}` : '';
-    return `${label} ${pool.open}/${summary.total}${reopen}`;
+    return `${label} ${pool.open}/${total}${reopen}`;
   };
   const mode = readMode().mode;
-  const pieces = [`agy${mode !== 'off' ? `[${mode}]` : ''} ${part('gem', summary.gemini)}`, part('3p', summary.third_party)];
+  const pieces = [`agy${mode !== 'off' ? `[${mode}]` : ''} ${part('gem', summary.gemini)}`];
+  // No profile with the Argon in its catalog: nothing to count.
+  if (summary.argon?.total) pieces.push(part('argon', summary.argon));
+  pieces.push(part('3p', summary.third_party));
   if (summary.stale.length) pieces.push(`stale ${summary.stale.length}`);
   if (summary.running_jobs) pieces.push(`▶${summary.running_jobs}`);
   return pieces.join(' · ');

@@ -20,10 +20,25 @@ const DEFAULT_MAX_PROFILE = 20;
 // A window this full leaves less than a job's worth of quota.
 const BLOCKED_PERCENT = 95;
 
+/**
+ * A família de cota de um modelo. Três cotas independentes por conta:
+ * `argon` (gemini-4-argon-*, só nos perfis 11–13), `gemini` (Flash) e `3p`
+ * (claude-*, gpt-*). O Argon começa por `gemini-` mas NÃO gasta a cota do
+ * Flash: tratá-lo como `gemini` foi o que o fez parecer aberto numa conta
+ * onde o Argon está esgotado há horas.
+ */
 export function quotaPoolForModel(model) {
   if (!model) return null;
+  if (model.startsWith('gemini-4-argon')) return 'argon';
   return model.startsWith('gemini-') ? 'gemini' : '3p';
 }
+
+/** Worker fields that hold each pool's slack and reopen time. */
+export const POOL_FIELDS = {
+  gemini: { slack: 'quotaGemini', reset: 'quotaResetGemini', age: 'quotaAgeMs' },
+  argon: { slack: 'quotaArgon', reset: 'quotaResetArgon', age: 'quotaArgonAgeMs' },
+  '3p': { slack: 'quotaThirdParty', reset: 'quotaResetThirdParty', age: 'quotaAgeMs' },
+};
 
 /** Below this slack a pool counts as closed for routing: a job would start
  *  and die minutes in, burning the account's window for nothing. */
@@ -31,8 +46,23 @@ export const OPEN_SLACK_PERCENT = 5;
 
 /** The measured slack of `model`'s pool on `worker`, or null when unknown. */
 export function slackForModel(worker, model) {
-  const value = quotaPoolForModel(model) === 'gemini' ? worker.quotaGemini : worker.quotaThirdParty;
+  const fields = POOL_FIELDS[quotaPoolForModel(model)];
+  const value = fields ? worker[fields.slack] : undefined;
   return typeof value === 'number' ? value : null;
+}
+
+/**
+ * Whether `worker` can run `model`, by the catalog `agy models` gave for its
+ * profile (`worker.models`). Modelo fora do catálogo não é elegível: o
+ * `gemini-3.1-pro` que já não existe em perfil nenhum falhava com
+ * `unsupported-model` só depois de reservado o worker. Sem catálogo lido
+ * (`models` nulo) um modelo comum segue elegível — falta de leitura não é
+ * ausência —, mas o Argon não: ele só existe nos perfis 11–13, e despachar
+ * às cegas para uma conta que talvez nem o tenha é o palpite que `auto` evita.
+ */
+export function workerHasModel(worker, model) {
+  if (Array.isArray(worker?.models)) return worker.models.includes(model);
+  return quotaPoolForModel(model) !== 'argon';
 }
 
 /**
@@ -54,6 +84,7 @@ export function routeWorker({ workers = [], chain = [], activeJobs = {}, request
   for (const model of chain) {
     const candidates = workers
       .filter((worker) => !excluded(worker, model))
+      .filter((worker) => workerHasModel(worker, model))
       .filter((worker) => (slackForModel(worker, model) ?? -1) >= OPEN_SLACK_PERCENT)
       .map((worker) => ({ ...worker, quotaSlack: slackForModel(worker, model) }));
     const worker = selectWorker({ workers: candidates, activeJobs, requestedWorkerId });
@@ -137,6 +168,7 @@ export async function discoverWorkers(options = {}) {
       probe: options.probe,
     });
     const quota = await readQuota(quotaCacheDir, entry.bin, now, options.model);
+    const models = await readCatalog(quotaCacheDir, entry.bin);
     return {
       id: entry.id,
       bin: entry.bin,
@@ -150,11 +182,17 @@ export async function discoverWorkers(options = {}) {
       quotaThirdParty: quota ? quota.thirdParty : null,
       quotaResetGemini: quota ? quota.resetGemini : null,
       quotaResetThirdParty: quota ? quota.resetThirdParty : null,
+      quotaArgon: quota ? quota.argon : null,
+      quotaResetArgon: quota ? quota.resetArgon : null,
+      quotaArgonAgeMs: quota ? quota.argonAgeMs : null,
+      models,
     };
   }));
 }
 
 export const PROBE_MODEL = 'gemini-3.8-flash-low';
+/** O Argon tem cota própria: a sonda do Flash não diz nada sobre ele. */
+export const ARGON_PROBE_MODEL = 'gemini-4-argon-low';
 export const DEFAULT_PROBE_MAX_AGE_MS = 10 * 60 * 1000;
 
 /**
@@ -168,32 +206,160 @@ export const DEFAULT_PROBE_MAX_AGE_MS = 10 * 60 * 1000;
  * janelas e o `disabled` atuais. Só corre nas contas com leitura ausente ou
  * mais velha do que `maxAgeMs`, todas em paralelo, numa pasta temporária.
  *
- * @returns {Promise<Array<{id:string, ok:boolean, ms:number, error?:string}>>}
+ * O Argon é outra cota: nos workers cujo catálogo (`worker.models`) tem
+ * `gemini-4-argon-*`, uma segunda sonda mínima com `gemini-4-argon-low` corre
+ * quando a leitura argon está ausente ou velha (a do hook, se há janela
+ * argon no cache, ou a da última sonda argon, o que for mais novo). O
+ * resultado vai para um ficheiro próprio (`agy-staff-argon-<perfil>.json`),
+ * nunca para o do hook.
+ *
+ * @returns {Promise<Array<{id:string, ok:boolean, ms:number, pool:string, error?:string}>>}
  */
-export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFAULT_PROBE_MAX_AGE_MS, timeoutMs = 60000, ping, lockDir = os.tmpdir() } = {}) {
-  const stale = workers.filter((worker) =>
-    worker.status !== 'unavailable' && (typeof worker.quotaAgeMs !== 'number' || worker.quotaAgeMs >= maxAgeMs));
+export async function refreshQuota(workers, { env = process.env, maxAgeMs = DEFAULT_PROBE_MAX_AGE_MS, timeoutMs = 60000, ping, lockDir = os.tmpdir(), now = Date.now() } = {}) {
+  const live = workers.filter((worker) => worker.status !== 'unavailable');
+  const stale = live.filter((worker) => typeof worker.quotaAgeMs !== 'number' || worker.quotaAgeMs >= maxAgeMs);
+  const staleArgon = live.filter((worker) => Array.isArray(worker.models) && worker.models.some((id) => quotaPoolForModel(id) === 'argon')
+    && (typeof worker.quotaArgonAgeMs !== 'number' || worker.quotaArgonAgeMs >= maxAgeMs));
   const run = ping ?? pingWorker;
-  return Promise.all(stale.map(async (worker) => {
+  const cacheDir = env.AGY_QUOTA_CACHE_DIR?.trim() || DEFAULT_QUOTA_CACHE_DIR;
+  const probeOne = (worker, pool) => async () => {
     const started = Date.now();
     // Ten parallel `--model auto` dispatches would otherwise ping every
     // stale account ten times. The first one takes a short-lived lock; the
     // rest skip that account and read whatever the first one refreshed.
-    const release = probeLock(lockDir, worker, timeoutMs + 10000);
-    if (!release) return { id: worker.id, ok: true, ms: 0, skipped: 'probe already running' };
+    const release = probeLock(lockDir, { id: pool === 'argon' ? `${worker.id}-argon` : worker.id }, timeoutMs + 10000);
+    if (!release) return { id: worker.id, pool, ok: true, ms: 0, skipped: 'probe already running' };
     try {
-      await run(worker.bin, { env, timeoutMs });
-      return { id: worker.id, ok: true, ms: Date.now() - started };
+      const output = await run(worker.bin, { env, timeoutMs, model: pool === 'argon' ? ARGON_PROBE_MODEL : PROBE_MODEL });
+      if (pool === 'argon') {
+        // An exit-0 answer can still carry the 429 in its text.
+        const closed = argonClosedFrom(output);
+        writeArgonReading(cacheDir, worker.bin, closed ? { open: false, resetsInMs: closed.resetsInMs } : { open: true }, now);
+        return { id: worker.id, pool, ok: true, ms: Date.now() - started, ...(closed ? { error: 'quota_exhausted' } : {}) };
+      }
+      return { id: worker.id, pool, ok: true, ms: Date.now() - started };
     } catch (error) {
       const text = `${error?.stdout ?? ''}${error?.stderr ?? ''}${error?.message ?? ''}`;
-      // An exhausted gemini pool still answers with its quota, and the hook
-      // has recorded it by the time the error surfaces: that is a reading.
+      // An exhausted pool still answers with its quota, and the hook has
+      // recorded it by the time the error surfaces: that is a reading.
       const exhausted = /RESOURCE_EXHAUSTED|quota/i.test(text);
-      return { id: worker.id, ok: exhausted, ms: Date.now() - started, error: exhausted ? 'quota_exhausted' : firstLine(text) };
+      if (pool === 'argon' && exhausted) {
+        const closed = argonClosedFrom(text);
+        if (closed) writeArgonReading(cacheDir, worker.bin, { open: false, resetsInMs: closed.resetsInMs }, now);
+      }
+      return { id: worker.id, pool, ok: exhausted, ms: Date.now() - started, error: exhausted ? 'quota_exhausted' : firstLine(text) };
     } finally {
       release();
     }
-  }));
+  };
+  return Promise.all([
+    ...stale.map((worker) => probeOne(worker, 'gemini')()),
+    ...staleArgon.map((worker) => probeOne(worker, 'argon')()),
+  ]);
+}
+
+/** `{resetsInMs}` when `text` carries AGY's individual-quota 429, else null.
+ *  `resetsInMs` is null when the text names no reset ("Resets in …"). */
+export function argonClosedFrom(text) {
+  const body = String(text ?? '');
+  if (!/RESOURCE_EXHAUSTED|Individual quota reached|quota exceeded|\bcode\s*429\b/i.test(body)) return null;
+  return { resetsInMs: parseResetsIn(body) };
+}
+
+/** The duration AGY prints after "Resets in" ("7h54m19s", "24h10m14s",
+ *  "2d3h"), in milliseconds, or null when the text has none. */
+export function parseResetsIn(text) {
+  const match = /Resets in\s+((?:\d+d)?(?:\d+h)?(?:\d+m)?(?:\d+s)?)(?![0-9a-z])/i.exec(String(text ?? ''));
+  return match ? durationMs(match[1]) : null;
+}
+
+/** "7h54m19s" → ms. Null for an empty or unparsable string. */
+export function durationMs(value) {
+  const parts = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/i.exec(String(value ?? '').trim());
+  if (!parts || parts.slice(1).every((part) => part === undefined)) return null;
+  const [days, hours, minutes, seconds] = parts.slice(1).map((part) => Number(part ?? 0));
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
+function argonFile(cacheDir, bin) {
+  const profile = quotaProfileForBin(bin);
+  return profile ? pathModule.join(cacheDir, `agy-staff-argon-${profile}.json`) : null;
+}
+
+/**
+ * Regista o que se sabe do Argon numa conta, fora do ficheiro do hook (que
+ * este processo nunca escreve): `open` vem de uma sonda que respondeu;
+ * fechado traz o reset que o AGY disse. Também é chamado quando um job morre
+ * de quota com um modelo argon.
+ */
+export function writeArgonReading(cacheDir, bin, { open, resetsInMs = null }, now = Date.now()) {
+  const file = argonFile(cacheDir, bin);
+  if (!file) return false;
+  try {
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      checked_at: now / 1000, open: !!open,
+      reopens_at: !open && typeof resetsInMs === 'number' ? (now + resetsInMs) / 1000 : null,
+    }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Convenience for the job-death path: the Argon of `bin` is closed. */
+export function markArgonClosed(bin, resetsIn, { env = process.env, now = Date.now() } = {}) {
+  const cacheDir = env.AGY_QUOTA_CACHE_DIR?.trim() || DEFAULT_QUOTA_CACHE_DIR;
+  const resetsInMs = typeof resetsIn === 'number' ? resetsIn : durationMs(resetsIn);
+  return writeArgonReading(cacheDir, bin, { open: false, resetsInMs }, now);
+}
+
+function readArgonReading(cacheDir, bin) {
+  const file = argonFile(cacheDir, bin);
+  if (!file) return null;
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const checked = Number(data?.checked_at) * 1000;
+    if (!Number.isFinite(checked)) return null;
+    const reopens = Number(data?.reopens_at) * 1000;
+    return { checkedAtMs: checked, open: data.open === true, reopensAtMs: Number.isFinite(reopens) ? reopens : null };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The model ids of the catalog `agy models` gave for the profile at `bin`
+ * (cache file `agy-models-<profile>.json`, written outside this process), or
+ * null when there is no readable catalog.
+ */
+async function readCatalog(cacheDir, bin) {
+  const profile = quotaProfileForBin(bin);
+  if (!profile) return null;
+  return parseCatalog(await readFile(pathModule.join(cacheDir, `agy-models-${profile}.json`), 'utf8').catch(() => null));
+}
+
+function parseCatalog(raw) {
+  try {
+    const ids = JSON.parse(raw)?.models?.map((model) => model?.id).filter((id) => typeof id === 'string');
+    return ids?.length ? ids : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Every model id some cached profile catalog lists, sorted. Empty when no
+ *  catalog was ever cached. Used to say what DOES exist when a model does not. */
+export function catalogModelIds({ env = process.env } = {}) {
+  const dir = env.AGY_QUOTA_CACHE_DIR?.trim() || DEFAULT_QUOTA_CACHE_DIR;
+  const ids = new Set();
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!/^agy-models-.*\.json$/.test(name)) continue;
+      for (const id of parseCatalog(fs.readFileSync(pathModule.join(dir, name), 'utf8')) ?? []) ids.add(id);
+    }
+  } catch { /* no cache dir: nothing to list */ }
+  return [...ids].sort();
 }
 
 function probeLock(dir, worker, staleMs) {
@@ -216,12 +382,13 @@ function probeLock(dir, worker, staleMs) {
   }
 }
 
-async function pingWorker(bin, { env, timeoutMs }) {
+async function pingWorker(bin, { env, timeoutMs, model = PROBE_MODEL }) {
   const cwd = fs.mkdtempSync(pathModule.join(os.tmpdir(), 'agy-probe-'));
   try {
-    const agy = agyLaunch(bin, ['-p', 'Reply with the single word: ok', '--model', PROBE_MODEL,
+    const agy = agyLaunch(bin, ['-p', 'Reply with the single word: ok', '--model', model,
       '--output-format', 'json', '--print-timeout', `${Math.ceil(timeoutMs / 1000)}s`]);
-    await execFileAsync(agy.cmd, agy.args, { env, cwd, timeout: timeoutMs + 5000, windowsHide: true });
+    const result = await execFileAsync(agy.cmd, agy.args, { env, cwd, timeout: timeoutMs + 5000, windowsHide: true });
+    return `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -544,16 +711,46 @@ async function readQuota(cacheDir, bin, now, model) {
   const ageMs = Math.max(0, now - capturedAt * 1000);
   const fresh = ageMs < MAX_QUOTA_AGE_MS;
   const pool = quotaPoolForModel(model);
+  const argon = argonReading(data, fresh, ageMs, readArgonReading(cacheDir, bin), now);
   return {
-    slack: fresh ? slackFrom(data, now, pool) : null,
+    slack: pool === 'argon' ? argon.slack : fresh ? slackFrom(data, now, pool) : null,
     gemini: fresh ? slackFrom(data, now, 'gemini') : null,
     thirdParty: fresh ? slackFrom(data, now, '3p') : null,
     // Reset times are reported even for an old reading: "3p is blocked
     // until 18:46" stays true however long ago it was captured.
     resetGemini: blockingResetFrom(data, now, 'gemini'),
     resetThirdParty: blockingResetFrom(data, now, '3p'),
+    argon: argon.slack,
+    resetArgon: argon.reset,
+    argonAgeMs: argon.ageMs,
     ageMs,
   };
+}
+
+/**
+ * A leitura do Argon de uma conta: a janela `gemini-argon-*` que o hook
+ * grava e/ou a última sonda/morte por quota registada pelo companion
+ * (`agy-staff-argon-<perfil>.json`). Vale a mais nova das duas. Uma sonda que
+ * achou o Argon fechado vale até ao reset que o AGY informou; uma que o achou
+ * aberto prova só isso — sem janela medida a folga é 100, e a idade diz o
+ * quanto confiar. Sem nenhuma das duas, folga e idade são null.
+ */
+function argonReading(data, fresh, hookAgeMs, probe, now) {
+  const hasWindow = poolBuckets(data, 'argon').length > 0;
+  const hook = hasWindow ? {
+    slack: fresh ? slackFrom(data, now, 'argon') : null,
+    reset: blockingResetFrom(data, now, 'argon'),
+    ageMs: hookAgeMs,
+  } : { slack: null, reset: null, ageMs: null };
+  if (!probe) return hook;
+  const probeAgeMs = Math.max(0, now - probe.checkedAtMs);
+  if (probeAgeMs >= MAX_QUOTA_AGE_MS || (hook.ageMs !== null && hook.ageMs <= probeAgeMs)) return hook;
+  if (!probe.open) {
+    // A closed reading holds until the reset AGY reported, not for six hours.
+    if (probe.reopensAtMs !== null && probe.reopensAtMs <= now) return hook;
+    return { slack: 0, reset: probe.reopensAtMs, ageMs: probeAgeMs };
+  }
+  return { slack: hook.slack ?? 100, reset: null, ageMs: probeAgeMs };
 }
 
 /**
@@ -570,7 +767,9 @@ export function quotaNow(bin, model, { env = process.env, now = Date.now() } = {
     const data = JSON.parse(fs.readFileSync(pathModule.join(dir, `agy-quota-${profile}.json`), 'utf8'));
     const ageMs = now - Number(data?.captured_at) * 1000;
     if (!(ageMs >= 0 && ageMs < MAX_QUOTA_AGE_MS)) return null;
-    return slackFrom(data, now, quotaPoolForModel(model));
+    const pool = quotaPoolForModel(model);
+    if (pool === 'argon') return argonReading(data, true, ageMs, readArgonReading(dir, bin), now).slack;
+    return slackFrom(data, now, pool);
   } catch {
     return null;
   }
@@ -587,7 +786,7 @@ function blockingResetFrom(data, now, pool) {
   if (!data?.buckets || typeof data.buckets !== 'object') return null;
   let tightest = null;
   for (const [name, bucket] of Object.entries(data.buckets)) {
-    if (!name.startsWith(`${pool} `) && !name.startsWith(`${pool}-`)) continue;
+    if (!inPool(name, pool)) continue;
     const resetsAt = Number(bucket?.resets_at) * 1000;
     const used = Number(bucket?.used_percent);
     if (!Number.isFinite(resetsAt) || resetsAt <= now || !Number.isFinite(used)) continue;
@@ -610,6 +809,8 @@ function blockingResetFrom(data, now, pool) {
 function disabledWindow(data, pool, bucketName) {
   const quota = data?.raw?.quota;
   if (!quota || typeof quota !== 'object') return false;
+  // The Argon window is a single bucket named like its raw entry.
+  if (pool === 'argon') return quota[bucketName]?.disabled === true;
   const span = /7d|week/i.test(bucketName) ? 'weekly' : '5h';
   return quota[`${pool}-${span}`]?.disabled === true;
 }
@@ -617,7 +818,24 @@ function disabledWindow(data, pool, bucketName) {
 function poolDisabled(data, pool) {
   const quota = data?.raw?.quota;
   if (!quota || typeof quota !== 'object') return false;
-  return Object.entries(quota).some(([name, window]) => name.startsWith(`${pool}-`) && window?.disabled === true);
+  return Object.entries(quota).some(([name, window]) => inPool(name, pool) && window?.disabled === true);
+}
+
+const POOL_PREFIX = { gemini: 'gemini', argon: 'gemini-argon', '3p': '3p' };
+
+/** Whether a bucket / raw-window name belongs to `pool`. `gemini-argon-…`
+ *  starts with `gemini-` but is its own pool: counting it for the Flash pool
+ *  gave that pool three windows and read as "no measurement" (`-`). */
+function inPool(name, pool) {
+  if (pool === 'gemini' && name.startsWith('gemini-argon')) return false;
+  const prefix = POOL_PREFIX[pool] ?? pool;
+  return name.startsWith(`${prefix} `) || name.startsWith(`${prefix}-`);
+}
+
+function poolBuckets(data, pool) {
+  return data?.buckets && typeof data.buckets === 'object'
+    ? Object.entries(data.buckets).filter(([name]) => inPool(name, pool)).map(([, bucket]) => bucket)
+    : [];
 }
 
 /**
@@ -642,14 +860,15 @@ function poolDisabled(data, pool) {
 function slackFrom(data, now, pool = null) {
   const buckets = data?.buckets && typeof data.buckets === 'object'
     ? Object.entries(data.buckets)
-      .filter(([name]) => !pool || name.startsWith(`${pool} `) || name.startsWith(`${pool}-`))
+      .filter(([name]) => !pool || inPool(name, pool))
       .map(([, bucket]) => bucket)
     : pool ? []
     : [{ used_percent: data?.used_percent, resets_at: data?.resets_at }];
   // A model family is usable only when both its short and weekly windows
   // still have measurements. A reset bucket cannot be inferred from its
   // sibling: reporting 100% from the 5h bucket while 7d is unknown is false.
-  if (pool && buckets.length !== 2) return null;
+  // (The Argon pool is one weekly window, so it needs only that one.)
+  if (pool && buckets.length !== (pool === 'argon' ? 1 : 2)) return null;
   const live = buckets
     .filter((bucket) => {
       const resetValue = bucket?.resets_at;

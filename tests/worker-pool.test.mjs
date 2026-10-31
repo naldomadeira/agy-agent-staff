@@ -134,6 +134,7 @@ test('deduplica e aplica id/capacidade da configuração ao bin já descoberto',
   assert.deepEqual(workers.find((worker) => worker.bin === 'agy'), {
     id: 'primary', bin: 'agy', available: true, status: 'available', version: 'agy-1.0.0', capacity: 4,
     quotaSlack: null, quotaAgeMs: null, quotaGemini: null, quotaThirdParty: null,
+    quotaArgon: null, quotaResetArgon: null, quotaArgonAgeMs: null, models: null,
     quotaResetGemini: null, quotaResetThirdParty: null,
   });
 });

@@ -142,8 +142,8 @@ if (argv[0] === 'models' || argv.includes('models')) {
       'gemini-3.6-flash-high\tGemini 3.6 Flash (High)',
       'gemini-3.6-flash-medium\tGemini 3.6 Flash (Medium)',
       'gemini-3.6-flash-low\tGemini 3.6 Flash (Low)',
-      'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
-      'gemini-3.1-pro-low\tGemini 3.1 Pro (Low)',
+      'gemini-4-argon-high\tGemini 4 Argon (High)',
+      'gemini-4-argon-low\tGemini 4 Argon (Low)',
     ].join('\n');
   process.stdout.write(defaultModels + '\n');
   process.exit(0);
